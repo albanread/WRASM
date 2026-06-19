@@ -23,6 +23,7 @@ pub mod diagnostics;
 pub mod doc;
 pub mod hover;
 pub mod lang;
+pub mod nav;
 pub mod outline;
 pub mod sig;
 pub mod snippet;
