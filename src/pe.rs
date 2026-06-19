@@ -214,7 +214,7 @@ pub fn write_pe(
     }
 
     // Section headers
-    let mut sec = |out: &mut Vec<u8>, name: &[u8], vsize: u32, rva: u32, raw: u32, foff: u32, ch: u32| {
+    let sec = |out: &mut Vec<u8>, name: &[u8], vsize: u32, rva: u32, raw: u32, foff: u32, ch: u32| {
         let mut n = [0u8; 8];
         n[..name.len()].copy_from_slice(name);
         out.extend_from_slice(&n);

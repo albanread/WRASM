@@ -635,6 +635,8 @@ dependencies = [
  "anyhow",
  "docpane",
  "ide",
+ "rasm",
+ "was",
  "winkb",
 ]
 
