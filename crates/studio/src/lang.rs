@@ -70,6 +70,8 @@ pub enum Request {
     Hover { id: u64, line: String, cursor: usize },
     /// Signature help for an `invoke` at `line`/`cursor`.
     Signature { id: u64, line: String, cursor: usize },
+    /// The machine-code bytes for a single source line (the live-bytes view).
+    LineBytes { id: u64, line: String },
     /// Stop the worker and let the join complete.
     Shutdown,
 }
@@ -87,6 +89,9 @@ pub enum Response {
     Completions { id: u64, items: Vec<Completion>, replace_start: usize },
     /// Hover / signature tooltip markdown, or `None` if there's nothing to show.
     Tip { id: u64, markdown: Option<String> },
+    /// The bytes a single line encodes to (empty if it isn't self-encodable,
+    /// e.g. a label-only line or one that references an undefined label).
+    LineBytes { id: u64, bytes: Vec<u8> },
     /// A request failed; `id` is the originating request's id.
     Error { id: u64, message: String },
 }
@@ -102,6 +107,7 @@ impl Response {
             | Response::Suggest { id, .. }
             | Response::Completions { id, .. }
             | Response::Tip { id, .. }
+            | Response::LineBytes { id, .. }
             | Response::Error { id, .. } => *id,
         }
     }
@@ -232,6 +238,9 @@ impl Lang {
     pub fn signature(&self, line: &str, cursor: usize) -> Option<Response> {
         self.call(|id| Request::Signature { id, line: line.to_string(), cursor })
     }
+    pub fn line_bytes(&self, line: &str) -> Option<Response> {
+        self.call(|id| Request::LineBytes { id, line: line.to_string() })
+    }
 
     /// Stop the worker and wait for it to finish.
     pub fn shutdown(mut self) {
@@ -313,6 +322,15 @@ fn worker(
                 let markdown = crate::sig::active_param(&line, cursor)
                     .and_then(|(func, active)| signature_markdown(&kb, &func, active));
                 Response::Tip { id, markdown }
+            }
+            Request::LineBytes { id, line } => {
+                // A line that can't stand alone (label-only, or referencing an
+                // undefined label) just shows no bytes — not an error popup.
+                let bytes = was::lower(&line, &kb)
+                    .and_then(|asm| rasm::assemble(&asm))
+                    .map(|m| m.code)
+                    .unwrap_or_default();
+                Response::LineBytes { id, bytes }
             }
         };
         if tx.send(resp).is_err() {
@@ -630,6 +648,40 @@ mod tests {
                 assert!(md.contains("CreateFileW"), "{md}");
                 assert!(md.contains("**"), "an active param is marked: {md}");
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_bytes_encodes_a_single_instruction() {
+        let Some(l) = lang() else { return };
+        match l.line_bytes("mov rax, 5") {
+            Some(Response::LineBytes { bytes, .. }) => {
+                // REX.W mov r64, imm32 -> 48 c7 c0 05 00 00 00
+                assert_eq!(bytes, vec![0x48, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match l.line_bytes("ret") {
+            Some(Response::LineBytes { bytes, .. }) => assert_eq!(bytes, vec![0xc3]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_bytes_blank_for_a_label_only_line() {
+        let Some(l) = lang() else { return };
+        match l.line_bytes("main:") {
+            Some(Response::LineBytes { bytes, .. }) => assert!(bytes.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_bytes_encodes_an_invoke() {
+        let Some(l) = lang() else { return };
+        match l.line_bytes("invoke ExitProcess, 7") {
+            Some(Response::LineBytes { bytes, .. }) => assert!(!bytes.is_empty()),
             other => panic!("{other:?}"),
         }
     }

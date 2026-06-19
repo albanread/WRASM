@@ -86,6 +86,15 @@ fn handle(lang: &Lang, line: &str) {
             },
             Err(e) => eprintln!("error: {e}"),
         },
+        ":bytes" => match lang.line_bytes(rest) {
+            Some(Response::LineBytes { bytes, .. }) if bytes.is_empty() => {
+                eprintln!("(no bytes — label, directive, or needs context)")
+            }
+            Some(Response::LineBytes { bytes, .. }) => {
+                println!("{}  ({} bytes)", studio::bytes::hex(&bytes), bytes.len())
+            }
+            other => report(other),
+        },
         ":asm" => assemble_cmd(lang, rest, Emit::Asm),
         ":obj" => assemble_cmd(lang, rest, Emit::Obj),
         ":exe" => assemble_cmd(lang, rest, Emit::Exe),

@@ -17,6 +17,7 @@
 use docpane::layout::{self, Layout};
 use docpane::parser;
 
+pub mod bytes;
 pub mod complete;
 pub mod diagnostics;
 pub mod hover;
