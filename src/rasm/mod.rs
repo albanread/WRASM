@@ -14,7 +14,9 @@ pub mod parse;
 
 pub use assemble::assemble;
 pub use encode::{encode, Encoded, Fixup, FixupKind};
-pub use parse::{Directive, Line, Mem, MemSize, Operand, Reg, RegClass};
+pub use parse::{
+    is_register, looks_like_number, Directive, Line, Mem, MemSize, Operand, Reg, RegClass,
+};
 
 /// The native from-scratch x86-64 [`Encoder`](crate::backend::Encoder) — the
 /// owned replacement for LLVM-MC.

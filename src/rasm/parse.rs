@@ -348,6 +348,13 @@ fn parse_reg(s: &str) -> Option<Reg> {
     reg_table(&s)
 }
 
+/// Is `s` an x86-64 register name? Any GPR (8/16/32/64), vector (xmm/ymm/zmm),
+/// or `rip`. This is the assembler's own classifier, exposed so a syntax
+/// highlighter colours exactly what `rasm` accepts — no separate table to drift.
+pub fn is_register(s: &str) -> bool {
+    parse_reg(s).is_some() || s.trim().eq_ignore_ascii_case("rip")
+}
+
 fn reg_table(s: &str) -> Option<Reg> {
     // 64-bit
     const R64: [&str; 16] = [
@@ -405,7 +412,7 @@ fn reg_table(s: &str) -> Option<Reg> {
 
 // ── literals ──────────────────────────────────────────────────────────────
 
-fn looks_like_number(s: &str) -> bool {
+pub fn looks_like_number(s: &str) -> bool {
     let t = s.strip_prefix(['-', '+']).unwrap_or(s);
     let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
     !t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit() || c == '_')

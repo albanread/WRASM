@@ -18,6 +18,7 @@ use docpane::layout::{self, Layout};
 use docpane::parser;
 
 pub mod lang;
+pub mod syntax;
 
 /// Text-measurement stub for headless layout and tests. The windowed app injects
 /// a DirectWrite-backed measurer instead; only absolute widths differ, not the
