@@ -16,8 +16,10 @@
 pub mod backend;
 pub mod coff;
 pub mod difftest;
+pub mod pe;
 pub mod rasm;
 
 pub use backend::{EncodedModule, Encoder, Reloc, RelocKind};
 pub use coff::write_coff;
+pub use pe::write_pe;
 pub use rasm::{assemble, RasmEncoder};

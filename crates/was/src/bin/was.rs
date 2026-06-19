@@ -6,10 +6,11 @@
 //!
 //! Knowledge DB: $WINKB_DB, else E:\windows_api\windows_api.db.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 
-use rasm::{assemble, write_coff};
+use rasm::{assemble, write_coff, write_pe};
 use winkb::Kb;
 
 fn main() -> ExitCode {
@@ -26,6 +27,7 @@ fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
+    let mut entry = "main".to_string();
     let mut emit_asm = false;
     let mut i = 1;
     while i < args.len() {
@@ -34,12 +36,21 @@ fn run() -> anyhow::Result<()> {
                 output = args.get(i + 1).cloned();
                 i += 2;
             }
+            "--entry" => {
+                if let Some(e) = args.get(i + 1) {
+                    entry = e.clone();
+                }
+                i += 2;
+            }
             "--emit-asm" => {
                 emit_asm = true;
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: was <input.asm> [-o <output.obj>] [--emit-asm]");
+                eprintln!(
+                    "usage: was <input.asm> [-o <out.obj|out.exe>] [--entry NAME] [--emit-asm]\n\
+                     (a .exe output is a self-contained PE; otherwise a COFF object)"
+                );
                 return Ok(());
             }
             other => {
@@ -68,13 +79,33 @@ fn run() -> anyhow::Result<()> {
     let module = assemble(&lowered)?;
     let output = output
         .unwrap_or_else(|| Path::new(&input).with_extension("obj").to_string_lossy().into_owned());
-    std::fs::write(&output, write_coff(&module))?;
-    eprintln!(
-        "wrote {output}: {} bytes .text, {} symbol(s), {} reloc(s), externs {:?}",
-        module.code.len(),
-        module.symbols.len(),
-        module.relocs.len(),
-        module.externs,
-    );
+
+    if output.to_ascii_lowercase().ends_with(".exe") {
+        // Self-contained PE: resolve each import's DLL via winkb, no linker.
+        let mut map = BTreeMap::new();
+        for ext in &module.externs {
+            let dll = kb
+                .function(ext)?
+                .and_then(|f| f.dll)
+                .ok_or_else(|| anyhow::anyhow!("no DLL known for import '{ext}'"))?;
+            map.insert(ext.clone(), dll);
+        }
+        let exe = write_pe(&module, &map, &entry)?;
+        std::fs::write(&output, &exe)?;
+        eprintln!(
+            "wrote {output}: {} bytes, entry '{entry}', imports {:?}",
+            exe.len(),
+            map,
+        );
+    } else {
+        std::fs::write(&output, write_coff(&module))?;
+        eprintln!(
+            "wrote {output}: {} bytes .text, {} symbol(s), {} reloc(s), externs {:?}",
+            module.code.len(),
+            module.symbols.len(),
+            module.relocs.len(),
+            module.externs,
+        );
+    }
     Ok(())
 }
