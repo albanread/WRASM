@@ -31,6 +31,8 @@
 use anyhow::Result;
 use winkb::{Func, Kb};
 
+pub mod widget;
+
 /// How many enum members to list inline before eliding the rest.
 const MAX_VALUES_INLINE: usize = 12;
 
@@ -281,6 +283,22 @@ mod tests {
         let md = interface_card(&kb, "IShellItem").unwrap().expect("IShellItem");
         assert!(md.contains("43826d1e"), "iid:\n{md}");
         assert!(md.contains("| vtbl | method |"), "vtable:\n{md}");
+    }
+
+    #[test]
+    fn insert_frame_round_trips_through_widget_model() {
+        let Some(kb) = kb() else { return };
+        let line = insert_frame(&kb, "CreateFileW").unwrap().expect("CreateFileW");
+        let spans = widget::parse(&line);
+        // Every parameter becomes exactly one interactive hole, in order.
+        let f = kb.function("CreateFileW").unwrap().unwrap();
+        assert_eq!(widget::holes(&spans).len(), f.params.len());
+        // Defaulting the holes yields a valid invoke line (dropdowns → a real
+        // constant, fields → <placeholder>).
+        let defaulted = widget::defaults(&spans);
+        assert!(defaulted.starts_with("invoke CreateFileW, "));
+        assert!(defaulted.contains("FILE_SHARE_NONE"));
+        assert!(defaulted.contains("<lpFileName>"));
     }
 
     #[test]
