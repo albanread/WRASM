@@ -5,6 +5,10 @@ edition = "2021"
 description = "From-scratch x86-64 machine-code encoder (Intel-syntax text in, bytes out), byte-identical to LLVM-MC. No LLVM, no JIT."
 license = "MIT"
 
+[[bin]]
+name = "rasm-as"
+path = "src/bin/rasm_as.rs"
+
 [dependencies]
 anyhow = "1"
 

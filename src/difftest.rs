@@ -348,7 +348,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Parse a corpus line back into `(asm, golden EncodedModule)`.
-fn parse_corpus_line(line: &str) -> Option<(String, EncodedModule)> {
+pub fn parse_corpus_line(line: &str) -> Option<(String, EncodedModule)> {
     let mut fields = line.splitn(3, '\t');
     let asm = fields.next()?.to_string();
     let code = unhex(fields.next()?)?;
