@@ -1,0 +1,18 @@
+[package]
+name = "studio"
+version = "0.1.0"
+edition = "2021"
+description = "The assembler IDE front-end: renders the assistant's markdown (from `ide`) through docpane's DirectWrite engine. Headless render seam is unit-testable."
+
+[lib]
+name = "studio"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+ide = { path = "../ide" }
+winkb = { path = "../winkb" }
+# The shared markdown/DirectWrite render core (WF66). parser+layout are pure;
+# render is Direct2D. We path-dep rather than vendor so there's one source of
+# truth while the IDE takes shape.
+docpane = { path = "../../../WF66/crates/docpane" }
