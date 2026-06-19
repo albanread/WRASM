@@ -1,0 +1,17 @@
+[package]
+name = "ide"
+version = "0.1.0"
+edition = "2021"
+description = "The assembler IDE: turns winkb knowledge into renderable markdown cards (the assistant pane), CLI-testable before any Direct2D."
+
+[lib]
+name = "ide"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ide-card"
+path = "src/bin/ide_card.rs"
+
+[dependencies]
+anyhow = "1"
+winkb = { path = "../winkb" }
