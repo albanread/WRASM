@@ -1,0 +1,17 @@
+[package]
+name = "rasm"
+version = "0.1.0"
+edition = "2021"
+description = "From-scratch x86-64 machine-code encoder (Intel-syntax text in, bytes out), byte-identical to LLVM-MC. No LLVM, no JIT."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+
+[dev-dependencies]
+# Decoder-only — the round-trip oracle for the encoder's unit tests
+# (encode -> decode -> assert the intended instruction). NOT a runtime dep.
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+
+[profile.release]
+lto = "thin"
