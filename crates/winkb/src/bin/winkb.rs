@@ -83,6 +83,14 @@ fn run() -> anyhow::Result<()> {
                 println!("{s}");
             }
         }
+        (Some("complete"), Some(prefix)) => {
+            let scope = args.get(3).map(String::as_str).unwrap_or("all");
+            let hits = kb.complete(prefix, scope, 30)?;
+            for c in &hits {
+                println!("{:<10} {:<40} {}", c.kind, c.name, c.detail);
+            }
+            eprintln!("\n{} candidate(s) [{scope}]", hits.len());
+        }
         _ => {
             eprintln!(
                 "usage:\n  \

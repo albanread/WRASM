@@ -17,6 +17,7 @@
 use docpane::layout::{self, Layout};
 use docpane::parser;
 
+pub mod complete;
 pub mod diagnostics;
 pub mod lang;
 pub mod snippet;

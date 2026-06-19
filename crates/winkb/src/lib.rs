@@ -25,6 +25,16 @@ pub struct Hit {
     pub detail: String,
 }
 
+/// An autocomplete candidate (a prefix match).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub name: String,
+    /// `function` | `constant` | `enum-val` | a type kind | `field`.
+    pub kind: String,
+    /// DLL / value-kind / qualified name / field type, by kind.
+    pub detail: String,
+}
+
 /// A named integer value resolved from `constants` or `enum_members`.
 #[derive(Debug, Clone)]
 pub struct Value {
@@ -100,6 +110,50 @@ impl Kb {
                 })
             },
         )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Prefix-match candidates for autocomplete. `scope` selects the tables:
+    /// `"function"`, `"constant"` (constants + enum members), `"type"`, or
+    /// `"all"`. Ordered shortest-name-first (the prefix-completion feel).
+    pub fn complete(&self, prefix: &str, scope: &str, limit: usize) -> Result<Vec<Completion>> {
+        // Windows names are full of `_`, which is a LIKE wildcard — escape it (and
+        // `%`/`\`) so this is a *literal* prefix match, not a fuzzy one.
+        let like = format!("{}%", escape_like(prefix));
+        let mut parts: Vec<&str> = Vec::new();
+        if scope == "function" || scope == "all" {
+            parts.push(
+                "SELECT function_name AS name, 'function' AS kind, COALESCE(dll_name,'') AS detail \
+                   FROM functions WHERE function_name LIKE ?1 ESCAPE '\\'",
+            );
+        }
+        if scope == "constant" || scope == "all" {
+            parts.push(
+                "SELECT constant_name AS name, 'constant' AS kind, value_kind AS detail \
+                   FROM constants WHERE constant_name LIKE ?1 ESCAPE '\\'",
+            );
+            parts.push(
+                "SELECT member_name AS name, 'enum-val' AS kind, COALESCE(underlying_type,'') AS detail \
+                   FROM enum_members WHERE member_name LIKE ?1 ESCAPE '\\'",
+            );
+        }
+        if scope == "type" || scope == "all" {
+            parts.push(
+                "SELECT type_name AS name, kind AS kind, COALESCE(qualified_name,'') AS detail \
+                   FROM types WHERE type_name LIKE ?1 ESCAPE '\\'",
+            );
+        }
+        if parts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT name, kind, detail FROM ({}) ORDER BY length(name), name LIMIT ?2",
+            parts.join(" UNION ALL "),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![like, limit as i64], |r| {
+            Ok(Completion { name: r.get(0)?, kind: r.get(1)?, detail: r.get(2)? })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -400,6 +454,20 @@ impl Kb {
     }
 }
 
+/// Escape SQL `LIKE` metacharacters so a string matches literally (used with
+/// `ESCAPE '\'`). Windows names contain `_` constantly, which would otherwise be
+/// a single-char wildcard.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Classic edit distance (small names; used only for "did you mean").
 fn levenshtein(a: &str, b: &str) -> usize {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -414,4 +482,37 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kb() -> Option<Kb> {
+        let path = std::env::var("WINKB_DB")
+            .unwrap_or_else(|_| r"E:\windows_api\windows_api.db".to_string());
+        Kb::open(&path).ok()
+    }
+
+    #[test]
+    fn complete_function_prefix() {
+        let Some(kb) = kb() else { return };
+        let hits = kb.complete("CreateFile", "function", 50).unwrap();
+        assert!(hits.iter().any(|c| c.name == "CreateFileW"), "{hits:?}");
+        assert!(hits.iter().all(|c| c.kind == "function" && c.name.starts_with("CreateFile")));
+    }
+
+    #[test]
+    fn complete_constant_scope_excludes_functions() {
+        let Some(kb) = kb() else { return };
+        let hits = kb.complete("FILE_SHARE_", "constant", 50).unwrap();
+        assert!(hits.iter().any(|c| c.name == "FILE_SHARE_READ"), "{hits:?}");
+        assert!(hits.iter().all(|c| c.kind != "function"));
+    }
+
+    #[test]
+    fn complete_unknown_scope_is_empty() {
+        let Some(kb) = kb() else { return };
+        assert!(kb.complete("X", "bogus", 10).unwrap().is_empty());
+    }
 }

@@ -27,7 +27,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Result;
-use winkb::Kb;
+use winkb::{Completion, Kb};
+
+use crate::complete::{self, CompletionKind};
 
 /// What an assemble should emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,8 @@ pub enum Request {
     Assemble { id: u64, src: String, emit: Emit },
     /// Did-you-mean suggestions for a name.
     Suggest { id: u64, name: String },
+    /// Autocomplete candidates for `line` at byte offset `cursor`.
+    Complete { id: u64, line: String, cursor: usize },
     /// Stop the worker and let the join complete.
     Shutdown,
 }
@@ -74,6 +78,9 @@ pub enum Response {
     Check { id: u64, diags: Vec<Diag> },
     Assembled { id: u64, emit: Emit, bytes: Vec<u8>, info: String },
     Suggest { id: u64, names: Vec<String> },
+    /// Autocomplete candidates plus the byte offset where the replaced prefix
+    /// begins (`line[replace_start..cursor]` is what a choice replaces).
+    Completions { id: u64, items: Vec<Completion>, replace_start: usize },
     /// A request failed; `id` is the originating request's id.
     Error { id: u64, message: String },
 }
@@ -87,6 +94,7 @@ impl Response {
             | Response::Check { id, .. }
             | Response::Assembled { id, .. }
             | Response::Suggest { id, .. }
+            | Response::Completions { id, .. }
             | Response::Error { id, .. } => *id,
         }
     }
@@ -161,6 +169,11 @@ impl Lang {
         let _ = self.tx.send(Request::Suggest { id, name: name.to_string() });
         id
     }
+    pub fn post_complete(&self, line: &str, cursor: usize) -> u64 {
+        let id = self.alloc();
+        let _ = self.tx.send(Request::Complete { id, line: line.to_string(), cursor });
+        id
+    }
 
     /// Non-blocking drain — the GUI calls this each message-loop pass.
     pub fn poll(&self) -> Option<Response> {
@@ -202,6 +215,9 @@ impl Lang {
     }
     pub fn suggest(&self, name: &str) -> Option<Response> {
         self.call(|id| Request::Suggest { id, name: name.to_string() })
+    }
+    pub fn complete(&self, line: &str, cursor: usize) -> Option<Response> {
+        self.call(|id| Request::Complete { id, line: line.to_string(), cursor })
     }
 
     /// Stop the worker and wait for it to finish.
@@ -267,10 +283,39 @@ fn worker(
                 Ok(names) => Response::Suggest { id, names },
                 Err(e) => Response::Error { id, message: format!("{e:#}") },
             },
+            Request::Complete { id, line, cursor } => {
+                let ctx = complete::context(&line, cursor);
+                Response::Completions {
+                    id,
+                    items: complete_items(&kb, &ctx),
+                    replace_start: ctx.start,
+                }
+            }
         };
         if tx.send(resp).is_err() {
             break; // the GUI handle was dropped; nothing left to answer
         }
+    }
+}
+
+/// Resolve a completion context into winkb candidates.
+fn complete_items(kb: &Kb, ctx: &complete::CompletionContext) -> Vec<Completion> {
+    match &ctx.kind {
+        CompletionKind::None => Vec::new(),
+        CompletionKind::Function => kb.complete(&ctx.prefix, "function", 50).unwrap_or_default(),
+        CompletionKind::Symbol => kb.complete(&ctx.prefix, "all", 50).unwrap_or_default(),
+        CompletionKind::Field { type_name } => kb
+            .layout(type_name)
+            .ok()
+            .flatten()
+            .map(|l| {
+                l.fields
+                    .into_iter()
+                    .filter(|f| f.name.starts_with(&ctx.prefix))
+                    .map(|f| Completion { name: f.name, kind: "field".into(), detail: f.type_name })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -446,6 +491,42 @@ mod tests {
             Some(Response::Suggest { names, .. }) => {
                 assert!(names.iter().any(|n| n == "OPEN_EXISTING"), "{names:?}")
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_after_invoke_lists_functions() {
+        let Some(l) = lang() else { return };
+        let line = "invoke CreateFil";
+        match l.complete(line, line.len()) {
+            Some(Response::Completions { items, replace_start, .. }) => {
+                assert_eq!(replace_start, 7, "replaces the typed name");
+                assert!(items.iter().any(|c| c.name == "CreateFileW"), "{items:?}");
+                assert!(items.iter().all(|c| c.kind == "function"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_struct_field_after_dot() {
+        let Some(l) = lang() else { return };
+        let line = "mov eax, [rcx + RECT.";
+        match l.complete(line, line.len()) {
+            Some(Response::Completions { items, .. }) => {
+                let names: Vec<_> = items.iter().map(|c| c.name.as_str()).collect();
+                assert!(names.contains(&"left") && names.contains(&"right"), "{names:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_offers_nothing_for_the_mnemonic() {
+        let Some(l) = lang() else { return };
+        match l.complete("mo", 2) {
+            Some(Response::Completions { items, .. }) => assert!(items.is_empty()),
             other => panic!("{other:?}"),
         }
     }
