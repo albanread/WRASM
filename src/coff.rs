@@ -24,7 +24,6 @@ const IMAGE_REL_AMD64_REL32: u16 = 0x0004;
 const HEADER_SIZE: usize = 20;
 const SECTION_HEADER_SIZE: usize = 40;
 const RELOC_SIZE: usize = 10;
-const SYMBOL_SIZE: usize = 18;
 
 struct Sym {
     name: String,
@@ -44,7 +43,7 @@ pub fn write_coff(m: &EncodedModule) -> Vec<u8> {
         index.insert(name.clone(), syms.len() as u32);
         syms.push(Sym { name: name.clone(), value: off as u32, section: 1 });
     }
-    let mut ensure_undef = |name: &str, syms: &mut Vec<Sym>, index: &mut BTreeMap<String, u32>| {
+    let ensure_undef = |name: &str, syms: &mut Vec<Sym>, index: &mut BTreeMap<String, u32>| {
         if !index.contains_key(name) {
             index.insert(name.to_string(), syms.len() as u32);
             syms.push(Sym { name: name.to_string(), value: 0, section: 0 });
@@ -173,7 +172,7 @@ mod tests {
         // main fits inline in the first symbol's name field.
         assert_eq!(&obj[sym_ptr..sym_ptr + 4], b"main");
         // ExitProcess (>8 chars) lives in the string table.
-        let strtab_start = sym_ptr + nsym * SYMBOL_SIZE;
+        let strtab_start = sym_ptr + nsym * 18; // 18 = COFF symbol record size
         let strtab = &obj[strtab_start..];
         assert!(
             strtab.windows(11).any(|w| w == b"ExitProcess"),

@@ -165,15 +165,6 @@ pub fn assemble(text: &str) -> Result<EncodedModule> {
         }
     }
 
-    // Which symbols are defined in this module (labels)?
-    let defined: std::collections::HashSet<String> = items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Label(n) => Some(n.clone()),
-            _ => None,
-        })
-        .collect();
-
     // ── Pass 2: branch relaxation to a fixpoint ─────────────────────────────
     loop {
         let (offsets, labels) = layout(&items);
