@@ -49,7 +49,7 @@ fn first_non_ws(line: &str) -> usize {
 }
 
 /// The next word-char run at or after `from`: `(start, end)`.
-fn next_word(line: &str, from: usize) -> Option<(usize, usize)> {
+pub(crate) fn next_word(line: &str, from: usize) -> Option<(usize, usize)> {
     let mut i = from.min(line.len());
     while i < line.len() {
         let c = line[i..].chars().next().unwrap();
@@ -75,7 +75,7 @@ fn next_word(line: &str, from: usize) -> Option<(usize, usize)> {
 
 /// The head word of the line (the mnemonic / `invoke` / directive), skipping an
 /// optional leading `label:`.
-fn head_word(line: &str) -> Option<(usize, usize)> {
+pub(crate) fn head_word(line: &str) -> Option<(usize, usize)> {
     let i = first_non_ws(line);
     let (ws, we) = next_word(line, i)?;
     let rest = &line[we..];
@@ -85,6 +85,22 @@ fn head_word(line: &str) -> Option<(usize, usize)> {
         return next_word(line, colon + 1);
     }
     Some((ws, we))
+}
+
+/// Count top-level commas in `s` (`[]` depth aware) — the argument separator
+/// count, used to find which `invoke` argument the caret is in.
+pub(crate) fn count_top_level_commas(s: &str) -> usize {
+    let mut depth = 0i32;
+    let mut n = 0;
+    for c in s.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ',' if depth == 0 => n += 1,
+            _ => {}
+        }
+    }
+    n
 }
 
 /// The first top-level comma at/after `from` (`[]` depth aware).

@@ -66,6 +66,10 @@ pub enum Request {
     Suggest { id: u64, name: String },
     /// Autocomplete candidates for `line` at byte offset `cursor`.
     Complete { id: u64, line: String, cursor: usize },
+    /// Tooltip for the token under the caret (`line` at byte offset `cursor`).
+    Hover { id: u64, line: String, cursor: usize },
+    /// Signature help for an `invoke` at `line`/`cursor`.
+    Signature { id: u64, line: String, cursor: usize },
     /// Stop the worker and let the join complete.
     Shutdown,
 }
@@ -81,6 +85,8 @@ pub enum Response {
     /// Autocomplete candidates plus the byte offset where the replaced prefix
     /// begins (`line[replace_start..cursor]` is what a choice replaces).
     Completions { id: u64, items: Vec<Completion>, replace_start: usize },
+    /// Hover / signature tooltip markdown, or `None` if there's nothing to show.
+    Tip { id: u64, markdown: Option<String> },
     /// A request failed; `id` is the originating request's id.
     Error { id: u64, message: String },
 }
@@ -95,6 +101,7 @@ impl Response {
             | Response::Assembled { id, .. }
             | Response::Suggest { id, .. }
             | Response::Completions { id, .. }
+            | Response::Tip { id, .. }
             | Response::Error { id, .. } => *id,
         }
     }
@@ -219,6 +226,12 @@ impl Lang {
     pub fn complete(&self, line: &str, cursor: usize) -> Option<Response> {
         self.call(|id| Request::Complete { id, line: line.to_string(), cursor })
     }
+    pub fn hover(&self, line: &str, cursor: usize) -> Option<Response> {
+        self.call(|id| Request::Hover { id, line: line.to_string(), cursor })
+    }
+    pub fn signature(&self, line: &str, cursor: usize) -> Option<Response> {
+        self.call(|id| Request::Signature { id, line: line.to_string(), cursor })
+    }
 
     /// Stop the worker and wait for it to finish.
     pub fn shutdown(mut self) {
@@ -291,6 +304,16 @@ fn worker(
                     replace_start: ctx.start,
                 }
             }
+            Request::Hover { id, line, cursor } => {
+                let markdown = crate::hover::token_at(&line, cursor)
+                    .and_then(|t| hover_markdown(&kb, &line[t.start..t.end]));
+                Response::Tip { id, markdown }
+            }
+            Request::Signature { id, line, cursor } => {
+                let markdown = crate::sig::active_param(&line, cursor)
+                    .and_then(|(func, active)| signature_markdown(&kb, &func, active));
+                Response::Tip { id, markdown }
+            }
         };
         if tx.send(resp).is_err() {
             break; // the GUI handle was dropped; nothing left to answer
@@ -317,6 +340,51 @@ fn complete_items(kb: &Kb, ctx: &complete::CompletionContext) -> Vec<Completion>
             })
             .unwrap_or_default(),
     }
+}
+
+/// A concise tooltip for a token: a constant's value, a function's one-line
+/// signature, or a type's size — whichever winkb knows. `None` if unknown.
+fn hover_markdown(kb: &Kb, word: &str) -> Option<String> {
+    if let Ok(vals) = kb.resolve(word) {
+        if let Some(v) = vals.first() {
+            let ns = v.namespace.as_deref().unwrap_or("");
+            return Some(format!("**{word}** = `0x{:x}` ({})  ·  _{ns}_", v.bits, v.i64v));
+        }
+    }
+    if let Ok(Some(f)) = kb.function(word) {
+        let dll = f.dll.as_deref().unwrap_or("?");
+        return Some(format!(
+            "`{}` **{}**({} param{})  ·  {dll}",
+            f.ret,
+            f.name,
+            f.params.len(),
+            if f.params.len() == 1 { "" } else { "s" },
+        ));
+    }
+    if let Ok(Some(l)) = kb.layout(word) {
+        return Some(format!("**{}**  ·  {}, sizeof `{}`", l.name, l.kind, l.size));
+    }
+    None
+}
+
+/// The signature of `func` with parameter `active` bolded — the signature-help
+/// tooltip. `None` if the function is unknown.
+fn signature_markdown(kb: &Kb, func: &str, active: usize) -> Option<String> {
+    let f = kb.function(func).ok().flatten()?;
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let one = format!("{} {}", p.type_name, p.name);
+            if i == active {
+                format!("**{one}**")
+            } else {
+                one
+            }
+        })
+        .collect();
+    Some(format!("`{}` {}({})", f.ret, f.name, params.join(", ")))
 }
 
 /// Lower + assemble a source buffer to the requested artifact, returning the
@@ -527,6 +595,41 @@ mod tests {
         let Some(l) = lang() else { return };
         match l.complete("mo", 2) {
             Some(Response::Completions { items, .. }) => assert!(items.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_resolves_a_constant_value() {
+        let Some(l) = lang() else { return };
+        let line = "mov eax, OPEN_EXISTING";
+        match l.hover(line, 12) {
+            Some(Response::Tip { markdown: Some(md), .. }) => {
+                assert!(md.contains("OPEN_EXISTING") && md.contains("0x"), "{md}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_a_register_is_empty() {
+        let Some(l) = lang() else { return };
+        match l.hover("mov rax, 1", 4) {
+            Some(Response::Tip { markdown, .. }) => assert!(markdown.is_none()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn signature_marks_the_active_param() {
+        let Some(l) = lang() else { return };
+        // caret after the first comma -> param 0 (lpFileName) is active/bold.
+        let line = "invoke CreateFileW, rcx";
+        match l.signature(line, line.len()) {
+            Some(Response::Tip { markdown: Some(md), .. }) => {
+                assert!(md.contains("CreateFileW"), "{md}");
+                assert!(md.contains("**"), "an active param is marked: {md}");
+            }
             other => panic!("{other:?}"),
         }
     }

@@ -19,7 +19,10 @@ use docpane::parser;
 
 pub mod complete;
 pub mod diagnostics;
+pub mod hover;
 pub mod lang;
+pub mod outline;
+pub mod sig;
 pub mod snippet;
 pub mod syntax;
 
