@@ -1,0 +1,11 @@
+[package]
+name = "was"
+version = "0.1.0"
+edition = "2021"
+description = "Windows assembler front-end: lowers invoke / Windows constants / struct fields to rasm Intel-syntax text, then assembles to a COFF object."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+rasm = { path = "../.." }
+winkb = { path = "../winkb" }
