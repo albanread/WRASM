@@ -1,0 +1,11 @@
+[package]
+name = "winkb"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only knowledge layer over windows_api.db: search/resolve Windows API functions, constants, enums, and types."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+# bundled = compile SQLite from source, so there is no system-SQLite dependency.
+rusqlite = { version = "0.32", features = ["bundled"] }

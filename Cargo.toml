@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/winkb"]
+resolver = "2"
+
 [package]
 name = "rasm"
 version = "0.1.0"
