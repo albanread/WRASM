@@ -212,4 +212,132 @@ impl Kb {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// ④ Struct/union layout: `sizeof`, alignment, and each field's byte offset
+    /// (all precomputed by the importer's `compute-layout` pass).
+    pub fn layout(&self, name: &str) -> Result<Option<Layout>> {
+        let head = self
+            .conn
+            .query_row(
+                "SELECT type_id, kind, size_bits, align_bits FROM types
+                   WHERE type_name = ?1 AND kind IN ('struct', 'union') LIMIT 1",
+                [name],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((tid, kind, size_bits, align_bits)) = head else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT sf.field_name, sf.byte_offset, t.type_name
+               FROM struct_fields sf LEFT JOIN types t ON t.type_id = sf.type_id
+               WHERE sf.struct_type_id = ?1 ORDER BY sf.ordinal",
+        )?;
+        let fields = stmt
+            .query_map([tid], |r| {
+                Ok(Field {
+                    name: r.get(0)?,
+                    offset: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    type_name: r.get::<_, Option<String>>(2)?.unwrap_or_else(|| "?".into()),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(Layout {
+            name: name.to_string(),
+            kind,
+            size: size_bits.unwrap_or(0) / 8,
+            align: align_bits.unwrap_or(0) / 8,
+            fields,
+        }))
+    }
+
+    /// Byte size of any named type (struct/enum/typedef/…), or None if unknown.
+    pub fn sizeof(&self, name: &str) -> Result<Option<i64>> {
+        let bits = self
+            .conn
+            .query_row(
+                "SELECT size_bits FROM types WHERE type_name = ?1 AND size_bits IS NOT NULL LIMIT 1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(bits.map(|b| b / 8))
+    }
+
+    /// ⑥ COM interface: IID and its own methods in absolute vtable order
+    /// (`call [vtable + vtable_index*8]`). Inherited slots come from `base`.
+    pub fn interface(&self, name: &str) -> Result<Option<Interface>> {
+        let head = self
+            .conn
+            .query_row(
+                "SELECT type_id, iid, base_qualified_name FROM types
+                   WHERE type_name = ?1 AND kind = 'interface' LIMIT 1",
+                [name],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((tid, iid, base)) = head else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT vtable_index, method_name FROM interface_methods
+               WHERE interface_type_id = ?1 ORDER BY vtable_index",
+        )?;
+        let methods = stmt
+            .query_map([tid], |r| {
+                Ok(Method {
+                    vtable_index: r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    name: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(Interface { name: name.to_string(), iid, base, methods }))
+    }
+}
+
+/// A struct/union field with its computed byte offset.
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    pub offset: i64,
+    pub type_name: String,
+}
+
+/// A struct/union layout (sizes in bytes).
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub name: String,
+    pub kind: String,
+    pub size: i64,
+    pub align: i64,
+    pub fields: Vec<Field>,
+}
+
+/// A COM interface method in vtable order.
+#[derive(Debug, Clone)]
+pub struct Method {
+    pub vtable_index: i64,
+    pub name: String,
+}
+
+/// A COM interface: IID + base + own vtable methods.
+#[derive(Debug, Clone)]
+pub struct Interface {
+    pub name: String,
+    pub iid: Option<String>,
+    pub base: Option<String>,
+    pub methods: Vec<Method>,
 }

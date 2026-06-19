@@ -54,12 +54,34 @@ fn run() -> anyhow::Result<()> {
             None => eprintln!("function '{name}' not found"),
             Some(f) => print_func(&f),
         },
+        (Some("layout"), Some(name)) => match kb.layout(name)? {
+            None => eprintln!("struct/union '{name}' not found"),
+            Some(l) => {
+                println!("{} {} : sizeof {}, align {}", l.kind, l.name, l.size, l.align);
+                for f in &l.fields {
+                    println!("  +{:<4} {:<28} {}", f.offset, f.name, f.type_name);
+                }
+            }
+        },
+        (Some("iface"), Some(name)) => match kb.interface(name)? {
+            None => eprintln!("interface '{name}' not found"),
+            Some(i) => {
+                println!("interface {}", i.name);
+                println!("  IID:  {}", i.iid.as_deref().unwrap_or("(none)"));
+                println!("  base: {}", i.base.as_deref().unwrap_or("(none)"));
+                for m in &i.methods {
+                    println!("  vtbl[{:>2}] {}", m.vtable_index, m.name);
+                }
+            }
+        },
         _ => {
             eprintln!(
                 "usage:\n  \
                  winkb search <fragment>\n  \
                  winkb show <function>\n  \
-                 winkb resolve <name>"
+                 winkb resolve <name>\n  \
+                 winkb layout <struct>\n  \
+                 winkb iface <interface>"
             );
         }
     }
