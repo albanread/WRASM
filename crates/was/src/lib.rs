@@ -17,6 +17,136 @@ use winkb::Kb;
 /// First four integer/pointer argument registers (Win64).
 const ARG_REGS: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
 
+/// One diagnostic: a 1-based line/column and a message.
+#[derive(Debug, Clone)]
+pub struct Diag {
+    pub line: usize,
+    pub col: usize,
+    pub message: String,
+}
+
+/// Check `src` and return diagnostics — semantic (invoke arg count, unknown
+/// constants with a "did you mean", bad struct fields) plus a whole-file
+/// syntax/encode pass through rasm. Empty result = clean.
+pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
+    let labels = collect_labels(src);
+    let mut diags = Vec::new();
+    for (i, raw) in src.lines().enumerate() {
+        let line = i + 1;
+        let body = strip_comment(raw);
+        let t = body.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // invoke arg-count check
+        if let Some(rest) = strip_keyword(t, "invoke") {
+            let parts = split_top_commas(rest);
+            let func = parts.first().map(|s| s.trim()).unwrap_or("");
+            let nargs = if func.is_empty() { 0 } else { parts.len() - 1 };
+            if let Ok(Some(f)) = kb.function(func) {
+                if f.params.len() != nargs {
+                    let col = body.find(func).map(|c| c + 1).unwrap_or(1);
+                    diags.push(Diag {
+                        line,
+                        col,
+                        message: format!("{func} takes {} argument(s), got {nargs}", f.params.len()),
+                    });
+                }
+            }
+        }
+        if !t.starts_with('.') {
+            check_idents(body, line, kb, &labels, &mut diags);
+        }
+    }
+    // whole-file syntax/encode pass
+    match lower(src, kb).and_then(|low| rasm::assemble(&low).map(|_| ())) {
+        Ok(()) => {}
+        Err(e) => diags.push(Diag { line: 0, col: 0, message: format!("{e:#}") }),
+    }
+    diags
+}
+
+/// Flag `Struct.field` typos and unknown constant-like identifiers.
+fn check_idents(body: &str, line: usize, kb: &Kb, labels: &HashSet<String>, diags: &mut Vec<Diag>) {
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < b.len() && b[i] as char != c {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < b.len() && (is_ident_char(b[i] as char) || b[i] as char == '.') {
+                i += 1;
+            }
+            let tok = &body[start..i];
+            let col = start + 1;
+            if let Some(dot) = tok.find('.') {
+                let (lhs, field) = (&tok[..dot], &tok[dot + 1..]);
+                if !is_register(lhs) && !labels.contains(lhs) {
+                    if let Ok(Some(layout)) = kb.layout(lhs) {
+                        if !field.is_empty() && !layout.fields.iter().any(|f| f.name == field) {
+                            let near = layout
+                                .fields
+                                .iter()
+                                .min_by_key(|f| lev(field, &f.name))
+                                .map(|f| format!(" — did you mean '{}.{}'?", lhs, f.name))
+                                .unwrap_or_default();
+                            diags.push(Diag {
+                                line,
+                                col,
+                                message: format!("{lhs} has no field '{field}'{near}"),
+                            });
+                        }
+                    }
+                }
+            } else if is_constant_like(tok) && !labels.contains(tok) {
+                if matches!(kb.resolve(tok), Ok(v) if v.is_empty()) {
+                    if let Ok(s) = kb.suggest(tok, 1) {
+                        if let Some(best) = s.first() {
+                            diags.push(Diag {
+                                line,
+                                col,
+                                message: format!("unknown constant '{tok}' — did you mean '{best}'?"),
+                            });
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Looks like a Windows constant: UPPER_SNAKE or all-caps, with a letter.
+fn is_constant_like(s: &str) -> bool {
+    s.len() > 2
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+        && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn lev(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ac) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &bc) in b.iter().enumerate() {
+            let cost = if ac == bc { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 /// Lower `src` to rasm-ready Intel-syntax text.
 pub fn lower(src: &str, kb: &Kb) -> Result<String> {
     let labels = collect_labels(src);

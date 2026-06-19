@@ -74,6 +74,15 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         },
+        (Some("snippet"), Some(name)) => match kb.snippet(name)? {
+            None => eprintln!("function '{name}' not found"),
+            Some(s) => println!("{s}"),
+        },
+        (Some("suggest"), Some(name)) => {
+            for s in kb.suggest(name, 5)? {
+                println!("{s}");
+            }
+        }
         _ => {
             eprintln!(
                 "usage:\n  \

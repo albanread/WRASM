@@ -29,6 +29,7 @@ fn run() -> anyhow::Result<()> {
     let mut output: Option<String> = None;
     let mut entry = "main".to_string();
     let mut emit_asm = false;
+    let mut check = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -44,6 +45,10 @@ fn run() -> anyhow::Result<()> {
             }
             "--emit-asm" => {
                 emit_asm = true;
+                i += 1;
+            }
+            "--check" => {
+                check = true;
                 i += 1;
             }
             "-h" | "--help" => {
@@ -69,6 +74,23 @@ fn run() -> anyhow::Result<()> {
     let kb = Kb::open(&db)?;
 
     let src = std::fs::read_to_string(&input)?;
+
+    if check {
+        let diags = was::check(&src, &kb);
+        for d in &diags {
+            if d.line == 0 {
+                eprintln!("{input}: {}", d.message);
+            } else {
+                eprintln!("{input}:{}:{}: {}", d.line, d.col, d.message);
+            }
+        }
+        eprintln!(
+            "{input}: {}",
+            if diags.is_empty() { "ok".to_string() } else { format!("{} issue(s)", diags.len()) }
+        );
+        return Ok(());
+    }
+
     let lowered = was::lower(&src, &kb)?;
 
     if emit_asm {

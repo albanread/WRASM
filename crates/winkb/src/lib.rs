@@ -341,3 +341,77 @@ pub struct Interface {
     pub base: Option<String>,
     pub methods: Vec<Method>,
 }
+
+impl Kb {
+    /// Generate a ready-to-edit `invoke` snippet for a function: enum-typed
+    /// parameters get a default member (a real, resolvable constant); everything
+    /// else becomes a `<paramName>` field for the user to fill.
+    pub fn snippet(&self, func: &str) -> Result<Option<String>> {
+        let Some(f) = self.function(func)? else {
+            return Ok(None);
+        };
+        let sig: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        let args: Vec<String> = f
+            .params
+            .iter()
+            .map(|p| {
+                if p.type_kind == "enum" {
+                    if let Some((m, _)) = p.related.first() {
+                        return m.clone();
+                    }
+                }
+                format!("<{}>", p.name)
+            })
+            .collect();
+        let dll = f.dll.as_deref().unwrap_or("");
+        let head = format!("; {} {}({})   [{}]", f.ret, f.name, sig.join(", "), dll);
+        let call = if args.is_empty() {
+            format!("invoke {}", f.name)
+        } else {
+            format!("invoke {}, {}", f.name, args.join(", "))
+        };
+        Ok(Some(format!("{head}\n{call}")))
+    }
+
+    /// "Did you mean" — constant/enum names close (edit distance ≤ 3) to `name`,
+    /// nearest first. Prefix-indexed so it stays fast over ~165K names.
+    pub fn suggest(&self, name: &str, limit: usize) -> Result<Vec<String>> {
+        if name.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let plen = name.len().min(4);
+        let prefix = format!("{}%", &name[..plen]);
+        let mut stmt = self.conn.prepare(
+            "SELECT name FROM (
+               SELECT constant_name AS name FROM constants WHERE constant_name LIKE ?1
+               UNION SELECT member_name FROM enum_members WHERE member_name LIKE ?1
+             ) LIMIT 800",
+        )?;
+        let cands: Vec<String> =
+            stmt.query_map([&prefix], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut scored: Vec<(usize, String)> = cands
+            .into_iter()
+            .map(|c| (levenshtein(name, &c), c))
+            .filter(|(d, _)| *d > 0 && *d <= 3)
+            .collect();
+        scored.sort();
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(_, n)| n).collect())
+    }
+}
+
+/// Classic edit distance (small names; used only for "did you mean").
+fn levenshtein(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ac) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &bc) in b.iter().enumerate() {
+            let cost = if ac == bc { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
