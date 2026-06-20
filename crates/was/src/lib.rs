@@ -10,7 +10,7 @@
 //! is not a register, not a label defined in this source, and winkb knows it —
 //! otherwise it is left for rasm to treat as a label/extern.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use winkb::Kb;
 
@@ -58,12 +58,53 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
             check_idents(body, line, kb, &labels, &mut diags);
         }
     }
-    // whole-file syntax/encode pass
-    match lower(src, kb).and_then(|low| rasm::assemble(&low).map(|_| ())) {
-        Ok(()) => {}
-        Err(e) => diags.push(Diag { line: 0, col: 0, message: format!("{e:#}") }),
+    // Whole-file syntax/encode pass, with the failing line recovered. A lowering
+    // error already carries its *source* line; a `rasm::assemble` error carries a
+    // *lowered* line, mapped back through `map`. Column points at the first
+    // non-blank char so the squiggle hugs the offending token, not the indent.
+    let mk = |line: usize, message: String| -> Diag {
+        let col = match line {
+            0 => 0,
+            n => src
+                .lines()
+                .nth(n - 1)
+                .map(|l| l.len() - l.trim_start().len() + 1)
+                .unwrap_or(1),
+        };
+        Diag { line, col, message }
+    };
+    match lower_mapped(src, kb) {
+        Err(e) => {
+            let (line, msg) = split_line_tag(&format!("{e:#}"));
+            diags.push(mk(line.unwrap_or(0), msg));
+        }
+        Ok((low, map)) => {
+            if let Err(e) = rasm::assemble(&low) {
+                let (lowered, msg) = split_line_tag(&format!("{e:#}"));
+                let line = lowered
+                    .and_then(|n| map.get(n.saturating_sub(1)).copied())
+                    .unwrap_or(0);
+                diags.push(mk(line, msg));
+            }
+        }
     }
     diags
+}
+
+/// Split a leading ``line N: `` tag off an error message, returning `N` and the
+/// remainder. Both [`lower_mapped`] and `rasm::assemble` prefix a failure this
+/// way, so peeling it lets the caller place the line itself (in [`Diag::line`])
+/// without the message contradicting it with a stale/lowered number.
+fn split_line_tag(msg: &str) -> (Option<usize>, String) {
+    if let Some(after) = msg.strip_prefix("line ") {
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            if let Some(rest) = after[digits.len()..].strip_prefix(": ") {
+                return (digits.parse().ok(), rest.to_string());
+            }
+        }
+    }
+    (None, msg.to_string())
 }
 
 /// Flag `Struct.field` typos and unknown constant-like identifiers.
@@ -149,31 +190,49 @@ fn lev(a: &str, b: &str) -> usize {
 
 /// Lower `src` to rasm-ready Intel-syntax text.
 pub fn lower(src: &str, kb: &Kb) -> Result<String> {
+    Ok(lower_mapped(src, kb)?.0)
+}
+
+/// Lower `src`, also returning a map from each *lowered* line (0-based) back to
+/// the 1-based source line it came from. One source line can expand to many
+/// lowered lines (an `invoke` becomes the whole Win64 call sequence), so this is
+/// what lets [`check`] point a downstream `rasm::assemble` error — whose line
+/// numbers are lowered-line numbers — at the real source line. Lowering errors
+/// are tagged ``line N: …`` with the *source* line directly.
+fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     let labels = collect_labels(src);
     let mut out = String::new();
-    for raw in src.lines() {
+    let mut map: Vec<usize> = Vec::new();
+    for (i, raw) in src.lines().enumerate() {
+        let src_line = i + 1;
+        let start = out.len();
         let body = strip_comment(raw);
         let t = body.trim();
         if t.is_empty() {
             out.push('\n');
-            continue;
-        }
-        // `invoke Func, args…`
-        if let Some(rest) = strip_keyword(t, "invoke") {
-            out.push_str(&expand_invoke(rest, kb, &labels)?);
-            continue;
-        }
-        // Directives pass through untouched.
-        if t.starts_with('.') {
+        } else if let Some(rest) = strip_keyword(t, "invoke") {
+            // `invoke Func, args…`
+            let expanded = expand_invoke(rest, kb, &labels)
+                .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
+            out.push_str(&expanded);
+        } else if t.starts_with('.') {
+            // Directives pass through untouched.
             out.push_str(body);
             out.push('\n');
-            continue;
+        } else {
+            // Instruction (possibly with a leading `label:`): resolve operands.
+            let line = rewrite_line(body, kb, &labels)
+                .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
+            out.push_str(&line);
+            out.push('\n');
         }
-        // Instruction (possibly with a leading `label:`): resolve operands.
-        out.push_str(&rewrite_line(body, kb, &labels)?);
-        out.push('\n');
+        // Every branch above ends each lowered line with '\n', so the count of
+        // newlines just added is exactly how many lowered lines this source line
+        // produced. (`rasm::assemble` enumerates the same lines() the same way.)
+        let added = out[start..].bytes().filter(|&b| b == b'\n').count();
+        map.resize(map.len() + added, src_line);
     }
-    Ok(out)
+    Ok((out, map))
 }
 
 /// Collect labels defined in this source so we never resolve them as constants.
@@ -486,5 +545,52 @@ mod tests {
     fn registers_recognized() {
         assert!(is_register("rcx") && is_register("eax") && is_register("xmm3"));
         assert!(!is_register("MB_OK") && !is_register("main"));
+    }
+
+    #[test]
+    fn split_line_tag_peels_the_prefix() {
+        let (n, rest) = split_line_tag("line 7: encode `xyzzy rax`: unknown mnemonic");
+        assert_eq!(n, Some(7));
+        assert_eq!(rest, "encode `xyzzy rax`: unknown mnemonic");
+        // No tag → message returned verbatim, no line.
+        assert_eq!(split_line_tag("boom"), (None, "boom".to_string()));
+        assert_eq!(split_line_tag("line 7"), (None, "line 7".to_string()));
+        assert_eq!(split_line_tag("line x: y"), (None, "line x: y".to_string()));
+    }
+
+    /// Open the knowledge db, or skip the test if it isn't present here.
+    fn kb() -> Option<Kb> {
+        let db = std::env::var("WINKB_DB")
+            .unwrap_or_else(|_| r"E:\windows_api\windows_api.db".to_string());
+        Kb::open(&db).ok()
+    }
+
+    #[test]
+    fn check_locates_encode_error_at_its_source_line() {
+        let Some(kb) = kb() else { return };
+        // Bogus mnemonic on line 4 (1-based).
+        let src = ".globl main\nmain:\n  mov eax, 1\n  xyzzy rax, rbx\n  ret\n";
+        let diags = check(src, &kb);
+        assert!(diags.iter().any(|d| d.line == 4), "want a diag on line 4: {diags:?}");
+        assert!(!diags.iter().any(|d| d.line == 0), "no whole-file fallback expected: {diags:?}");
+    }
+
+    #[test]
+    fn check_maps_encode_error_back_through_invoke_expansion() {
+        let Some(kb) = kb() else { return };
+        // The `invoke` on line 3 expands to the whole Win64 call sequence (~13
+        // lowered lines); the bad mnemonic on line 4 must still map back to 4.
+        let src = ".globl main\nmain:\n  invoke ExitProcess, 7\n  xyzzy rax\n  ret\n";
+        let diags = check(src, &kb);
+        assert!(diags.iter().any(|d| d.line == 4), "want a diag on line 4: {diags:?}");
+        assert!(!diags.iter().any(|d| d.line == 0), "{diags:?}");
+    }
+
+    #[test]
+    fn check_clean_source_has_no_whole_file_diag() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  invoke ExitProcess, 0\n  ret\n";
+        let diags = check(src, &kb);
+        assert!(diags.is_empty(), "clean source should not flag anything: {diags:?}");
     }
 }
