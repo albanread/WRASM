@@ -1432,8 +1432,16 @@ fn is_ident_char(c: char) -> bool {
 
 fn strip_comment(line: &str) -> &str {
     let mut depth = 0i32;
+    let mut quote = None::<char>;
     for (i, c) in line.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
         match c {
+            '\'' | '"' => quote = Some(c), // a `;`/`#` inside a string isn't a comment
             '[' => depth += 1,
             ']' => depth -= 1,
             ';' | '#' if depth == 0 => return &line[..i],
