@@ -221,9 +221,10 @@ pub fn method_card(kb: &Kb, interface: &str, method: &str) -> Result<Option<Stri
         s.push_str(&format!(" · inherited from `{owner}`"));
     }
     s.push_str(".\n\n### Call it\n\n```was\n");
-    s.push_str(&format!("p.{method}(args…)                  ; typed-pointer form (comobj p : {interface})\n"));
-    s.push_str(&format!("comcall p, {interface}, {method}, args…   ; explicit form\n"));
-    s.push_str("```\n");
+    s.push_str(&format!("p.{method}(args…)\n"));
+    s.push_str(&format!("comcall p, {interface}, {method}, args…\n"));
+    s.push_str("```\n\n");
+    s.push_str(&format!("The `p.{method}(…)` form needs `comobj p : {interface}`.\n"));
     Ok(Some(s))
 }
 
