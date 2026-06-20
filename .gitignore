@@ -4,3 +4,6 @@
 studio_shot_*.png
 # generated binaries are output, never source (studio F5, was CLI, demos)
 *.exe
+*.obj
+# demo render dumps (each demo writes a <name>.bmp of its first frame)
+*.bmp
