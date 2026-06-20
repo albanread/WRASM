@@ -111,27 +111,25 @@ mod gui {
 
     const STARTER: &str = "\
 .globl main
+
+.macro APPEND chr           ; a user macro — generates no code until used
+  mov al, chr
+  mov [rdi + rcx], al
+  inc rcx
+.endmacro
+
 main:
   sub rsp, 64               ; a buffer + scratch on the stack
-  lea rdi, [rsp + 32]       ; rdi = &buffer  (survives the calls below)
+  lea rdi, [rsp + 32]       ; rdi = &buffer
   xor rcx, rcx              ; rcx = index
 
-  mov al, '0'               ; digits 0..9 with repeat / until
-  .repeat
+  .for al = '0' to '9'      ; a counted loop: digits 0..9
     mov [rdi + rcx], al
     inc rcx
-    inc al
-  .until al > '9'
+  .endfor
 
-  mov al, 'a'               ; letters a.., stopping at 'f' with if / break
-  .while al <= 'z'
-    .if al == 'f'
-      .break
-    .endif
-    mov [rdi + rcx], al
-    inc rcx
-    inc al
-  .endw
+  APPEND '!'                ; macro invocations expand inline below
+  APPEND '!'
 
   mov r13, rcx              ; the byte count (saved before invoke clobbers rcx)
   invoke GetStdHandle, -11  ; STD_OUTPUT_HANDLE -> rax
@@ -251,9 +249,9 @@ main:
                 last_mouse: (0.0, 0.0),
                 revealed: false,
             };
-            // Open on the first high-level construct, so the expansion listing
-            // (repeat/until, then while/if/break) is in view on startup.
-            app.doc.set_caret(7, 2);
+            // Open on the macro definition — it generates no code (empty margin),
+            // with the loop and the macro's expansion in the listing below.
+            app.doc.set_caret(2, 2);
             app.after_edit();
             app
         }

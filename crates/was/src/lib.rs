@@ -11,7 +11,7 @@
 //! otherwise it is left for rasm to treat as a label/extern.
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use winkb::Kb;
 
 /// First four integer/pointer argument registers (Win64).
@@ -29,13 +29,28 @@ pub struct Diag {
 /// constants with a "did you mean", bad struct fields) plus a whole-file
 /// syntax/encode pass through rasm. Empty result = clean.
 pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
-    let labels = collect_labels(src);
+    let mut labels = collect_labels(src);
+    labels.extend(macro_names(src)); // a macro invocation is not an unknown name
     let mut diags = Vec::new();
+    let mut in_macro = false;
     for (i, raw) in src.lines().enumerate() {
         let line = i + 1;
         let body = strip_comment(raw);
         let t = body.trim();
         if t.is_empty() {
+            continue;
+        }
+        // A `.macro` definition's params/body are macro-local — skip them here;
+        // real errors surface when the expanded code is assembled below.
+        if strip_keyword(t, ".macro").is_some() {
+            in_macro = true;
+            continue;
+        }
+        if t == ".endmacro" || t == ".endm" {
+            in_macro = false;
+            continue;
+        }
+        if in_macro {
             continue;
         }
         // invoke arg-count check
@@ -188,6 +203,160 @@ fn lev(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// A collected `.macro` definition: its parameter names and raw body lines.
+struct Macro {
+    params: Vec<String>,
+    body: Vec<String>,
+}
+
+/// Expand user `.macro`/`.endmacro` definitions and their invocations, returning
+/// the macro-free source plus a map from each output line (0-based) to the
+/// 1-based original line it came from (a macro body maps to the invocation line).
+/// Definitions themselves produce no output — they generate no code.
+fn expand_macros(src: &str) -> Result<(String, Vec<usize>)> {
+    // Pass 1: collect definitions; keep the rest with their original line numbers.
+    let mut macros: HashMap<String, Macro> = HashMap::new();
+    let mut kept: Vec<(String, usize)> = Vec::new();
+    let mut collecting: Option<(String, Vec<String>, Vec<String>)> = None;
+    for (i, raw) in src.lines().enumerate() {
+        let t = strip_comment(raw).trim();
+        if let Some((_, _, body)) = collecting.as_mut() {
+            if t == ".endmacro" || t == ".endm" {
+                let (name, params, body) = collecting.take().unwrap();
+                macros.insert(name, Macro { params, body });
+            } else if strip_keyword(t, ".macro").is_some() {
+                bail!("line {}: nested `.macro` is not supported", i + 1);
+            } else {
+                body.push(raw.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = strip_keyword(t, ".macro") {
+            let (name, params) = parse_macro_header(rest)
+                .with_context(|| format!("line {}: `{}`", i + 1, raw.trim()))?;
+            collecting = Some((name, params, Vec::new()));
+            continue;
+        }
+        kept.push((raw.to_string(), i + 1));
+    }
+    if collecting.is_some() {
+        bail!("`.macro` without `.endmacro`");
+    }
+    // Pass 2: expand invocations (recursively, so a macro may use another).
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for (line, orig) in kept {
+        expand_line(&line, orig, &macros, &mut out, 0)?;
+    }
+    let mut esrc = String::new();
+    let mut emap = Vec::with_capacity(out.len());
+    for (line, orig) in out {
+        esrc.push_str(&line);
+        esrc.push('\n');
+        emap.push(orig);
+    }
+    Ok((esrc, emap))
+}
+
+/// Parse a `.macro` header `NAME p1, p2` into `(name, params)`.
+fn parse_macro_header(rest: &str) -> Result<(String, Vec<String>)> {
+    let rest = rest.trim();
+    let (name, params) = match rest.split_once(char::is_whitespace) {
+        Some((n, p)) => (n, p),
+        None => (rest, ""),
+    };
+    if name.is_empty() {
+        bail!("`.macro` needs a name");
+    }
+    let params = if params.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_top_commas(params).iter().map(|s| s.trim().to_string()).collect()
+    };
+    Ok((name.to_string(), params))
+}
+
+/// Expand `line` (from original line `orig`) into `out`: if its first word names
+/// a macro, substitute the arguments and recurse on the body; else pass through.
+fn expand_line(
+    line: &str,
+    orig: usize,
+    macros: &HashMap<String, Macro>,
+    out: &mut Vec<(String, usize)>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 64 {
+        bail!("macro expansion too deep (recursive macro?)");
+    }
+    let body = strip_comment(line).trim();
+    let name = body.split(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("");
+    let Some(mac) = macros.get(name) else {
+        out.push((line.to_string(), orig));
+        return Ok(());
+    };
+    let args_str = body[name.len()..].trim();
+    let args: Vec<String> = if args_str.is_empty() {
+        Vec::new()
+    } else {
+        split_top_commas(args_str).iter().map(|s| s.trim().to_string()).collect()
+    };
+    if args.len() != mac.params.len() {
+        bail!("macro `{name}` expects {} argument(s), got {}", mac.params.len(), args.len());
+    }
+    for bline in &mac.body {
+        let sub = substitute_params(bline, &mac.params, &args);
+        expand_line(&sub, orig, macros, out, depth + 1)?;
+    }
+    Ok(())
+}
+
+/// Substitute whole-word parameter names with their arguments in one body line;
+/// string/char literals are copied verbatim.
+fn substitute_params(line: &str, params: &[String], args: &[String]) -> String {
+    let b = line.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '\'' || c == '"' {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i] as char);
+                let done = b[i] as char == c;
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let tok = &line[start..i];
+            match params.iter().position(|p| p == tok) {
+                Some(k) => out.push_str(&args[k]),
+                None => out.push_str(tok),
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The names of every `.macro` defined in `src`.
+fn macro_names(src: &str) -> Vec<String> {
+    src.lines()
+        .filter_map(|raw| {
+            let t = strip_comment(raw).trim();
+            let rest = strip_keyword(t, ".macro")?;
+            parse_macro_header(rest).ok().map(|(name, _)| name)
+        })
+        .collect()
+}
+
 /// Lower `src` to rasm-ready Intel-syntax text.
 pub fn lower(src: &str, kb: &Kb) -> Result<String> {
     Ok(lower_mapped(src, kb)?.0)
@@ -195,11 +364,25 @@ pub fn lower(src: &str, kb: &Kb) -> Result<String> {
 
 /// Lower `src`, also returning a map from each *lowered* line (0-based) back to
 /// the 1-based source line it came from. One source line can expand to many
-/// lowered lines (an `invoke` becomes the whole Win64 call sequence), so this is
-/// what lets [`check`] point a downstream `rasm::assemble` error — whose line
-/// numbers are lowered-line numbers — at the real source line. Lowering errors
-/// are tagged ``line N: …`` with the *source* line directly.
+/// lowered lines (an `invoke`, a `.while`, or a user macro), so this is what lets
+/// [`check`] point a downstream `rasm::assemble` error — whose line numbers are
+/// lowered-line numbers — at the real source line.
+///
+/// User macros are expanded first (a separate textual pass); the two line maps
+/// compose, so a macro's body still maps back to the invocation line.
 pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
+    let (expanded, emap) = expand_macros(src)?;
+    let (lowered, lmap) = lower_expanded(&expanded, kb)?;
+    let map = lmap
+        .into_iter()
+        .map(|el| emap.get(el.wrapping_sub(1)).copied().unwrap_or(0))
+        .collect();
+    Ok((lowered, map))
+}
+
+/// Lower already-macro-expanded `src`. The returned map is the 1-based *expanded*
+/// line per lowered line; [`lower_mapped`] composes it back to source lines.
+fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     let labels = collect_labels(src);
     let mut out = String::new();
     let mut map: Vec<usize> = Vec::new();
@@ -934,6 +1117,45 @@ mod tests {
         let low = lower(src, &kb).expect("lower");
         assert!(low.contains("jle __while0_end"), "signed `s>` exits with jle:\n{low}");
         assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn macro_header_and_names() {
+        assert_eq!(
+            parse_macro_header("PUSH2 a, b").unwrap(),
+            ("PUSH2".to_string(), vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(parse_macro_header("NOARGS").unwrap(), ("NOARGS".to_string(), vec![]));
+        assert_eq!(macro_names(".macro FOO x\n  nop\n.endmacro\n  FOO 1\n"), vec!["FOO".to_string()]);
+    }
+
+    #[test]
+    fn macro_expands_args_and_definition_emits_no_code() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\n.macro PUSH2 a, b\n  push a\n  push b\n.endmacro\nmain:\n  PUSH2 rcx, rdx\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        assert!(low.contains("push rcx") && low.contains("push rdx"), "args substituted:\n{low}");
+        assert!(!low.contains(".macro"), "definition must emit nothing:\n{low}");
+        assert!(!low.contains("PUSH2"), "invocation must be gone:\n{low}");
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn macro_can_use_high_level_constructs_twice() {
+        let Some(kb) = kb() else { return };
+        // A macro that loops; invoked twice → two independent loops (fresh ids).
+        let src = ".globl main\n.macro COUNTDOWN n\n  mov al, n\n  .while al > 0\n    sub al, 1\n  .endw\n.endmacro\nmain:\n  COUNTDOWN 3\n  COUNTDOWN 5\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        assert!(low.contains("__while0_top:") && low.contains("__while1_top:"), "two loops:\n{low}");
+        assert!(low.contains("mov al, 3") && low.contains("mov al, 5"), "args substituted:\n{low}");
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn macro_arg_count_mismatch_errors() {
+        let Some(kb) = kb() else { return };
+        let err = lower(".macro M a, b\n  nop\n.endmacro\nmain:\n  M 1\n", &kb).unwrap_err();
+        assert!(format!("{err:#}").contains("expects 2"), "{err:#}");
     }
 
     #[test]
