@@ -1,0 +1,202 @@
+; plasma.was — the demoscene "plasma" effect, animated, in a software framebuffer.
+;
+;   was examples\plasma.was -o plasma.exe   &&   plasma.exe
+;
+; The whole trick is a PRECOMPUTED SINE TABLE. Computing sin() per pixel would
+; be far too slow (and there is no x86 sine instruction worth using here), so we
+; bake one wave into a 256-byte lookup table once, at assemble time, and only
+; ever do table reads + integer adds in the hot loop.
+;
+; For each pixel we sum a few sine waves (one along x, one along y, one along the
+; diagonal), all scrolling by a per-frame counter `tick`. That sum picks a colour
+; out of the SAME table, read three times at 120-degree phase offsets — which
+; turns one wave into a smooth red/green/blue rainbow. Bump `tick` each frame and
+; the whole field flows.
+;
+; sintab[i] = round(127.5 + 127.5*sin(i * 2pi / 256))   (values 0..255)
+;
+; The first frame is also saved to plasma.bmp.
+
+.DATA
+; ---- the precomputed sine table: one full wave, 256 bytes, range 0..255 ----
+sintab  BYTE 128, 131, 134, 137, 140, 143, 146, 149, 152, 155, 158, 162, 165, 167, 170, 173
+        BYTE 176, 179, 182, 185, 188, 190, 193, 196, 198, 201, 203, 206, 208, 211, 213, 215
+        BYTE 218, 220, 222, 224, 226, 228, 230, 232, 234, 235, 237, 238, 240, 241, 243, 244
+        BYTE 245, 246, 248, 249, 250, 250, 251, 252, 253, 253, 254, 254, 254, 255, 255, 255
+        BYTE 255, 255, 255, 255, 254, 254, 254, 253, 253, 252, 251, 250, 250, 249, 248, 246
+        BYTE 245, 244, 243, 241, 240, 238, 237, 235, 234, 232, 230, 228, 226, 224, 222, 220
+        BYTE 218, 215, 213, 211, 208, 206, 203, 201, 198, 196, 193, 190, 188, 185, 182, 179
+        BYTE 176, 173, 170, 167, 165, 162, 158, 155, 152, 149, 146, 143, 140, 137, 134, 131
+        BYTE 128, 124, 121, 118, 115, 112, 109, 106, 103, 100, 97, 93, 90, 88, 85, 82
+        BYTE 79, 76, 73, 70, 67, 65, 62, 59, 57, 54, 52, 49, 47, 44, 42, 40
+        BYTE 37, 35, 33, 31, 29, 27, 25, 23, 21, 20, 18, 17, 15, 14, 12, 11
+        BYTE 10, 9, 7, 6, 5, 5, 4, 3, 2, 2, 1, 1, 1, 0, 0, 0
+        BYTE 0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 4, 5, 5, 6, 7, 9
+        BYTE 10, 11, 12, 14, 15, 17, 18, 20, 21, 23, 25, 27, 29, 31, 33, 35
+        BYTE 37, 40, 42, 44, 47, 49, 52, 54, 57, 59, 62, 65, 67, 70, 73, 76
+        BYTE 79, 82, 85, 88, 90, 93, 97, 100, 103, 106, 109, 112, 115, 118, 121, 124
+
+tick        DWORD  0                  ; animation time, advanced each frame
+className   WCHAR  "rasm_plasma", 0
+titleText   WCHAR  "RASM — plasma (precomputed sine table)", 0
+fname       WCHAR  "plasma.bmp", 0
+wc          BYTE   80 dup(0)
+bmi         BYTE   40 dup(0)
+msg         BYTE   48 dup(0)
+ps          BYTE   72 dup(0)
+filehdr     BYTE   0x42,0x4D, 0x36,0xC4,0x12,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+fb          QWORD  ?
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4
+    mov     [rip + fb], rax
+
+    call    render                      ; first frame
+
+    ; BITMAPINFOHEADER (top-down 32bpp)
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 1228800, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; window
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0     ; ~60 Hz
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- render one plasma frame into the framebuffer ----
+; rdi is non-volatile (callee-saved), so we save it; everything else here is a
+; volatile (scratch) register.
+;   r8  = &sintab     r9 = tick     r10 = y     r11 = x     rdi = pixel pointer
+render:
+    push    rdi
+    lea     r8, [rip + sintab]
+    mov     r9d, [rip + tick]
+    mov     rdi, [rip + fb]
+    xor     r10, r10                    ; y
+pl_y:
+    xor     r11, r11                    ; x
+pl_x:
+    ; --- v = three scrolling sine waves summed (0..765) ---
+    mov     eax, r11d                   ; wave along x:  sintab[(x/2 + tick) & 255]
+    shr     eax, 1
+    add     eax, r9d
+    and     eax, 255
+    movzx   ecx, byte ptr [r8 + rax]    ; ecx = running sum
+
+    mov     eax, r10d                   ; wave along y:  sintab[(y/2 + tick) & 255]
+    shr     eax, 1
+    add     eax, r9d
+    and     eax, 255
+    movzx   edx, byte ptr [r8 + rax]
+    add     ecx, edx
+
+    mov     eax, r11d                   ; diagonal wave:  sintab[((x+y)/8 + tick) & 255]
+    add     eax, r10d
+    shr     eax, 3
+    add     eax, r9d
+    and     eax, 255
+    movzx   edx, byte ptr [r8 + rax]
+    add     ecx, edx                    ; ecx = v
+
+    shr     ecx, 1                      ; fold the sum into a palette index 0..255
+    and     ecx, 255
+
+    ; --- colour = the same table read at three 120-degree phase offsets ---
+    movzx   eax, byte ptr [r8 + rcx]    ; R = sintab[idx]
+    shl     eax, 16
+    mov     edx, ecx                    ; G = sintab[(idx + 85) & 255]
+    add     edx, 85
+    and     edx, 255
+    movzx   edx, byte ptr [r8 + rdx]
+    shl     edx, 8
+    or      eax, edx
+    mov     edx, ecx                    ; B = sintab[(idx + 170) & 255]
+    add     edx, 170
+    and     edx, 255
+    movzx   edx, byte ptr [r8 + rdx]
+    or      eax, edx                    ; eax = 0x00RRGGBB
+    mov     [rdi], eax
+    add     rdi, 4
+
+    inc     r11
+    cmp     r11, 640
+    jb      pl_x
+    inc     r10
+    cmp     r10, 480
+    jb      pl_y
+    pop     rdi
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                     ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                      ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                    ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    add     dword ptr [rip + tick], 2   ; scroll the waves
+    call    render
+    invoke  InvalidateRect, [rip + hwndSave], 0, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
