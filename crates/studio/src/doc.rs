@@ -119,6 +119,66 @@ impl Doc {
         self.lines[row].replace_range(start..end, replacement);
         self.caret.col = start + replacement.len();
     }
+
+    /// Snap a byte column to the nearest char boundary at or before it, clamped
+    /// to the line length — so a column carried across rows never lands mid-char.
+    fn snap(&self, row: usize, col: usize) -> usize {
+        let line = &self.lines[row];
+        let mut c = col.min(line.len());
+        while c > 0 && !line.is_char_boundary(c) {
+            c -= 1;
+        }
+        c
+    }
+
+    /// Move one character left, wrapping to the end of the previous line.
+    pub fn move_left(&mut self) {
+        let Caret { row, col } = self.caret;
+        if col > 0 {
+            let prev = self.lines[row][..col].chars().next_back().unwrap();
+            self.caret.col = col - prev.len_utf8();
+        } else if row > 0 {
+            self.caret = Caret { row: row - 1, col: self.lines[row - 1].len() };
+        }
+    }
+
+    /// Move one character right, wrapping to the start of the next line.
+    pub fn move_right(&mut self) {
+        let Caret { row, col } = self.caret;
+        let line = &self.lines[row];
+        if col < line.len() {
+            let next = line[col..].chars().next().unwrap();
+            self.caret.col = col + next.len_utf8();
+        } else if row + 1 < self.lines.len() {
+            self.caret = Caret { row: row + 1, col: 0 };
+        }
+    }
+
+    /// Move to the previous line, keeping the column (clamped to that line).
+    pub fn move_up(&mut self) {
+        if self.caret.row > 0 {
+            let row = self.caret.row - 1;
+            self.caret = Caret { row, col: self.snap(row, self.caret.col) };
+        }
+    }
+
+    /// Move to the next line, keeping the column (clamped to that line).
+    pub fn move_down(&mut self) {
+        if self.caret.row + 1 < self.lines.len() {
+            let row = self.caret.row + 1;
+            self.caret = Caret { row, col: self.snap(row, self.caret.col) };
+        }
+    }
+
+    /// Caret to the start of the line.
+    pub fn home(&mut self) {
+        self.caret.col = 0;
+    }
+
+    /// Caret to the end of the line.
+    pub fn end(&mut self) {
+        self.caret.col = self.lines[self.caret.row].len();
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +268,45 @@ mod tests {
         d.insert("\nmov rax, 1\nret");
         assert_eq!(d.text(), "head\nmov rax, 1\nret\ntail");
         assert_eq!(d.caret, Caret { row: 2, col: 3 });
+    }
+
+    #[test]
+    fn move_left_right_wrap_across_lines() {
+        let mut d = Doc::from_str("ab\ncd");
+        d.set_caret(1, 0);
+        d.move_left(); // wraps to end of line 0
+        assert_eq!(d.caret, Caret { row: 0, col: 2 });
+        d.move_right(); // wraps back to start of line 1
+        assert_eq!(d.caret, Caret { row: 1, col: 0 });
+        // At the very start, left is a no-op.
+        d.set_caret(0, 0);
+        d.move_left();
+        assert_eq!(d.caret, Caret { row: 0, col: 0 });
+        // At the very end, right is a no-op.
+        d.set_caret(1, 2);
+        d.move_right();
+        assert_eq!(d.caret, Caret { row: 1, col: 2 });
+    }
+
+    #[test]
+    fn move_up_down_clamps_the_column() {
+        let mut d = Doc::from_str("longline\nhi\nanother");
+        d.set_caret(0, 8); // end of "longline"
+        d.move_down(); // "hi" is shorter → clamp to col 2
+        assert_eq!(d.caret, Caret { row: 1, col: 2 });
+        d.move_down(); // "another" is long enough → keep col 2
+        assert_eq!(d.caret, Caret { row: 2, col: 2 });
+        d.move_up();
+        assert_eq!(d.caret, Caret { row: 1, col: 2 });
+    }
+
+    #[test]
+    fn home_and_end() {
+        let mut d = Doc::from_str("  mov rax, 1");
+        d.set_caret(0, 5);
+        d.home();
+        assert_eq!(d.caret, Caret { row: 0, col: 0 });
+        d.end();
+        assert_eq!(d.caret, Caret { row: 0, col: 12 });
     }
 }
