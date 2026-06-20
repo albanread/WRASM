@@ -90,7 +90,7 @@ pub fn function_card(kb: &Kb, name: &str) -> Result<Option<String>> {
                 "| {} | `{}` | {} | {} |\n",
                 p.ordinal,
                 p.name,
-                p.type_name,
+                short_type(&p.type_name),
                 values_cell(&p.related),
             ));
         }
@@ -146,7 +146,7 @@ pub fn struct_card(kb: &Kb, name: &str) -> Result<Option<String>> {
     if !l.fields.is_empty() {
         s.push_str("| offset | field | type |\n|--:|---|---|\n");
         for fld in &l.fields {
-            s.push_str(&format!("| +{} | `{}` | {} |\n", fld.offset, fld.name, fld.type_name));
+            s.push_str(&format!("| +{} | `{}` | {} |\n", fld.offset, fld.name, short_type(&fld.type_name)));
         }
         s.push('\n');
     }
@@ -222,6 +222,13 @@ fn values_cell(related: &[(String, u64)]) -> String {
     } else {
         shown
     }
+}
+
+/// Trim a fully-qualified Windows-metadata type to its last component, so a
+/// table's type column shows `BITMAPINFO*` instead of the whole namespace path
+/// `Windows.Win32.Graphics.Gdi.BITMAPINFO*`. Short names pass through unchanged.
+fn short_type(t: &str) -> &str {
+    t.rsplit('.').next().unwrap_or(t)
 }
 
 #[allow(dead_code)]
