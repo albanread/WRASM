@@ -111,8 +111,20 @@ mod gui {
     const STARTER: &str = "\
 .globl main
 main:
-  invoke ExitProcess, 42
-  ret
+  sub rsp, 64               ; a 26-byte buffer + scratch on the stack
+  lea rdi, [rsp + 32]       ; rdi = &buffer  (survives the calls below)
+  xor rcx, rcx              ; rcx = index
+  mov al, 'a'
+  .while al <= 'z'
+    mov [rdi + rcx], al     ; buffer[i] = letter
+    inc al
+    inc rcx
+  .endw
+  invoke GetStdHandle, -11  ; STD_OUTPUT_HANDLE -> rax
+  mov rsi, rax              ; rsi = stdout (survives the call)
+  lea r12, [rsp + 24]       ; r12 = &bytesWritten
+  invoke WriteFile, rsi, rdi, 26, r12, 0
+  invoke ExitProcess, 0
 ";
 
     /// A token's editor colour (VS Code Dark+ family).
@@ -199,8 +211,8 @@ main:
                 card_scroll: 0.0,
                 card_max_scroll: 0.0,
             };
-            // Land the caret on `ExitProcess` so the first card is a real one.
-            app.doc.set_caret(2, 9);
+            // Land the caret on `WriteFile` so the first card is a real one.
+            app.doc.set_caret(14, 9);
             app.after_edit();
             app
         }
@@ -227,20 +239,14 @@ main:
                     self.diags = diags;
                 }
             }
-            let mut rows = Vec::with_capacity(self.doc.line_count());
-            for r in 0..self.doc.line_count() {
-                let line = self.doc.line(r).to_string();
-                let listing = self
-                    .lang
-                    .as_ref()
-                    .and_then(|l| match l.listing(&line) {
-                        Some(Response::Listing { rows, .. }) => Some(rows),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                rows.push(listing);
-            }
-            self.line_listing = rows;
+            self.line_listing = self
+                .lang
+                .as_ref()
+                .and_then(|l| match l.listing(&self.doc.text()) {
+                    Some(Response::Listing { rows, .. }) => Some(rows),
+                    _ => None,
+                })
+                .unwrap_or_default();
             self.after_caret();
         }
 

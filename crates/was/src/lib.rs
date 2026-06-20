@@ -199,10 +199,14 @@ pub fn lower(src: &str, kb: &Kb) -> Result<String> {
 /// what lets [`check`] point a downstream `rasm::assemble` error — whose line
 /// numbers are lowered-line numbers — at the real source line. Lowering errors
 /// are tagged ``line N: …`` with the *source* line directly.
-fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
+pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     let labels = collect_labels(src);
     let mut out = String::new();
     let mut map: Vec<usize> = Vec::new();
+    // High-level loop state: a counter for unique labels, and a stack matching
+    // each `.endw` to its `.while` so loops can nest.
+    let mut loop_ctr = 0usize;
+    let mut loop_stack: Vec<usize> = Vec::new();
     for (i, raw) in src.lines().enumerate() {
         let src_line = i + 1;
         let start = out.len();
@@ -215,6 +219,20 @@ fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             let expanded = expand_invoke(rest, kb, &labels)
                 .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
             out.push_str(&expanded);
+        } else if let Some(cond) = strip_keyword(t, ".while") {
+            // `.while reg <relop> val` → top label, the test, and the exit branch.
+            let id = loop_ctr;
+            loop_ctr += 1;
+            loop_stack.push(id);
+            let expanded = expand_while(cond, id, kb, &labels)
+                .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
+            out.push_str(&expanded);
+        } else if t == ".endw" {
+            // `.endw` → jump back to the matching top, then the exit label.
+            let id = loop_stack
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("line {src_line}: `.endw` without a `.while`"))?;
+            out.push_str(&expand_endw(id));
         } else if t.starts_with('.') {
             // Directives pass through untouched.
             out.push_str(body);
@@ -233,6 +251,56 @@ fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
         map.resize(map.len() + added, src_line);
     }
     Ok((out, map))
+}
+
+/// The conditional branch that *exits* a `.while` — taken when the loop
+/// condition is false. Unsigned (`ja`/`jb`/…), the right choice for the counters
+/// and characters these loops iterate.
+fn while_exit_branch(relop: &str) -> Option<&'static str> {
+    Some(match relop {
+        "<=" => "ja",
+        "<" => "jae",
+        ">=" => "jb",
+        ">" => "jbe",
+        "==" => "jne",
+        "!=" => "je",
+        _ => return None,
+    })
+}
+
+/// Split a `.while` condition into `(lhs, relop, rhs)`; two-char operators first.
+fn split_condition(cond: &str) -> Option<(&str, &str, &str)> {
+    for op in ["<=", ">=", "==", "!="] {
+        if let Some(p) = cond.find(op) {
+            return Some((&cond[..p], op, &cond[p + op.len()..]));
+        }
+    }
+    for op in ["<", ">"] {
+        if let Some(p) = cond.find(op) {
+            return Some((&cond[..p], op, &cond[p + 1..]));
+        }
+    }
+    None
+}
+
+/// Expand `.while reg <relop> val` to its top label, the comparison, and the
+/// branch that leaves the loop. Operands resolve like any instruction's, so a
+/// constant or `'z'` works as the bound.
+fn expand_while(cond: &str, id: usize, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+    let (lhs, relop, rhs) = split_condition(cond)
+        .ok_or_else(|| anyhow::anyhow!("`.while` wants `reg <relop> value`, got `{cond}`"))?;
+    let branch = while_exit_branch(relop)
+        .ok_or_else(|| anyhow::anyhow!("`.while`: unknown operator `{relop}`"))?;
+    let lhs = resolve_operands(lhs.trim(), kb, labels)?;
+    let rhs = resolve_operands(rhs.trim(), kb, labels)?;
+    Ok(format!(
+        "__while{id}_top:\n  cmp {lhs}, {rhs}\n  {branch} __while{id}_end\n"
+    ))
+}
+
+/// Expand `.endw` to the back-jump to the loop top and the exit label.
+fn expand_endw(id: usize) -> String {
+    format!("  jmp __while{id}_top\n__while{id}_end:\n")
 }
 
 /// Collect labels defined in this source so we never resolve them as constants.
@@ -592,5 +660,34 @@ mod tests {
         let src = ".globl main\nmain:\n  invoke ExitProcess, 0\n  ret\n";
         let diags = check(src, &kb);
         assert!(diags.is_empty(), "clean source should not flag anything: {diags:?}");
+    }
+
+    #[test]
+    fn while_condition_parsing() {
+        assert_eq!(split_condition("al <= 'z'"), Some(("al ", "<=", " 'z'")));
+        assert_eq!(split_condition("rcx < 26"), Some(("rcx ", "<", " 26")));
+        assert_eq!(split_condition("al != 0"), Some(("al ", "!=", " 0")));
+        assert!(split_condition("al z").is_none());
+        assert_eq!(while_exit_branch("<="), Some("ja"));
+        assert_eq!(while_exit_branch(">"), Some("jbe"));
+        assert!(while_exit_branch("~~").is_none());
+    }
+
+    #[test]
+    fn while_loop_lowers_to_branches_and_labels() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  mov al, 'a'\n  .while al <= 'z'\n    inc al\n  .endw\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        for want in ["__while0_top:", "cmp al, 'z'", "ja __while0_end", "jmp __while0_top", "__while0_end:"] {
+            assert!(low.contains(want), "expansion missing {want:?}:\n{low}");
+        }
+        assert!(rasm::assemble(&low).is_ok(), "the expansion assembles:\n{low}");
+    }
+
+    #[test]
+    fn endw_without_while_is_an_error() {
+        let Some(kb) = kb() else { return };
+        let err = lower("main:\n  .endw\n", &kb).unwrap_err();
+        assert!(format!("{err:#}").contains(".endw"), "{err:#}");
     }
 }

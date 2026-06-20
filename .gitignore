@@ -1,5 +1,6 @@
 /target
 
-# studio --shot / F12 offscreen review captures, and F5 build output
+# studio --shot / F12 offscreen review captures
 studio_shot_*.png
-studio_build.exe
+# generated binaries are output, never source (studio F5, was CLI, demos)
+*.exe
