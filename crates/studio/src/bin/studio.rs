@@ -33,7 +33,7 @@ mod gui {
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
-    use windows::core::{w, PCWSTR};
+    use windows::core::{w, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
@@ -64,8 +64,8 @@ mod gui {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F5, VK_HOME,
-        VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP, VIRTUAL_KEY,
+        GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F5, VK_F6,
+        VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
@@ -75,6 +75,14 @@ mod gui {
         WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
         WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN,
         WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, GetMenuItemCount,
+        SetMenu, SetWindowTextW, HMENU, MF_BYPOSITION, MF_POPUP, MF_SEPARATOR, MF_STRING, WM_COMMAND,
+    };
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_OVERWRITEPROMPT,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
 
     use docpane::layout::Layout;
@@ -120,6 +128,26 @@ mod gui {
     const VK_X: VIRTUAL_KEY = VIRTUAL_KEY(0x58);
     const VK_Y: VIRTUAL_KEY = VIRTUAL_KEY(0x59);
     const VK_Z: VIRTUAL_KEY = VIRTUAL_KEY(0x5A);
+    const VK_N: VIRTUAL_KEY = VIRTUAL_KEY(0x4E);
+    const VK_O: VIRTUAL_KEY = VIRTUAL_KEY(0x4F);
+    const VK_S: VIRTUAL_KEY = VIRTUAL_KEY(0x53);
+
+    // Menu command ids (WM_COMMAND low word).
+    const IDM_NEW: u16 = 0x100;
+    const IDM_OPEN: u16 = 0x101;
+    const IDM_SAVE: u16 = 0x102;
+    const IDM_SAVEAS: u16 = 0x103;
+    const IDM_EXPORT: u16 = 0x104;
+    const IDM_EXIT: u16 = 0x105;
+    const IDM_UNDO: u16 = 0x110;
+    const IDM_REDO: u16 = 0x111;
+    const IDM_CUT: u16 = 0x112;
+    const IDM_COPY: u16 = 0x113;
+    const IDM_PASTE: u16 = 0x114;
+    const IDM_SELALL: u16 = 0x115;
+    const IDM_BUILD: u16 = 0x120;
+    const IDM_RUN: u16 = 0x121;
+    const IDM_RECENT_BASE: u16 = 0x200; // recent files occupy base .. base + N
 
     const STARTER: &str = "\
 .globl main
@@ -238,6 +266,77 @@ main:
         out
     }
 
+    // ── menu + dialog + recent-file helpers ──────────────────────────────────
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    unsafe fn menu_str(m: HMENU, id: u16, label: &str) {
+        let w = wide(label);
+        let _ = AppendMenuW(m, MF_STRING, id as usize, PCWSTR(w.as_ptr()));
+    }
+    unsafe fn menu_popup(m: HMENU, sub: HMENU, label: &str) {
+        let w = wide(label);
+        let _ = AppendMenuW(m, MF_POPUP, sub.0 as usize, PCWSTR(w.as_ptr()));
+    }
+    unsafe fn menu_sep(m: HMENU) {
+        let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+
+    /// A common file dialog; `save` picks open vs. save, `ext` the default
+    /// extension for saving. Returns the chosen path.
+    unsafe fn file_dialog(hwnd: HWND, save: bool, ext: &str) -> Option<PathBuf> {
+        let mut buf = [0u16; 1024];
+        let filter: Vec<u16> = "WRASM source\0*.was\0Listing\0*.lst\0All files\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+        let defext = wide(ext);
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: hwnd,
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            lpstrFile: PWSTR(buf.as_mut_ptr()),
+            nMaxFile: buf.len() as u32,
+            lpstrDefExt: PCWSTR(defext.as_ptr()),
+            Flags: if save {
+                OFN_OVERWRITEPROMPT
+            } else {
+                OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST
+            },
+            ..Default::default()
+        };
+        let ok = if save {
+            GetSaveFileNameW(&mut ofn).as_bool()
+        } else {
+            GetOpenFileNameW(&mut ofn).as_bool()
+        };
+        if !ok {
+            return None;
+        }
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        Some(PathBuf::from(String::from_utf16_lossy(&buf[..end])))
+    }
+
+    fn recent_file() -> Option<PathBuf> {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("rasm-studio").join("recent.txt"))
+    }
+    fn load_recent() -> Vec<PathBuf> {
+        recent_file()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+            .unwrap_or_default()
+    }
+    fn save_recent(recent: &[PathBuf]) {
+        if let Some(p) = recent_file() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let body =
+                recent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+            let _ = std::fs::write(p, body);
+        }
+    }
+
     struct App {
         hwnd: HWND,
         dpi: u32,
@@ -277,6 +376,13 @@ main:
         pending_card: u64,
         /// True while the mouse is dragging out a selection.
         dragging: bool,
+
+        /// The file the buffer is associated with (`None` = untitled).
+        path: Option<PathBuf>,
+        /// Recently opened files (most recent first).
+        recent: Vec<PathBuf>,
+        /// The "Open Recent" popup, rebuilt as `recent` changes.
+        recent_menu: HMENU,
     }
 
     impl App {
@@ -316,7 +422,12 @@ main:
                 pending_listing: 0,
                 pending_card: 0,
                 dragging: false,
+                path: None,
+                recent: load_recent(),
+                recent_menu: HMENU::default(),
             };
+            unsafe { app.build_menu() };
+            app.update_title();
             // Open on the macro definition — it generates no code (empty margin),
             // with the loop and the macro's expansion in the listing below.
             app.doc.set_caret(2, 2);
@@ -911,6 +1022,10 @@ main:
                     VK_Z if shift => self.do_redo(),
                     VK_Z => self.do_undo(),
                     VK_Y => self.do_redo(),
+                    VK_N => self.file_new(),
+                    VK_O => self.file_open_dialog(),
+                    VK_S if shift => self.file_save_as(),
+                    VK_S => self.file_save(),
                     _ => return false,
                 }
                 self.invalidate();
@@ -942,6 +1057,10 @@ main:
                 VK_DELETE => return self.edit(|d| d.delete_forward()),
                 VK_F5 => {
                     self.build_exe();
+                    return true;
+                }
+                VK_F6 => {
+                    self.run_exe();
                     return true;
                 }
                 VK_F12 => {
@@ -985,6 +1104,212 @@ main:
         fn do_redo(&mut self) {
             if self.doc.redo() {
                 self.after_edit();
+            }
+        }
+
+        // ── menu + file commands ─────────────────────────────────────────────
+
+        unsafe fn build_menu(&mut self) {
+            let bar = CreateMenu().unwrap_or_default();
+            let file = CreatePopupMenu().unwrap_or_default();
+            self.recent_menu = CreatePopupMenu().unwrap_or_default();
+            let edit = CreatePopupMenu().unwrap_or_default();
+            let asm = CreatePopupMenu().unwrap_or_default();
+
+            menu_str(file, IDM_NEW, "&New\tCtrl+N");
+            menu_str(file, IDM_OPEN, "&Open…\tCtrl+O");
+            menu_popup(file, self.recent_menu, "Open &Recent");
+            menu_sep(file);
+            menu_str(file, IDM_SAVE, "&Save\tCtrl+S");
+            menu_str(file, IDM_SAVEAS, "Save &As…\tCtrl+Shift+S");
+            menu_str(file, IDM_EXPORT, "&Export Listing…");
+            menu_sep(file);
+            menu_str(file, IDM_EXIT, "E&xit");
+
+            menu_str(edit, IDM_UNDO, "&Undo\tCtrl+Z");
+            menu_str(edit, IDM_REDO, "&Redo\tCtrl+Y");
+            menu_sep(edit);
+            menu_str(edit, IDM_CUT, "Cu&t\tCtrl+X");
+            menu_str(edit, IDM_COPY, "&Copy\tCtrl+C");
+            menu_str(edit, IDM_PASTE, "&Paste\tCtrl+V");
+            menu_str(edit, IDM_SELALL, "Select &All\tCtrl+A");
+
+            menu_str(asm, IDM_BUILD, "&Build .exe\tF5");
+            menu_str(asm, IDM_RUN, "&Run\tF6");
+
+            menu_popup(bar, file, "&File");
+            menu_popup(bar, edit, "&Edit");
+            menu_popup(bar, asm, "&Assembler");
+            let _ = SetMenu(self.hwnd, Some(bar));
+            self.rebuild_recent_menu();
+            let _ = DrawMenuBar(self.hwnd);
+        }
+
+        unsafe fn rebuild_recent_menu(&self) {
+            while GetMenuItemCount(Some(self.recent_menu)) > 0 {
+                let _ = DeleteMenu(self.recent_menu, 0, MF_BYPOSITION);
+            }
+            if self.recent.is_empty() {
+                menu_str(self.recent_menu, 0, "(none)");
+                return;
+            }
+            for (i, p) in self.recent.iter().take(9).enumerate() {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string());
+                menu_str(self.recent_menu, IDM_RECENT_BASE + i as u16, &format!("&{} {name}", i + 1));
+            }
+        }
+
+        /// Dispatch a menu command (WM_COMMAND low word).
+        fn on_command(&mut self, id: u16) {
+            match id {
+                IDM_NEW => self.file_new(),
+                IDM_OPEN => self.file_open_dialog(),
+                IDM_SAVE => self.file_save(),
+                IDM_SAVEAS => self.file_save_as(),
+                IDM_EXPORT => self.export_listing(),
+                IDM_EXIT => unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+                },
+                IDM_UNDO => self.do_undo(),
+                IDM_REDO => self.do_redo(),
+                IDM_CUT => self.clipboard_cut(),
+                IDM_COPY => self.clipboard_copy(),
+                IDM_PASTE => self.clipboard_paste(),
+                IDM_SELALL => {
+                    self.doc.select_all();
+                    self.invalidate();
+                }
+                IDM_BUILD => self.build_exe(),
+                IDM_RUN => self.run_exe(),
+                id if id >= IDM_RECENT_BASE => {
+                    if let Some(p) = self.recent.get((id - IDM_RECENT_BASE) as usize).cloned() {
+                        self.file_open(&p);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn file_new(&mut self) {
+            self.doc = Doc::from_str("");
+            self.path = None;
+            self.editor_scroll = 0.0;
+            self.after_edit();
+            self.update_title();
+            self.invalidate();
+        }
+
+        fn file_open(&mut self, path: &Path) {
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    self.doc = Doc::from_str(&text);
+                    self.path = Some(path.to_path_buf());
+                    self.editor_scroll = 0.0;
+                    self.add_recent(path);
+                    self.after_edit();
+                    self.update_title();
+                }
+                Err(e) => self.notice = format!("open failed: {e}"),
+            }
+            self.invalidate();
+        }
+
+        fn file_open_dialog(&mut self) {
+            if let Some(p) = unsafe { file_dialog(self.hwnd, false, "was") } {
+                self.file_open(&p);
+            }
+        }
+
+        fn file_save(&mut self) {
+            match self.path.clone() {
+                Some(p) => self.write_to(&p),
+                None => self.file_save_as(),
+            }
+        }
+
+        fn file_save_as(&mut self) {
+            if let Some(p) = unsafe { file_dialog(self.hwnd, true, "was") } {
+                self.write_to(&p);
+                self.path = Some(p.clone());
+                self.add_recent(&p);
+                self.update_title();
+            }
+        }
+
+        fn write_to(&mut self, path: &Path) {
+            self.notice = match std::fs::write(path, self.doc.text()) {
+                Ok(()) => format!("saved {}", path.display()),
+                Err(e) => format!("save failed: {e}"),
+            };
+            self.invalidate();
+        }
+
+        fn export_listing(&mut self) {
+            if let Some(p) = unsafe { file_dialog(self.hwnd, true, "lst") } {
+                self.notice = match std::fs::write(&p, self.listing_text()) {
+                    Ok(()) => format!("exported listing to {}", p.display()),
+                    Err(e) => format!("export failed: {e}"),
+                };
+                self.invalidate();
+            }
+        }
+
+        /// A plain-text assembler listing: each source line, then its expansion.
+        fn listing_text(&self) -> String {
+            let mut out = String::new();
+            for row in 0..self.doc.line_count() {
+                out.push_str(&format!("{:>4}  {}\n", row + 1, self.doc.line(row)));
+                if self.is_macro(row) {
+                    for (bytes, mask, asm) in self.listing(row) {
+                        out.push_str(&format!("      {:<26}{asm}\n", hex_masked(bytes, mask)));
+                    }
+                }
+            }
+            out
+        }
+
+        fn run_exe(&mut self) {
+            let Some(lang) = self.lang.as_ref() else { return };
+            let out = std::env::temp_dir().join("studio_run.exe");
+            self.notice = match lang.assemble(&self.doc.text(), Emit::Exe) {
+                Some(Response::Assembled { bytes, .. }) if std::fs::write(&out, &bytes).is_ok() => {
+                    // A new console window that stays open after the program exits.
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/C", "start", "", "cmd", "/K", &out.to_string_lossy()])
+                        .spawn();
+                    format!("running {}", out.display())
+                }
+                Some(Response::Error { message, .. }) => format!("build error: {message}"),
+                _ => "build failed".to_string(),
+            };
+            self.invalidate();
+        }
+
+        fn add_recent(&mut self, path: &Path) {
+            let p = path.to_path_buf();
+            self.recent.retain(|x| x != &p);
+            self.recent.insert(0, p);
+            self.recent.truncate(9);
+            save_recent(&self.recent);
+            unsafe {
+                self.rebuild_recent_menu();
+                let _ = DrawMenuBar(self.hwnd);
+            }
+        }
+
+        fn update_title(&self) {
+            let name = self
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "untitled".to_string());
+            let title = wide(&format!("RASM Studio — {name}"));
+            unsafe {
+                let _ = SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr()));
             }
         }
 
@@ -1315,6 +1640,10 @@ main:
         match msg {
             WM_TIMER => {
                 app.poll_lang();
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                app.on_command((wparam.0 & 0xFFFF) as u16);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1), // we paint the whole client in WM_PAINT
