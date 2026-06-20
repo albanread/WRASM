@@ -1342,6 +1342,14 @@ fn collect_com_objs(src: &str) -> std::collections::HashMap<String, String> {
     m
 }
 
+/// The `comobj NAME : Interface` bindings declared in `src`, as sorted
+/// `(name, interface)` pairs — for the IDE to resolve a typed pointer.
+pub fn com_bindings(src: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = collect_com_objs(src).into_iter().collect();
+    v.sort();
+    v
+}
+
 /// Recognise a typed COM method call `obj.Method(args)` where `obj` is a declared
 /// `comobj`. Returns `(obj, interface, method, args)`.
 fn parse_method_call(

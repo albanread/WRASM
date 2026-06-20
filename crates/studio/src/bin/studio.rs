@@ -383,6 +383,8 @@ main:
         recent: Vec<PathBuf>,
         /// The "Open Recent" popup, rebuilt as `recent` changes.
         recent_menu: HMENU,
+        /// `comobj NAME : Interface` bindings in the buffer (for COM-aware cards).
+        com_binds: Vec<(String, String)>,
     }
 
     impl App {
@@ -425,6 +427,7 @@ main:
                 path: None,
                 recent: load_recent(),
                 recent_menu: HMENU::default(),
+                com_binds: Vec::new(),
             };
             unsafe { app.build_menu() };
             app.update_title();
@@ -458,14 +461,51 @@ main:
                 self.pending_check = lang.post_check(&text);
                 self.pending_listing = lang.post_listing(&text);
             }
+            self.com_binds = was::com_bindings(&self.doc.text());
             self.after_caret();
+        }
+
+        /// The card query for the caret: a `comobj`'s interface, an `obj.Method`
+        /// (→ `Interface::Method`), or else the plain symbol under the caret.
+        fn card_query(&self) -> Option<String> {
+            let line = self.doc.line(self.doc.caret.row);
+            // The dotted token around the caret (`pSwap` or `pSwap.Present`).
+            let is_tok = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+            let col = self.doc.caret.col.min(line.len());
+            let mut s = col;
+            while s > 0 {
+                let c = line[..s].chars().next_back().unwrap();
+                if is_tok(c) {
+                    s -= c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let mut e = col;
+            while e < line.len() {
+                let c = line[e..].chars().next().unwrap();
+                if is_tok(c) {
+                    e += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let tok = &line[s..e];
+            if let Some((name, method)) = tok.split_once('.') {
+                if let Some((_, iface)) = self.com_binds.iter().find(|(n, _)| n == name) {
+                    return Some(format!("{iface}::{method}"));
+                }
+            } else if let Some((_, iface)) = self.com_binds.iter().find(|(n, _)| n == tok) {
+                return Some(iface.clone());
+            }
+            lang_word(&self.doc)
         }
 
         /// After a caret move (no text change): request the card for the symbol
         /// under the caret (async) and keep the caret on screen.
         fn after_caret(&mut self) {
             if !self.search_active {
-                if let Some(word) = lang_word(&self.doc) {
+                if let Some(word) = self.card_query() {
                     if word != self.card_word {
                         if let Some(lang) = self.lang.as_ref() {
                             self.pending_card = lang.post_card(&word);
@@ -489,8 +529,9 @@ main:
                     self.line_listing = rows;
                 }
             }
+            self.com_binds = was::com_bindings(&self.doc.text());
             if !self.search_active {
-                self.refresh_card(lang_word(&self.doc));
+                self.refresh_card(self.card_query());
             }
             self.ensure_caret_visible();
         }

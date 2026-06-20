@@ -44,6 +44,12 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
     if q.is_empty() {
         return Ok("# Search\n\nType a function, type, or fragment.\n".to_string());
     }
+    // `Interface::Method` → a COM method card.
+    if let Some((iface, method)) = q.split_once("::") {
+        if let Some(md) = method_card(kb, iface.trim(), method.trim())? {
+            return Ok(md);
+        }
+    }
     if let Some(md) = function_card(kb, q)? {
         return Ok(md);
     }
@@ -178,10 +184,46 @@ pub fn interface_card(kb: &Kb, name: &str) -> Result<Option<String>> {
     if !i.methods.is_empty() {
         s.push_str("| vtbl | method |\n|--:|---|\n");
         for m in &i.methods {
-            s.push_str(&format!("| {} | `{}` |\n", m.vtable_index, m.name));
+            // Link each method to its own card (`Interface::Method`).
+            s.push_str(&format!("| {} | [`{}`](was:{}::{}) |\n", m.vtable_index, m.name, i.name, m.name));
         }
         s.push('\n');
     }
+    Ok(Some(s))
+}
+
+/// A concise card for a COM method `Interface::Method`: which interface, which
+/// vtable slot (walking the base chain for inherited methods), and the two ways
+/// to call it in WRASM. `None` if the interface or method isn't known.
+pub fn method_card(kb: &Kb, interface: &str, method: &str) -> Result<Option<String>> {
+    if kb.interface(interface)?.is_none() {
+        return Ok(None);
+    }
+    // Find the absolute vtable slot and which interface in the chain owns it.
+    let mut name = interface.to_string();
+    let mut found: Option<(i64, String)> = None;
+    for _ in 0..32 {
+        let Some(iface) = kb.interface(&name)? else { break };
+        if let Some(m) = iface.methods.iter().find(|m| m.name == method) {
+            found = Some((m.vtable_index, iface.name.clone()));
+            break;
+        }
+        match iface.base {
+            Some(b) => name = b.rsplit('.').next().unwrap_or(&b).to_string(),
+            None => break,
+        }
+    }
+    let Some((slot, owner)) = found else { return Ok(None) };
+
+    let mut s = format!("# {interface}::{method}  (COM method)\n\n");
+    s.push_str(&format!("Vtable slot **{slot}** of [`{interface}`](was:{interface})"));
+    if owner != interface {
+        s.push_str(&format!(" · inherited from `{owner}`"));
+    }
+    s.push_str(".\n\n### Call it\n\n```was\n");
+    s.push_str(&format!("p.{method}(args…)                  ; typed-pointer form (comobj p : {interface})\n"));
+    s.push_str(&format!("comcall p, {interface}, {method}, args…   ; explicit form\n"));
+    s.push_str("```\n");
     Ok(Some(s))
 }
 

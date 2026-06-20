@@ -69,8 +69,9 @@ pub enum Request {
     Assemble { id: u64, src: String, emit: Emit },
     /// Did-you-mean suggestions for a name.
     Suggest { id: u64, name: String },
-    /// Autocomplete candidates for `line` at byte offset `cursor`.
-    Complete { id: u64, line: String, cursor: usize },
+    /// Autocomplete candidates for `line` at byte offset `cursor`. `binds` are the
+    /// buffer's `comobj` name→interface bindings (for typed-pointer completion).
+    Complete { id: u64, line: String, cursor: usize, binds: Vec<(String, String)> },
     /// Tooltip for the token under the caret (`line` at byte offset `cursor`).
     Hover { id: u64, line: String, cursor: usize },
     /// Signature help for an `invoke` at `line`/`cursor`.
@@ -208,9 +209,9 @@ impl Lang {
         let _ = self.tx.send(Request::Suggest { id, name: name.to_string() });
         id
     }
-    pub fn post_complete(&self, line: &str, cursor: usize) -> u64 {
+    pub fn post_complete(&self, line: &str, cursor: usize, binds: Vec<(String, String)>) -> u64 {
         let id = self.alloc();
-        let _ = self.tx.send(Request::Complete { id, line: line.to_string(), cursor });
+        let _ = self.tx.send(Request::Complete { id, line: line.to_string(), cursor, binds });
         id
     }
 
@@ -267,8 +268,8 @@ impl Lang {
     pub fn suggest(&self, name: &str) -> Option<Response> {
         self.call(|id| Request::Suggest { id, name: name.to_string() })
     }
-    pub fn complete(&self, line: &str, cursor: usize) -> Option<Response> {
-        self.call(|id| Request::Complete { id, line: line.to_string(), cursor })
+    pub fn complete(&self, line: &str, cursor: usize, binds: Vec<(String, String)>) -> Option<Response> {
+        self.call(|id| Request::Complete { id, line: line.to_string(), cursor, binds: binds.clone() })
     }
     pub fn hover(&self, line: &str, cursor: usize) -> Option<Response> {
         self.call(|id| Request::Hover { id, line: line.to_string(), cursor })
@@ -416,11 +417,11 @@ fn handle(kb: &Kb, req: Request) -> Response {
             Ok(names) => Response::Suggest { id, names },
             Err(e) => Response::Error { id, message: format!("{e:#}") },
         },
-        Request::Complete { id, line, cursor } => {
+        Request::Complete { id, line, cursor, binds } => {
             let ctx = complete::context(&line, cursor);
             Response::Completions {
                 id,
-                items: complete_items(kb, &ctx),
+                items: complete_items(kb, &ctx, &binds),
                 replace_start: ctx.start,
             }
         }
@@ -522,24 +523,66 @@ fn isolated_listing(lowered: &str, src_map: &[usize], n: usize) -> Vec<Vec<Listi
 }
 
 /// Resolve a completion context into winkb candidates.
-fn complete_items(kb: &Kb, ctx: &complete::CompletionContext) -> Vec<Completion> {
+fn complete_items(
+    kb: &Kb,
+    ctx: &complete::CompletionContext,
+    binds: &[(String, String)],
+) -> Vec<Completion> {
     match &ctx.kind {
         CompletionKind::None => Vec::new(),
         CompletionKind::Function => kb.complete(&ctx.prefix, "function", 50).unwrap_or_default(),
         CompletionKind::Symbol => kb.complete(&ctx.prefix, "all", 50).unwrap_or_default(),
-        CompletionKind::Field { type_name } => kb
-            .layout(type_name)
-            .ok()
-            .flatten()
-            .map(|l| {
-                l.fields
+        // `obj.` where obj is a typed `comobj` pointer → the interface's methods
+        // (own + inherited). Otherwise a struct field.
+        CompletionKind::Field { type_name } => {
+            if let Some((_, iface)) = binds.iter().find(|(n, _)| n == type_name) {
+                interface_methods(kb, iface)
                     .into_iter()
-                    .filter(|f| f.name.starts_with(&ctx.prefix))
-                    .map(|f| Completion { name: f.name, kind: "field".into(), detail: f.type_name })
+                    .filter(|(name, _)| name.starts_with(&ctx.prefix))
+                    .map(|(name, slot)| Completion {
+                        name,
+                        kind: "method".into(),
+                        detail: format!("vtbl[{slot}] {iface}"),
+                    })
                     .collect()
-            })
-            .unwrap_or_default(),
+            } else {
+                kb.layout(type_name)
+                    .ok()
+                    .flatten()
+                    .map(|l| {
+                        l.fields
+                            .into_iter()
+                            .filter(|f| f.name.starts_with(&ctx.prefix))
+                            .map(|f| Completion {
+                                name: f.name,
+                                kind: "field".into(),
+                                detail: f.type_name,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        }
     }
+}
+
+/// Every method callable on `iface` as `(name, vtable_slot)`, walking the base
+/// chain so inherited IUnknown/parent methods are offered too.
+fn interface_methods(kb: &Kb, iface: &str) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    let mut name = iface.to_string();
+    for _ in 0..32 {
+        let Ok(Some(i)) = kb.interface(&name) else { break };
+        for m in &i.methods {
+            out.push((m.name.clone(), m.vtable_index));
+        }
+        match i.base {
+            Some(b) => name = b.rsplit('.').next().unwrap_or(&b).to_string(),
+            None => break,
+        }
+    }
+    out.sort_by_key(|(_, slot)| *slot);
+    out
 }
 
 /// A concise tooltip for a token: a constant's value, a function's one-line
@@ -767,7 +810,7 @@ mod tests {
     fn complete_after_invoke_lists_functions() {
         let Some(l) = lang() else { return };
         let line = "invoke CreateFil";
-        match l.complete(line, line.len()) {
+        match l.complete(line, line.len(), vec![]) {
             Some(Response::Completions { items, replace_start, .. }) => {
                 assert_eq!(replace_start, 7, "replaces the typed name");
                 assert!(items.iter().any(|c| c.name == "CreateFileW"), "{items:?}");
@@ -781,7 +824,7 @@ mod tests {
     fn complete_struct_field_after_dot() {
         let Some(l) = lang() else { return };
         let line = "mov eax, [rcx + RECT.";
-        match l.complete(line, line.len()) {
+        match l.complete(line, line.len(), vec![]) {
             Some(Response::Completions { items, .. }) => {
                 let names: Vec<_> = items.iter().map(|c| c.name.as_str()).collect();
                 assert!(names.contains(&"left") && names.contains(&"right"), "{names:?}");
@@ -791,9 +834,24 @@ mod tests {
     }
 
     #[test]
+    fn complete_after_typed_pointer_lists_interface_methods() {
+        let Some(l) = lang() else { return };
+        // `pSwap` is a typed pointer to IDXGISwapChain → `pSwap.` offers methods.
+        let binds = vec![("pSwap".to_string(), "IDXGISwapChain".to_string())];
+        match l.complete("  pSwap.", 8, binds) {
+            Some(Response::Completions { items, .. }) => {
+                assert!(items.iter().any(|c| c.name == "Present"), "own method: {items:?}");
+                assert!(items.iter().any(|c| c.name == "Release"), "inherited method: {items:?}");
+                assert!(items.iter().all(|c| c.kind == "method"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn complete_offers_nothing_for_the_mnemonic() {
         let Some(l) = lang() else { return };
-        match l.complete("mo", 2) {
+        match l.complete("mo", 2, vec![]) {
             Some(Response::Completions { items, .. }) => assert!(items.is_empty()),
             other => panic!("{other:?}"),
         }
@@ -933,9 +991,9 @@ mod tests {
     #[test]
     fn coalesce_keeps_last_live_read_drops_earlier() {
         let batch = vec![
-            Request::Complete { id: 1, line: "a".into(), cursor: 1 },
+            Request::Complete { id: 1, line: "a".into(), cursor: 1, binds: vec![] },
             Request::Card { id: 2, query: "RECT".into() },
-            Request::Complete { id: 3, line: "ab".into(), cursor: 2 },
+            Request::Complete { id: 3, line: "ab".into(), cursor: 2, binds: vec![] },
             Request::Hover { id: 4, line: "x".into(), cursor: 0 },
         ];
         let ids: Vec<u64> = coalesce_superseded(batch).iter().map(req_id).collect();
@@ -957,7 +1015,7 @@ mod tests {
     #[test]
     fn coalesce_collapses_a_typing_burst_to_the_latest() {
         let batch: Vec<Request> = (0..5)
-            .map(|i| Request::Complete { id: i, line: "x".repeat(i as usize + 1), cursor: 1 })
+            .map(|i| Request::Complete { id: i, line: "x".repeat(i as usize + 1), cursor: 1, binds: vec![] })
             .collect();
         let kept = coalesce_superseded(batch);
         assert_eq!(kept.len(), 1);
