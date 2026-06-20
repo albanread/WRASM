@@ -31,6 +31,8 @@ pub struct Diag {
 pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
     let mut labels = collect_labels(src);
     labels.extend(macro_names(src)); // a macro invocation is not an unknown name
+    let com_objs = collect_com_objs(src);
+    labels.extend(com_objs.keys().cloned());
     let mut diags = Vec::new();
     let mut in_macro = false;
     for (i, raw) in src.lines().enumerate() {
@@ -99,6 +101,25 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
             if matches!(kb.interface(iface), Ok(None)) {
                 let col = body.find(iface).map(|c| c + 1).unwrap_or(1);
                 diags.push(Diag { line, col, message: format!("unknown interface '{iface}'") });
+            }
+            continue;
+        }
+        // comobj NAME : Interface — the interface must exist.
+        if let Some(rest) = strip_keyword(t, "comobj") {
+            if let Some((_, iface)) = rest.split_once(':') {
+                let iface = iface.trim();
+                if matches!(kb.interface(iface), Ok(None)) {
+                    let col = body.find(iface).map(|c| c + 1).unwrap_or(1);
+                    diags.push(Diag { line, col, message: format!("unknown interface '{iface}'") });
+                }
+            }
+            continue;
+        }
+        // obj.Method(args) — the method must exist on the bound interface.
+        if let Some((_, iface, method, _)) = parse_method_call(t, &com_objs) {
+            if matches!(vtable_index_of(kb, &iface, &method), Ok(None)) {
+                let col = body.rfind(&method).map(|c| c + 1).unwrap_or(1);
+                diags.push(Diag { line, col, message: format!("{iface} has no method '{method}'") });
             }
             continue;
         }
@@ -634,7 +655,9 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
 /// Lower already-macro-expanded `src`. The returned map is the 1-based *expanded*
 /// line per lowered line; [`lower_mapped`] composes it back to source lines.
 fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
-    let labels = collect_labels(src);
+    let mut labels = collect_labels(src);
+    let com_objs = collect_com_objs(src); // `comobj name : Interface` bindings
+    labels.extend(com_objs.keys().cloned());
     let mut out = String::new();
     let mut map: Vec<usize> = Vec::new();
     // High-level block state: a counter for unique labels, and a stack so each
@@ -684,6 +707,20 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             // `iid Interface` — emit that interface's IID as 16 GUID bytes
             let expanded =
                 emit_iid(rest, kb).with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
+            out.push_str(&expanded);
+        } else if let Some(rest) = strip_keyword(t, "comobj") {
+            // `comobj NAME : Interface` — a pointer slot (binding is pre-scanned)
+            let name = rest.split_once(':').map_or(rest.trim(), |(n, _)| n.trim());
+            out.push_str(&format!("{name}:\n  .zero 8\n"));
+        } else if let Some((obj, iface, method, args)) = parse_method_call(t, &com_objs) {
+            // `obj.Method(args)` — typed COM call on the bound interface.
+            let rest = if args.is_empty() {
+                format!("[rip + {obj}], {iface}, {method}")
+            } else {
+                format!("[rip + {obj}], {iface}, {method}, {args}")
+            };
+            let expanded = expand_comcall(&rest, kb, &labels)
+                .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
             out.push_str(&expanded);
         } else if let Some(cond) = strip_keyword(t, ".if") {
             // `.if c` → test c; on false skip to the next clause.
@@ -1290,6 +1327,39 @@ fn field_path(kb: &Kb, root: &str, path: &str) -> Result<Option<(i64, usize)>> {
     Ok(None)
 }
 
+/// Pre-scan `comobj NAME : Interface` declarations into a `name -> interface`
+/// map, so a later `NAME.Method(...)` call knows the object's interface type.
+fn collect_com_objs(src: &str) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for raw in src.lines() {
+        let t = strip_comment(raw).trim();
+        if let Some(rest) = strip_keyword(t, "comobj") {
+            if let Some((name, iface)) = rest.split_once(':') {
+                m.insert(name.trim().to_string(), iface.trim().to_string());
+            }
+        }
+    }
+    m
+}
+
+/// Recognise a typed COM method call `obj.Method(args)` where `obj` is a declared
+/// `comobj`. Returns `(obj, interface, method, args)`.
+fn parse_method_call(
+    t: &str,
+    com_objs: &std::collections::HashMap<String, String>,
+) -> Option<(String, String, String, String)> {
+    let (lhs, rest) = t.split_once('.')?;
+    let name = lhs.trim();
+    let iface = com_objs.get(name)?;
+    let open = rest.find('(')?;
+    let close = rest.rfind(')')?;
+    let method = rest[..open].trim();
+    if method.is_empty() || !method.chars().all(is_ident_char) {
+        return None;
+    }
+    Some((name.to_string(), iface.clone(), method.to_string(), rest[open + 1..close].trim().to_string()))
+}
+
 /// Lay out a struct-instance data block: a label, then each constant field at its
 /// db-resolved offset (zero-filled between), as visible `.long`/`.word`/`.byte`.
 fn emit_struct(kb: &Kb, acc: &StructAccum) -> Result<String> {
@@ -1504,6 +1574,20 @@ mod tests {
         assert!(low.contains("scd:"), "labelled: {low}");
         assert!(low.contains("BufferDesc.Format @ 16"), "nested offset resolved: {low}");
         assert!(low.contains("BufferCount @ 40"), "top-level offset: {low}");
+    }
+
+    #[test]
+    fn typed_pointer_method_call_desugars_to_comcall() {
+        let Some(kb) = kb() else { return };
+        let src = "comobj pSwap : IDXGISwapChain\nmain:\n  pSwap.Present(1, 0)\n  pSwap.Release()\n";
+        let low = lower(src, &kb).unwrap();
+        assert!(low.contains("pSwap:") && low.contains(".zero 8"), "pointer slot: {low}");
+        assert!(low.contains("mov rcx, [rip + pSwap]"), "loads the pointer: {low}");
+        assert!(low.contains("call qword ptr [rax + 64]"), "Present is vtbl[8]: {low}");
+        assert!(low.contains("call qword ptr [rax + 16]"), "Release is vtbl[2]: {low}");
+        // a bad method on a typed pointer is an editor diagnostic
+        let diags = check("comobj p : IDXGISwapChain\np.Nope()\n", &kb);
+        assert!(diags.iter().any(|d| d.message.contains("no method 'Nope'")), "{diags:?}");
     }
 
     #[test]
