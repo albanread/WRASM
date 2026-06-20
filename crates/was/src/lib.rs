@@ -1833,6 +1833,11 @@ fn expand_invoke(rest: &str, kb: &Kb, labels: &HashSet<String>, framed: bool) ->
 /// form your insight asks for.
 fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>, framed: bool) -> Result<String> {
     let n = args.len();
+    // The function's parameter types — so a float param marshals to xmm on its own.
+    let ptys: Vec<String> = kb
+        .function(func)?
+        .map(|f| f.params.iter().map(|p| p.type_name.clone()).collect())
+        .unwrap_or_default();
     let mut o = String::new();
     o.push_str(&format!("  ; invoke {func} ({n} args)\n"));
     if !framed {
@@ -1850,7 +1855,7 @@ fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>, fra
     }
     // Register args (0..=3): integers → rcx/rdx/r8/r9, floats → xmm0–3.
     for (idx, arg) in args.iter().enumerate().take(4) {
-        o.push_str(&marshal_reg_arg(idx, arg, kb, labels)?);
+        o.push_str(&marshal_reg_arg(idx, arg, ptys.get(idx).map(|s| s.as_str()), kb, labels)?);
     }
     o.push_str(&format!("  call {func}\n"));
     if !framed {
@@ -1859,14 +1864,14 @@ fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>, fra
     Ok(o)
 }
 
-/// Find a COM method's absolute vtable index, walking the base-interface chain
-/// (so inherited `IUnknown`/parent methods like `Release` resolve too).
-fn vtable_index_of(kb: &Kb, iface: &str, method: &str) -> Result<Option<i64>> {
+/// Find a COM method (with its vtable index and param types) by walking the
+/// base-interface chain — so inherited `IUnknown`/parent methods resolve too.
+fn find_method(kb: &Kb, iface: &str, method: &str) -> Result<Option<winkb::Method>> {
     let mut name = iface.to_string();
     for _ in 0..32 {
         let Some(i) = kb.interface(&name)? else { return Ok(None) };
         if let Some(m) = i.methods.iter().find(|m| m.name == method) {
-            return Ok(Some(m.vtable_index));
+            return Ok(Some(m.clone()));
         }
         match i.base {
             // The base is a fully-qualified name; the lookup wants the simple name.
@@ -1875,6 +1880,22 @@ fn vtable_index_of(kb: &Kb, iface: &str, method: &str) -> Result<Option<i64>> {
         }
     }
     Ok(None)
+}
+
+/// The vtable index of a COM method (or `None` if unknown).
+fn vtable_index_of(kb: &Kb, iface: &str, method: &str) -> Result<Option<i64>> {
+    Ok(find_method(kb, iface, method)?.map(|m| m.vtable_index))
+}
+
+/// A floating-point parameter type → `Some(is_double)`; otherwise `None`. Such an
+/// argument rides an xmm register, not an integer one. (A pointer like `f32*` is a
+/// pointer, not a float — only the bare scalar types match.)
+fn float_type(t: &str) -> Option<bool> {
+    match t.trim() {
+        "f32" | "FLOAT" | "float" | "single" => Some(false),
+        "f64" | "double" => Some(true),
+        _ => None,
+    }
 }
 
 /// Expand `comcall obj, Interface, Method[, args…]` to a COM vtable call. `obj`
@@ -1888,8 +1909,9 @@ fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>, framed: bool) -
     }
     let iface = parts[1].trim();
     let method = parts[2].trim();
-    let idx = vtable_index_of(kb, iface, method)?
+    let m = find_method(kb, iface, method)?
         .ok_or_else(|| anyhow::anyhow!("comcall: interface '{iface}' has no method '{method}'"))?;
+    let idx = m.vtable_index;
 
     // The object is the `this` pointer (arg 0); the rest are the method's args.
     let mut all: Vec<String> = Vec::with_capacity(parts.len() - 1);
@@ -1913,7 +1935,9 @@ fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>, framed: bool) -
         o.push_str(&format!("  mov [rsp + {off}], rax\n"));
     }
     for (i, arg) in all.iter().enumerate().take(4) {
-        o.push_str(&marshal_reg_arg(i, arg, kb, labels)?);
+        // all[0] is `this` (an integer pointer); all[i>=1] is method param i-1.
+        let pty = i.checked_sub(1).and_then(|pi| m.params.get(pi)).map(|s| s.as_str());
+        o.push_str(&marshal_reg_arg(i, arg, pty, kb, labels)?);
     }
     o.push_str("  mov rax, [rcx]\n"); // vtable, from the `this` pointer in rcx
     o.push_str(&format!("  call qword ptr [rax + {disp}]\n"));
@@ -2150,12 +2174,23 @@ fn float_arg(arg: &str) -> Option<(bool, &str)> {
     None
 }
 
-/// Marshal argument `idx` (0..3) into its slot: a `real4`/`real8` arg → movss/
-/// movsd into xmm{idx}; otherwise its integer register via `load_arg`.
-fn marshal_reg_arg(idx: usize, arg: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
-    if let Some((wide, v)) = float_arg(arg) {
+/// Marshal argument `idx` (0..3) into its slot. A float — recognised either from
+/// the db param type (`param_ty`) or an explicit `real4`/`real8` annotation — goes
+/// via movss/movsd into xmm{idx}; anything else into its integer register.
+fn marshal_reg_arg(
+    idx: usize,
+    arg: &str,
+    param_ty: Option<&str>,
+    kb: &Kb,
+    labels: &HashSet<String>,
+) -> Result<String> {
+    // explicit annotation wins (a fallback when the db is wrong); else the type.
+    let float = float_arg(arg)
+        .map(|(w, v)| (w, v.to_string()))
+        .or_else(|| param_ty.and_then(float_type).map(|w| (w, arg.to_string())));
+    if let Some((wide, val)) = float {
         let ins = if wide { "movsd" } else { "movss" };
-        let rv = resolve_operands(v, kb, labels)?;
+        let rv = resolve_operands(&val, kb, labels)?;
         return Ok(format!("  {ins} xmm{idx}, {}\n", rv.trim()));
     }
     load_arg(ARG_REGS[idx], arg, kb, labels)
@@ -2337,6 +2372,12 @@ mod tests {
         // a real4 register-position arg → movss into that position's xmm
         let low = lower(".data\nf DWORD 0\n.code\n.globl m\nm:\n  invoke Sleep, real4 [rip + f]\n", &kb).unwrap();
         assert!(low.contains("movss xmm0, [rip + f]"), "float → xmm0:\n{low}");
+
+        // and auto-detected from the db: ID2D1RenderTarget::DrawEllipse's strokeWidth
+        // is `f32`, so a plain arg in slot 3 marshals to xmm3 with no annotation.
+        let src = ".data\ncomobj p : ID2D1HwndRenderTarget\nb QWORD ?\nw DWORD 0\ne struct D2D1_ELLIPSE\nends\n.code\n.globl m\nm:\n  p.DrawEllipse(e, [rip + b], [rip + w], 0)\n";
+        let dl = lower(src, &kb).unwrap();
+        assert!(dl.contains("movss xmm3, [rip + w]"), "auto float→xmm3:\n{dl}");
     }
 
     #[test]

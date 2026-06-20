@@ -346,15 +346,31 @@ impl Kb {
         let Some((tid, iid, base)) = head else {
             return Ok(None);
         };
+        // Parameter types for every method on this interface, in one query,
+        // grouped by method and ordered by ordinal (the type at ordinal N is
+        // param N's type — that's all the marshaler needs, e.g. an `f32` → xmm).
+        let mut pstmt = self.conn.prepare(
+            "SELECT p.method_id, p.type_name FROM interface_method_params p
+               JOIN interface_methods m ON m.method_id = p.method_id
+               WHERE m.interface_type_id = ?1 ORDER BY p.method_id, p.ordinal",
+        )?;
+        let mut params_by_method: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in pstmt.query_map([tid], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (mid, tn) = row?;
+            params_by_method.entry(mid).or_default().push(tn);
+        }
         let mut stmt = self.conn.prepare(
-            "SELECT vtable_index, method_name FROM interface_methods
+            "SELECT method_id, vtable_index, method_name FROM interface_methods
                WHERE interface_type_id = ?1 ORDER BY vtable_index",
         )?;
         let methods = stmt
             .query_map([tid], |r| {
+                let mid: i64 = r.get(0)?;
                 Ok(Method {
-                    vtable_index: r.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    name: r.get(1)?,
+                    vtable_index: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    name: r.get(2)?,
+                    params: params_by_method.get(&mid).cloned().unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -385,6 +401,9 @@ pub struct Layout {
 pub struct Method {
     pub vtable_index: i64,
     pub name: String,
+    /// Parameter type names, by ordinal (the Microsoft data's names are shifted
+    /// by one, but the types are aligned — enough to know which args are floats).
+    pub params: Vec<String>,
 }
 
 /// A COM interface: IID + base + own vtable methods.

@@ -319,7 +319,7 @@ rball:
     pBrush.SetColor(r8)
     pRT.FillEllipse(ellipse, [rip + pBrush])
     pBrush.SetColor(outlineCol)
-    pRT.DrawEllipse(ellipse, [rip + pBrush], real4 [rip + strokeW], 0)
+    pRT.DrawEllipse(ellipse, [rip + pBrush], [rip + strokeW], 0)   ; strokeWidth → xmm3 (db says f32)
     ; spin highlight: a bright dot orbiting the centre
     mov     eax, [rsi + rbx + 16]       ; angle
     mov     ecx, eax
