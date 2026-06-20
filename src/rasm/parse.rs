@@ -61,7 +61,10 @@ pub enum Operand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Directive {
     IntelSyntax,
+    /// `.text` / `.code` — switch to the read-execute code section.
     Text,
+    /// `.data` — switch to the read-write data section (mutable globals).
+    Data,
     Globl(String),
     /// `.quad a, b, ...` — one or more 8-byte little-endian values. LET's
     /// SSE masks emit two (`.quad 0x8000..., 0x0000...`).
@@ -164,9 +167,12 @@ fn parse_directive(d: &str) -> Result<Line> {
     let mut it = d.split_whitespace();
     let head = it.next().unwrap_or("");
     let arg = d[head.len()..].trim();
-    let dir = match head {
+    // Directive names are case-insensitive so MASM-style `.DATA`/`.CODE` and the
+    // GAS-style lowercase forms both parse; arguments keep their case.
+    let dir = match head.to_ascii_lowercase().as_str() {
         "intel_syntax" => Directive::IntelSyntax,
-        "text" => Directive::Text,
+        "text" | "code" => Directive::Text,
+        "data" => Directive::Data,
         "globl" | "global" => Directive::Globl(arg.to_string()),
         "quad" => Directive::Quad(
             arg.split(',').map(|v| parse_int(v.trim())).collect::<Result<Vec<_>>>()?,

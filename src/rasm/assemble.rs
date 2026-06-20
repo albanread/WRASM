@@ -20,6 +20,15 @@ use crate::backend::{EncodedModule, Reloc, RelocKind};
 use super::encode::{encode, FixupKind};
 use super::parse::{parse_line, Directive, Line, Operand};
 
+/// Which output section an item lands in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sect {
+    /// `.text` — read-execute code.
+    Text,
+    /// `.data` — read-write globals.
+    Data,
+}
+
 /// A relaxable branch/call.
 struct Branch {
     /// Short-form opcode bytes (1-byte rel8 follows). `None` for `call`.
@@ -119,20 +128,31 @@ fn branch_for(mnemonic: &str, target: &str) -> Option<Branch> {
     None
 }
 
-/// Assemble a whole module's worth of text into an [`EncodedModule`].
+/// Assemble a whole module's worth of text into an [`EncodedModule`], splitting
+/// `.text` (code) and `.data` (read-write globals) into separate blobs.
 pub fn assemble(text: &str) -> Result<EncodedModule> {
-    Ok(assemble_listing(text)?.0)
+    Ok(assemble_impl(text, false)?.0)
 }
 
 /// Like [`assemble`], but also return a per-input-line byte span — `(start, len)`
 /// into the final `code` for each line of `text` (`len == 0` for labels,
-/// directives, blank lines). Additive: the encoding is identical; this only
-/// records where each line's bytes landed (after relaxation + label resolution),
-/// which is what a listing view needs to show real branch displacements.
+/// directives, blank lines). For the listing every byte lands in `code` (the
+/// section split is flattened) so the spans index one contiguous blob, which is
+/// what a listing view needs to show real branch displacements next to a line.
 pub fn assemble_listing(text: &str) -> Result<(EncodedModule, Vec<(usize, usize)>)> {
-    // ── Pass 1: parse into items (tracking each item's source line) ─────────
+    assemble_impl(text, true)
+}
+
+/// The shared driver. When `flatten`, `.data`/`.text` are ignored and every byte
+/// goes into `code` (a single section, as the listing view wants); otherwise the
+/// two sections are kept apart and a `.text`→`.data` reference becomes a reloc
+/// the PE writer resolves once both sections have addresses.
+fn assemble_impl(text: &str, flatten: bool) -> Result<(EncodedModule, Vec<(usize, usize)>)> {
+    // ── Pass 1: parse into items (tracking each item's line + section) ──────
     let mut items: Vec<Item> = Vec::new();
     let mut item_line: Vec<usize> = Vec::new();
+    let mut item_sect: Vec<Sect> = Vec::new();
+    let mut cur = Sect::Text;
     for (lineno, raw) in text.lines().enumerate() {
         let start = items.len();
         // MC allows `label: insn` / `label: .quad ...` on one line; peel any
@@ -149,6 +169,9 @@ pub fn assemble_listing(text: &str) -> Result<(EncodedModule, Vec<(usize, usize)
             match line {
                 Line::Empty => {}
                 Line::Label(name) => items.push(Item::Label(name)),
+                // Section switches change where following items land (no bytes).
+                Line::Directive(Directive::Text) if !flatten => cur = Sect::Text,
+                Line::Directive(Directive::Data) if !flatten => cur = Sect::Data,
                 Line::Directive(d) => push_directive(&mut items, d)?,
                 Line::Insn { mnemonic, ops } => {
                     // Relaxable branch/call to a symbol?
@@ -178,28 +201,27 @@ pub fn assemble_listing(text: &str) -> Result<(EncodedModule, Vec<(usize, usize)
         }
         for _ in start..items.len() {
             item_line.push(lineno);
+            item_sect.push(cur);
         }
     }
 
     // ── Pass 2: branch relaxation to a fixpoint ─────────────────────────────
     loop {
-        let (offsets, labels) = layout(&items);
+        let (places, labels) = layout(&items, &item_sect);
         let mut changed = false;
-        let mut off_iter = offsets.iter();
-        for it in &mut items {
-            let off = *off_iter.next().unwrap();
+        for (it, &(sect, off)) in items.iter_mut().zip(&places) {
             if let Item::Branch(b) = it {
                 if b.is_long {
                     continue;
                 }
-                // Extern target → must be long.
+                // Extern or cross-section target → must be long; else fits-in-rel8?
                 let must_long = match labels.get(&b.target) {
-                    None => true,
-                    Some(&tgt) => {
+                    Some(&(tsect, tgt)) if tsect == sect => {
                         let after = off + b.size();
                         let disp = tgt as i64 - after as i64;
                         !(-128..=127).contains(&disp)
                     }
+                    _ => true,
                 };
                 if must_long {
                     b.is_long = true;
@@ -212,76 +234,107 @@ pub fn assemble_listing(text: &str) -> Result<(EncodedModule, Vec<(usize, usize)
         }
     }
 
-    // ── Pass 3: emit ────────────────────────────────────────────────────────
-    let (offsets, labels) = layout(&items);
+    // ── Pass 3: emit into the two section blobs ─────────────────────────────
+    let (places, labels) = layout(&items, &item_sect);
     let mut code: Vec<u8> = Vec::new();
+    let mut data: Vec<u8> = Vec::new();
     let mut symbols: BTreeMap<String, usize> = BTreeMap::new();
+    let mut data_symbols: BTreeMap<String, usize> = BTreeMap::new();
     let mut relocs: Vec<Reloc> = Vec::new();
     let mut externs: Vec<String> = Vec::new();
     let mut globls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let nlines = text.lines().count();
     let mut spans: Vec<Option<(usize, usize)>> = vec![None; nlines];
-    let mut idx = 0usize;
-    for it in &items {
-        let off = offsets[idx];
+    for (idx, it) in items.iter().enumerate() {
+        let (sect, off) = places[idx];
         let line = item_line[idx];
-        idx += 1;
-        debug_assert_eq!(off, code.len());
-        let s = code.len();
+        let buf = match sect {
+            Sect::Text => &mut code,
+            Sect::Data => &mut data,
+        };
+        debug_assert_eq!(off, buf.len());
+        let s = buf.len();
         match it {
-            Item::Label(n) => {
-                symbols.insert(n.clone(), code.len());
-            }
+            Item::Label(n) => match sect {
+                Sect::Text => {
+                    symbols.insert(n.clone(), off);
+                }
+                Sect::Data => {
+                    data_symbols.insert(n.clone(), off);
+                }
+            },
             Item::Globl(n) => {
                 globls.insert(n.clone());
             }
             Item::AlignP2(n) => {
                 let align = 1usize << *n;
-                let pad = (align - (code.len() % align)) % align;
-                write_nop_padding(&mut code, pad);
+                let pad = (align - (buf.len() % align)) % align;
+                if sect == Sect::Text {
+                    write_nop_padding(buf, pad); // canonical NOPs in code
+                } else {
+                    buf.resize(buf.len() + pad, 0); // zero-fill in data
+                }
             }
             Item::Code { bytes, riprel } => {
-                let base = code.len();
-                code.extend_from_slice(bytes);
+                let base = buf.len();
+                buf.extend_from_slice(bytes);
                 for (at, target) in riprel {
                     let field = base + at;
-                    if let Some(&tgt) = labels.get(target) {
-                        let disp = tgt as i64 - (field as i64 + 4);
-                        let d = i32::try_from(disp).context("RIP-rel disp32 overflow")?;
-                        code[field..field + 4].copy_from_slice(&d.to_le_bytes());
-                    } else {
-                        relocs.push(Reloc { at: field, size: 4, kind: RelocKind::RipRel32, target: target.clone(), addend: 0 });
-                        externs.push(target.clone());
+                    match labels.get(target) {
+                        // Same-section internal reference → resolve the disp now.
+                        Some(&(tsect, tgt)) if tsect == sect => {
+                            let disp = tgt as i64 - (field as i64 + 4);
+                            let d = i32::try_from(disp).context("RIP-rel disp32 overflow")?;
+                            buf[field..field + 4].copy_from_slice(&d.to_le_bytes());
+                        }
+                        // Cross-section (code → data): emit a reloc the PE writer
+                        // resolves against the data section's address.
+                        Some(_) => relocs.push(Reloc {
+                            at: field,
+                            size: 4,
+                            kind: RelocKind::RipRel32,
+                            target: target.clone(),
+                            addend: 0,
+                        }),
+                        // Undefined here → an extern to bind.
+                        None => {
+                            relocs.push(Reloc {
+                                at: field,
+                                size: 4,
+                                kind: RelocKind::RipRel32,
+                                target: target.clone(),
+                                addend: 0,
+                            });
+                            externs.push(target.clone());
+                        }
                     }
                 }
             }
             Item::Branch(b) => {
-                let base = code.len();
                 if b.is_long {
-                    code.extend_from_slice(&b.long);
-                    let field = code.len();
-                    code.extend_from_slice(&[0, 0, 0, 0]);
-                    if let Some(&tgt) = labels.get(&b.target) {
+                    buf.extend_from_slice(&b.long);
+                    let field = buf.len();
+                    buf.extend_from_slice(&[0, 0, 0, 0]);
+                    if let Some(&(_, tgt)) = labels.get(&b.target) {
                         let disp = tgt as i64 - (field as i64 + 4);
                         let d = i32::try_from(disp).context("branch rel32 overflow")?;
-                        code[field..field + 4].copy_from_slice(&d.to_le_bytes());
+                        buf[field..field + 4].copy_from_slice(&d.to_le_bytes());
                     } else {
                         relocs.push(Reloc { at: field, size: 4, kind: RelocKind::BranchRel32, target: b.target.clone(), addend: 0 });
                         externs.push(b.target.clone());
                     }
                 } else {
-                    code.extend_from_slice(b.short.as_ref().unwrap());
-                    let field = code.len();
-                    code.push(0);
-                    let tgt = *labels.get(&b.target).expect("short branch to extern impossible");
+                    buf.extend_from_slice(b.short.as_ref().unwrap());
+                    let field = buf.len();
+                    buf.push(0);
+                    let (_, tgt) = *labels.get(&b.target).expect("short branch to extern impossible");
                     let disp = tgt as i64 - (field as i64 + 1);
-                    code[field] = i8::try_from(disp).context("branch rel8 overflow")? as u8;
+                    buf[field] = i8::try_from(disp).context("branch rel8 overflow")? as u8;
                 }
-                let _ = base;
             }
         }
-        let e = code.len();
+        let e = buf.len();
         if e > s {
             let span = spans[line].get_or_insert((s, e));
             span.0 = span.0.min(s);
@@ -298,27 +351,40 @@ pub fn assemble_listing(text: &str) -> Result<(EncodedModule, Vec<(usize, usize)
         .into_iter()
         .map(|o| o.map_or((0, 0), |(s, e)| (s, e - s)))
         .collect();
-    Ok((EncodedModule { code, symbols, relocs, externs }, listing))
+    Ok((
+        EncodedModule { code, data, symbols, data_symbols, relocs, externs },
+        listing,
+    ))
 }
 
-/// Compute the byte offset of each item and the offset of every label.
-fn layout(items: &[Item]) -> (Vec<usize>, BTreeMap<String, usize>) {
-    let mut offsets = Vec::with_capacity(items.len());
+/// Compute each item's `(section, offset-within-section)` and the same for every
+/// label. The two sections have independent offset counters.
+fn layout(items: &[Item], sects: &[Sect]) -> (Vec<(Sect, usize)>, BTreeMap<String, (Sect, usize)>) {
+    let mut places = Vec::with_capacity(items.len());
     let mut labels = BTreeMap::new();
-    let mut off = 0usize;
-    for it in items {
-        offsets.push(off);
+    let (mut code_off, mut data_off) = (0usize, 0usize);
+    for (it, &sect) in items.iter().zip(sects) {
+        let off = match sect {
+            Sect::Text => code_off,
+            Sect::Data => data_off,
+        };
+        places.push((sect, off));
         if let Item::Label(n) = it {
-            labels.insert(n.clone(), off);
+            labels.insert(n.clone(), (sect, off));
         }
-        off += it.size_at(off);
+        let sz = it.size_at(off);
+        match sect {
+            Sect::Text => code_off += sz,
+            Sect::Data => data_off += sz,
+        }
     }
-    (offsets, labels)
+    (places, labels)
 }
 
 fn push_directive(items: &mut Vec<Item>, d: Directive) -> Result<()> {
     match d {
-        Directive::IntelSyntax | Directive::Text | Directive::Other(_) => {}
+        // Section switches are handled in pass 1; reaching here is a no-op.
+        Directive::IntelSyntax | Directive::Text | Directive::Data | Directive::Other(_) => {}
         Directive::Globl(n) => items.push(Item::Globl(n)),
         Directive::Quad(vs) => items.push(Item::Code {
             bytes: vs.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -448,6 +514,45 @@ ret
         // `mov rax, rcx` is 3 bytes at offset 0; `ret` is 1 byte right after.
         assert_eq!(spans[3], (0, 3));
         assert_eq!(spans[4], (3, 1));
+    }
+
+    #[test]
+    fn data_section_splits_and_cross_ref_is_a_reloc() {
+        // A `.data` global, written through its address from `.text`.
+        let src = "\
+.data
+counter:
+.long 0
+.text
+.globl main
+main:
+lea rcx, [rip + counter]
+mov dword ptr [rcx], 42
+ret
+";
+        let m = assemble(src).unwrap();
+        // The `.long 0` landed in `.data`, not `.text`; `main` starts at code 0.
+        assert_eq!(m.data, vec![0, 0, 0, 0], "data byte in .data blob");
+        assert_eq!(m.data_symbols.get("counter"), Some(&0));
+        assert_eq!(m.symbols.get("main"), Some(&0), "code starts with main");
+        // The `.text`→`.data` reference is a reloc the PE writer resolves, and
+        // `counter` is internal — not an extern.
+        assert_eq!(m.relocs.len(), 1);
+        assert_eq!(m.relocs[0].kind, RelocKind::RipRel32);
+        assert_eq!(m.relocs[0].target, "counter");
+        assert!(m.externs.is_empty(), "internal data label must not be an extern");
+    }
+
+    #[test]
+    fn listing_flattens_sections_into_one_blob() {
+        // The listing view ignores the section split so its spans index a single
+        // `code` blob and a cross reference is patched in place (no reloc).
+        let src = ".data\ncounter:\n.long 7\n.text\n.globl w\nw:\nlea rcx, [rip + counter]\nret\n";
+        let (m, spans) = assemble_listing(src).unwrap();
+        assert!(m.data.is_empty(), "listing keeps every byte in code");
+        assert!(m.relocs.is_empty(), "cross-ref is patched in flat mode");
+        assert_eq!(spans.len(), src.lines().count());
+        assert_eq!(spans[2], (0, 4), "`.long 7` is 4 bytes at code offset 0");
     }
 
     #[test]

@@ -60,8 +60,14 @@ pub fn write_pe(
     let thunk_rva = |i: usize| thunks_rva + (i * THUNK) as u32;
     let text_vsize = code_len + flat.len() * THUNK;
 
+    // ── .data layout (read/write globals) ────────────────────────────────────
+    let has_data = !module.data.is_empty();
+    let data_rva = align_up(TEXT_RVA + text_vsize as u32, SECTION_ALIGN);
+    let data_vsize = module.data.len() as u32;
+    let after_data = if has_data { data_rva + data_vsize } else { TEXT_RVA + text_vsize as u32 };
+
     // ── .rdata layout (import directory) ─────────────────────────────────────
-    let rdata_rva = align_up(TEXT_RVA + text_vsize as u32, SECTION_ALIGN);
+    let rdata_rva = align_up(after_data, SECTION_ALIGN);
     let ndll = by_dll.len();
     let nfunc = flat.len();
     let descs_off = 0usize;
@@ -137,6 +143,15 @@ pub fn write_pe(
         text.extend_from_slice(&(disp as i32).to_le_bytes());
     }
     for r in &module.relocs {
+        // A reference into our own `.data` (a global) resolves against the data
+        // section's address — no import thunk involved.
+        if let Some(&doff) = module.data_symbols.get(r.target.as_str()) {
+            let site_rva = TEXT_RVA as i64 + r.at as i64;
+            let target_rva = data_rva as i64 + doff as i64 + r.addend;
+            let disp = target_rva - (site_rva + 4);
+            text[r.at..r.at + 4].copy_from_slice(&(disp as i32).to_le_bytes());
+            continue;
+        }
         match r.kind {
             RelocKind::BranchRel32 | RelocKind::RipRel32 => {
                 let i = *func_index
@@ -152,10 +167,13 @@ pub fn write_pe(
 
     // ── section + image sizes ────────────────────────────────────────────────
     let text_raw = align_up(text.len() as u32, FILE_ALIGN);
-    let rdata_file = HEADERS_FILE + text_raw;
+    let data_raw = if has_data { align_up(data_vsize, FILE_ALIGN) } else { 0 };
+    let data_file = HEADERS_FILE + text_raw;
+    let rdata_file = data_file + data_raw;
     let rdata_raw = align_up(rdata.len() as u32, FILE_ALIGN);
     let size_of_image = align_up(rdata_rva + rdata_vsize as u32, SECTION_ALIGN);
     let entry_rva = TEXT_RVA + entry_off as u32;
+    let nsections: u16 = if has_data { 3 } else { 2 };
 
     // ── headers ──────────────────────────────────────────────────────────────
     let mut out = Vec::<u8>::new();
@@ -167,7 +185,7 @@ pub fn write_pe(
     // PE signature + COFF file header
     out.extend_from_slice(b"PE\0\0");
     out.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine = AMD64
-    out.extend_from_slice(&2u16.to_le_bytes()); // NumberOfSections
+    out.extend_from_slice(&nsections.to_le_bytes()); // NumberOfSections
     out.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
     out.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
     out.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
@@ -179,7 +197,7 @@ pub fn write_pe(
     out.push(14); // MajorLinkerVersion
     out.push(0); // MinorLinkerVersion
     out.extend_from_slice(&text_raw.to_le_bytes()); // SizeOfCode
-    out.extend_from_slice(&rdata_raw.to_le_bytes()); // SizeOfInitializedData
+    out.extend_from_slice(&(rdata_raw + data_raw).to_le_bytes()); // SizeOfInitializedData
     out.extend_from_slice(&0u32.to_le_bytes()); // SizeOfUninitializedData
     out.extend_from_slice(&entry_rva.to_le_bytes()); // AddressOfEntryPoint
     out.extend_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfCode
@@ -228,7 +246,11 @@ pub fn write_pe(
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&ch.to_le_bytes());
     };
+    // .text (RX), then .data (RW, INITIALIZED|READ|WRITE) if any, then .rdata (R).
     sec(&mut out, b".text", text_vsize as u32, TEXT_RVA, text_raw, HEADERS_FILE, 0x6000_0020);
+    if has_data {
+        sec(&mut out, b".data", data_vsize, data_rva, data_raw, data_file, 0xC000_0040);
+    }
     sec(&mut out, b".rdata", rdata_vsize as u32, rdata_rva, rdata_raw, rdata_file, 0x4000_0040);
 
     // pad headers to SizeOfHeaders
@@ -236,9 +258,64 @@ pub fn write_pe(
     // .text (padded)
     out.extend_from_slice(&text);
     out.resize((HEADERS_FILE + text_raw) as usize, 0);
+    // .data (padded)
+    if has_data {
+        out.extend_from_slice(&module.data);
+        out.resize((data_file + data_raw) as usize, 0);
+    }
     // .rdata (padded)
     out.extend_from_slice(&rdata);
     out.resize((rdata_file + rdata_raw) as usize, 0);
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{Reloc, RelocKind};
+
+    /// `lea rcx, [rip + counter]; ret`, where `counter` is a 4-byte `.data` global.
+    fn module_with_data() -> EncodedModule {
+        EncodedModule {
+            code: vec![0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xC3],
+            data: vec![0, 0, 0, 0],
+            symbols: BTreeMap::from([("main".to_string(), 0usize)]),
+            data_symbols: BTreeMap::from([("counter".to_string(), 0usize)]),
+            relocs: vec![Reloc {
+                at: 3,
+                size: 4,
+                kind: RelocKind::RipRel32,
+                target: "counter".to_string(),
+                addend: 0,
+            }],
+            externs: vec![],
+        }
+    }
+
+    fn num_sections(exe: &[u8]) -> u16 {
+        u16::from_le_bytes([exe[0x46], exe[0x47]]) // e_lfanew=0x40, +4 sig +2 machine
+    }
+
+    #[test]
+    fn writable_data_section_emitted_and_cross_ref_resolved() {
+        let exe = write_pe(&module_with_data(), &BTreeMap::new(), "main").unwrap();
+        assert_eq!(&exe[0..2], b"MZ");
+        assert_eq!(num_sections(&exe), 3, "headers + .text + .data + .rdata");
+        assert!(exe.windows(5).any(|w| w == b".data"), ".data section header present");
+        // The code→data RIP-rel field (code off 3 → file 0x203) was patched.
+        assert_ne!(&exe[0x203..0x207], &[0, 0, 0, 0], "code→data disp resolved, not a placeholder");
+    }
+
+    #[test]
+    fn no_data_keeps_two_sections() {
+        let m = EncodedModule {
+            code: vec![0xC3], // ret
+            symbols: BTreeMap::from([("main".to_string(), 0usize)]),
+            ..Default::default()
+        };
+        let exe = write_pe(&m, &BTreeMap::new(), "main").unwrap();
+        assert_eq!(num_sections(&exe), 2, "no .data → just .text + .rdata");
+        assert!(!exe.windows(5).any(|w| w == b".data"));
+    }
 }

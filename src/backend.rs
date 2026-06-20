@@ -32,15 +32,21 @@ pub enum RelocKind {
     Abs64,
 }
 
-/// The product of [`Encoder::encode`]: a position-independent code blob plus the
-/// symbol table and relocation list a loader needs to place it.
+/// The product of [`Encoder::encode`]: position-independent code (and optional
+/// read/write data) blobs plus the symbol table and relocation list a loader
+/// needs to place it.
 #[derive(Debug, Clone, Default)]
 pub struct EncodedModule {
-    /// The encoded bytes, with reloc fields left as placeholders (0).
+    /// The encoded `.text` bytes, with reloc fields left as placeholders (0).
     pub code: Vec<u8>,
-    /// `name -> byte offset` for every `.globl`/labelled symbol defined here.
+    /// The `.data` bytes (read/write globals), empty unless `.data` is used.
+    pub data: Vec<u8>,
+    /// `name -> code offset` for every `.globl`/labelled symbol defined in `.text`.
     pub symbols: BTreeMap<String, usize>,
-    /// Relocations to apply at load time.
+    /// `name -> data offset` for every label defined in `.data` (so a `.text`
+    /// reference to it can be resolved against the data section's address).
+    pub data_symbols: BTreeMap<String, usize>,
+    /// Relocations to apply at load time (externs, and `.text`→`.data` refs).
     pub relocs: Vec<Reloc>,
     /// Names referenced but not defined here (externs to bind).
     pub externs: Vec<String>,
