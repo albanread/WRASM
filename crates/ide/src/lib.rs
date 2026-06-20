@@ -50,6 +50,14 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
             return Ok(md);
         }
     }
+    // `Struct.field` → the struct's layout card (the dual of `Interface::Method`):
+    // field access like `WNDCLASSEXW.cbSize` resolves to its containing struct, so
+    // the offset table — including that field — is shown.
+    if let Some((stru, _field)) = q.split_once('.') {
+        if let Some(md) = struct_card(kb, stru.trim())? {
+            return Ok(md);
+        }
+    }
     if let Some(md) = function_card(kb, q)? {
         return Ok(md);
     }
@@ -325,6 +333,16 @@ mod tests {
         assert!(md.contains("sizeof **16**"), "size:\n{md}");
         assert!(md.contains("`left`") && md.contains("`right`"), "fields:\n{md}");
         assert!(md.contains("| offset | field | type |"), "table:\n{md}");
+    }
+
+    #[test]
+    fn struct_field_access_resolves_to_the_struct_card() {
+        // The dual of `Interface::Method`: `Struct.field` (e.g. the `WNDCLASSEXW.cbSize`
+        // a `mov [rdi + WNDCLASSEXW.cbSize]` uses) answers with the struct's layout.
+        let Some(kb) = kb() else { return };
+        let md = answer(&kb, "WNDCLASSEXW.cbSize").unwrap();
+        assert_eq!(md, answer(&kb, "WNDCLASSEXW").unwrap(), "same as the bare struct");
+        assert!(md.contains("# WNDCLASSEXW") && md.contains("`cbSize`"), "struct card:\n{md}");
     }
 
     #[test]

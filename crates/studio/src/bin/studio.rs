@@ -545,6 +545,11 @@ main:
                 if let Some((_, iface)) = self.com_binds.iter().find(|(n, _)| n == name) {
                     return Some(format!("{iface}::{method}"));
                 }
+                // Not a comobj — a `Struct.field` access (e.g. WNDCLASSEXW.cbSize).
+                // Hand the resolver the dotted token; it shows the struct's card.
+                if !name.is_empty() {
+                    return Some(tok.to_string());
+                }
             } else if let Some((_, iface)) = self.com_binds.iter().find(|(n, _)| n == tok) {
                 return Some(iface.clone());
             }
