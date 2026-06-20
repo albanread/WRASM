@@ -92,6 +92,7 @@ mod gui {
     use studio::doc::Doc;
     use studio::lang::{Diag, Emit, Lang, ListingRow, Response};
     use studio::syntax::TokKind;
+    use winkb::Completion;
 
     const CLASS: PCWSTR = w!("RasmStudioMain");
 
@@ -385,6 +386,14 @@ main:
         recent_menu: HMENU,
         /// `comobj NAME : Interface` bindings in the buffer (for COM-aware cards).
         com_binds: Vec<(String, String)>,
+        /// Active autocomplete candidates (empty = the popup is hidden).
+        comp: Vec<Completion>,
+        /// Highlighted candidate index.
+        comp_sel: usize,
+        /// Byte offset in the caret line where the completed prefix starts.
+        comp_start: usize,
+        /// The in-flight completion request id (matches a `Completions` reply).
+        pending_complete: u64,
     }
 
     impl App {
@@ -428,6 +437,10 @@ main:
                 recent: load_recent(),
                 recent_menu: HMENU::default(),
                 com_binds: Vec::new(),
+                comp: Vec::new(),
+                comp_sel: 0,
+                comp_start: 0,
+                pending_complete: 0,
             };
             unsafe { app.build_menu() };
             app.update_title();
@@ -517,6 +530,51 @@ main:
             self.ensure_caret_visible();
         }
 
+        /// Ask for autocomplete candidates at the caret (member completion after
+        /// `.`, or a name once a prefix is typed); hide the popup otherwise.
+        fn maybe_complete(&mut self) {
+            use studio::complete::CompletionKind as K;
+            let line = self.doc.line(self.doc.caret.row).to_string();
+            let col = self.doc.caret.col;
+            let ctx = studio::complete::context(&line, col);
+            let want = match &ctx.kind {
+                K::Field { .. } => true,
+                K::Function | K::Symbol => !ctx.prefix.is_empty(),
+                K::None => false,
+            };
+            if want {
+                if let Some(lang) = self.lang.as_ref() {
+                    self.pending_complete = lang.post_complete(&line, col, self.com_binds.clone());
+                }
+            } else {
+                self.close_completion();
+            }
+        }
+
+        fn close_completion(&mut self) {
+            if !self.comp.is_empty() {
+                self.comp.clear();
+                self.invalidate();
+            }
+        }
+
+        /// Replace the typed prefix with the highlighted candidate (one undo step).
+        fn accept_completion(&mut self) {
+            if self.comp.is_empty() {
+                return;
+            }
+            let name = self.comp[self.comp_sel].name.clone();
+            let row = self.doc.caret.row;
+            let col = self.doc.caret.col;
+            self.doc.set_caret(row, self.comp_start.min(col));
+            self.doc.start_selection();
+            self.doc.set_caret(row, col);
+            self.doc.insert(&name);
+            self.comp.clear();
+            self.after_edit();
+            self.invalidate();
+        }
+
         /// Synchronous one-time population for the first paint (before the poll
         /// timer runs); all runtime updates go through the async path above.
         fn seed(&mut self) {
@@ -554,6 +612,14 @@ main:
                         self.card_md = markdown;
                         self.card_layout = None;
                         self.card_scroll = 0.0;
+                        self.invalidate();
+                    }
+                    Response::Completions { id, items, replace_start }
+                        if id == self.pending_complete =>
+                    {
+                        self.comp = items;
+                        self.comp_sel = 0;
+                        self.comp_start = replace_start;
                         self.invalidate();
                     }
                     _ => {} // a superseded reply, or one for a sync call() already taken
@@ -732,6 +798,7 @@ main:
             target.Clear(Some(std::ptr::addr_of!(bg)));
 
             self.draw_editor(target, split, editor_h);
+            self.draw_completion(target, split, editor_h);
             self.draw_output(target, split, editor_h, vh);
 
             if let Some(c) = self.card_layout.as_ref() {
@@ -825,6 +892,48 @@ main:
         /// Draw the editor as an ASM listing: a gray byte margin on the left,
         /// colour-coded source on the right, the macro expansion as gray ghost
         /// rows beneath a macro line, the caret, and diagnostic squiggles.
+        /// The autocomplete popup, a list anchored below the caret line.
+        unsafe fn draw_completion(&self, t: &ID2D1RenderTarget, split: f32, editor_h: f32) {
+            if self.comp.is_empty() {
+                return;
+            }
+            let rows = self.row_layout();
+            let Some(&(top, _)) = rows.get(self.doc.caret.row) else { return };
+            let sy = top - self.editor_scroll;
+            if sy < -LINE_H || sy > editor_h {
+                return; // caret line scrolled out of view
+            }
+            let line = self.doc.line(self.doc.caret.row);
+            let pe = self.comp_start.min(line.len());
+            let popup_w = 320.0_f32;
+            let px = (SRC_X + measure(&line[..pe])).min(split - popup_w - 8.0).max(SRC_X);
+            let py = sy + LINE_H;
+            let item_h = LINE_H;
+            let max_show = 8usize;
+            let n = self.comp.len().min(max_show);
+            // Window the visible items so the selection stays on screen.
+            let first = self
+                .comp_sel
+                .saturating_sub(max_show - 1)
+                .min(self.comp.len().saturating_sub(n));
+            render::fill_rect(t, px, py, popup_w, n as f32 * item_h + 4.0, 0x22_22_2A);
+            render::fill_rect(t, px, py, popup_w, 1.0, theme::BORDER);
+            for (i, item) in self.comp.iter().skip(first).take(n).enumerate() {
+                let iy = py + 2.0 + i as f32 * item_h;
+                if first + i == self.comp_sel {
+                    render::fill_rect(t, px, iy, popup_w, item_h, SELECTION);
+                }
+                render::draw_text(
+                    t, px + 7.0, iy, popup_w - 122.0, item_h, &item.name,
+                    EDITOR_FONT, EDITOR_SIZE * 0.92, false, false, theme::TEXT, false,
+                );
+                render::draw_text(
+                    t, px + popup_w - 112.0, iy, 106.0, item_h, &item.detail,
+                    EDITOR_FONT, EDITOR_SIZE * 0.78, false, false, theme::TEXT_DIM, false,
+                );
+            }
+        }
+
         unsafe fn draw_editor(&self, t: &ID2D1RenderTarget, split: f32, editor_h: f32) {
             let text_right = split - 6.0;
             render::fill_rect(t, 0.0, 0.0, SRC_X - 4.0, editor_h, 0x18_18_18); // margin bg
@@ -1033,6 +1142,11 @@ main:
                 self.invalidate();
                 return;
             }
+            // Autocomplete popup open: Tab/Enter accept the highlighted candidate.
+            if !self.comp.is_empty() && (ch == 0x09 || ch == 0x0D) {
+                self.accept_completion();
+                return;
+            }
             // Text input (Backspace/Enter/Tab arrive here too — handled here, not
             // in WM_KEYDOWN, so they aren't applied twice).
             match ch {
@@ -1047,6 +1161,12 @@ main:
                 _ => return,
             }
             self.after_edit();
+            // Re-query completion after a text change; a newline ends it.
+            if ch == 0x08 || (ch >= 0x20 && ch != 0x7f) {
+                self.maybe_complete();
+            } else {
+                self.close_completion();
+            }
             self.invalidate();
         }
 
@@ -1059,6 +1179,30 @@ main:
                     self.invalidate();
                 }
                 return true;
+            }
+            // Autocomplete popup open: arrows move the selection, Esc dismisses,
+            // a caret move closes it (and then proceeds).
+            if !self.comp.is_empty() && !ctrl {
+                match vk {
+                    VK_DOWN => {
+                        self.comp_sel = (self.comp_sel + 1) % self.comp.len();
+                        self.invalidate();
+                        return true;
+                    }
+                    VK_UP => {
+                        self.comp_sel = (self.comp_sel + self.comp.len() - 1) % self.comp.len();
+                        self.invalidate();
+                        return true;
+                    }
+                    VK_ESCAPE => {
+                        self.close_completion();
+                        return true;
+                    }
+                    VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_PRIOR | VK_NEXT => {
+                        self.close_completion();
+                    }
+                    _ => {}
+                }
             }
             if ctrl {
                 match vk {

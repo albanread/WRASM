@@ -542,7 +542,7 @@ fn complete_items(
                     .map(|(name, slot)| Completion {
                         name,
                         kind: "method".into(),
-                        detail: format!("vtbl[{slot}] {iface}"),
+                        detail: format!("vtbl[{slot}]"),
                     })
                     .collect()
             } else {
