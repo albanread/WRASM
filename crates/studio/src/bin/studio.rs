@@ -34,7 +34,12 @@ mod gui {
     use std::path::{Path, PathBuf};
 
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
     };
@@ -59,16 +64,17 @@ mod gui {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F5,
-        VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP, VIRTUAL_KEY,
+        GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F5, VK_HOME,
+        VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
         GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassExW, SetTimer,
         SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA,
         IDC_ARROW, MSG, SW_SHOW, WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
-        WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SIZE,
-        WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+        WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     use docpane::layout::Layout;
@@ -106,7 +112,14 @@ mod gui {
     const CARET_COLOR: u32 = theme::TEXT_BRIGHT;
     const BYTE_COLOR: u32 = 0x6E_6E_6E; // listing bytes, dim gray
     const GHOST_COLOR: u32 = 0x86_86_86; // expanded ghost asm, gray
-    const VK_F: VIRTUAL_KEY = VIRTUAL_KEY(0x46); // the 'F' key (Ctrl+F = search)
+    const SELECTION: u32 = 0x26_4F_78; // selection highlight (VS Code blue)
+    const VK_F: VIRTUAL_KEY = VIRTUAL_KEY(0x46); // 'F' (Ctrl+F = search)
+    const VK_A: VIRTUAL_KEY = VIRTUAL_KEY(0x41);
+    const VK_C: VIRTUAL_KEY = VIRTUAL_KEY(0x43);
+    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+    const VK_X: VIRTUAL_KEY = VIRTUAL_KEY(0x58);
+    const VK_Y: VIRTUAL_KEY = VIRTUAL_KEY(0x59);
+    const VK_Z: VIRTUAL_KEY = VIRTUAL_KEY(0x5A);
 
     const STARTER: &str = "\
 .globl main
@@ -184,6 +197,47 @@ main:
             .join(" ")
     }
 
+    /// Put `text` on the system clipboard as UTF-16 (`CF_UNICODETEXT`).
+    unsafe fn clipboard_set(hwnd: HWND, text: &str) {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        if OpenClipboard(Some(hwnd)).is_err() {
+            return;
+        }
+        let _ = EmptyClipboard();
+        if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) {
+            let p = GlobalLock(h) as *mut u16;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+                let _ = GlobalUnlock(h);
+                let _ = SetClipboardData(13, Some(HANDLE(h.0))); // 13 = CF_UNICODETEXT
+            }
+        }
+        let _ = CloseClipboard();
+    }
+
+    /// Read UTF-16 text from the system clipboard, if present.
+    unsafe fn clipboard_get(hwnd: HWND) -> Option<String> {
+        if OpenClipboard(Some(hwnd)).is_err() {
+            return None;
+        }
+        let mut out = None;
+        if IsClipboardFormatAvailable(13).is_ok() {
+            if let Ok(h) = GetClipboardData(13) {
+                let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
+                if !p.is_null() {
+                    let mut len = 0;
+                    while *p.add(len) != 0 {
+                        len += 1;
+                    }
+                    out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+                    let _ = GlobalUnlock(HGLOBAL(h.0));
+                }
+            }
+        }
+        let _ = CloseClipboard();
+        out
+    }
+
     struct App {
         hwnd: HWND,
         dpi: u32,
@@ -221,6 +275,8 @@ main:
         pending_check: u64,
         pending_listing: u64,
         pending_card: u64,
+        /// True while the mouse is dragging out a selection.
+        dragging: bool,
     }
 
     impl App {
@@ -259,6 +315,7 @@ main:
                 pending_check: 0,
                 pending_listing: 0,
                 pending_card: 0,
+                dragging: false,
             };
             // Open on the macro definition — it generates no code (empty margin),
             // with the loop and the macro's expansion in the listing below.
@@ -645,6 +702,23 @@ main:
                     }
                 }
 
+                // Selection highlight (behind the source text).
+                if let Some((s, e)) = self.doc.selection() {
+                    if row >= s.row && row <= e.row {
+                        let x0 = if row == s.row {
+                            SRC_X + measure(&line[..s.col.min(line.len())])
+                        } else {
+                            SRC_X
+                        };
+                        let x1 = if row == e.row {
+                            SRC_X + measure(&line[..e.col.min(line.len())])
+                        } else {
+                            text_right
+                        };
+                        render::fill_rect(t, x0, sy, (x1 - x0).max(2.0), LINE_H, SELECTION);
+                    }
+                }
+
                 // Colour-coded source.
                 for tok in self.doc.tokens(row) {
                     let x = SRC_X + measure(&line[..tok.start]);
@@ -800,13 +874,15 @@ main:
                 self.invalidate();
                 return;
             }
+            // Text input (Backspace/Enter/Tab arrive here too — handled here, not
+            // in WM_KEYDOWN, so they aren't applied twice).
             match ch {
-                0x08 => self.doc.backspace(),  // Backspace
-                0x0D => self.doc.insert("\n"), // Enter
-                0x09 => self.doc.insert("  "), // Tab → two spaces
+                0x08 => self.doc.backspace(),
+                0x0D => self.doc.insert("\n"),
+                0x09 => self.doc.insert("  "),
                 c if c >= 0x20 && c != 0x7f => {
                     if let Some(c) = char::from_u32(c) {
-                        self.doc.insert(&c.to_string());
+                        self.doc.type_char(c); // coalesced typing → one undo step
                     }
                 }
                 _ => return,
@@ -816,7 +892,7 @@ main:
         }
 
         /// A navigation / command key from WM_KEYDOWN. Returns true if handled.
-        fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool) -> bool {
+        fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> bool {
             // Search box focused: swallow keys (text comes via WM_CHAR); Esc exits.
             if self.search_active {
                 if vk == VK_ESCAPE {
@@ -825,10 +901,28 @@ main:
                 }
                 return true;
             }
-            if ctrl && vk == VK_F {
-                self.search_active = true;
+            if ctrl {
+                match vk {
+                    VK_F => self.search_active = true,
+                    VK_A => self.doc.select_all(),
+                    VK_C => self.clipboard_copy(),
+                    VK_X => self.clipboard_cut(),
+                    VK_V => self.clipboard_paste(),
+                    VK_Z if shift => self.do_redo(),
+                    VK_Z => self.do_undo(),
+                    VK_Y => self.do_redo(),
+                    _ => return false,
+                }
                 self.invalidate();
                 return true;
+            }
+            // Caret-moving keys: extend the selection with Shift, else drop it.
+            if matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END | VK_PRIOR | VK_NEXT) {
+                if shift {
+                    self.doc.start_selection();
+                } else {
+                    self.doc.clear_selection();
+                }
             }
             match vk {
                 VK_LEFT => self.doc.move_left(),
@@ -845,17 +939,7 @@ main:
                     self.page_move(true);
                     return true;
                 }
-                VK_BACK => return self.edit(|d| d.backspace()),
-                VK_RETURN => return self.edit(|d| d.insert("\n")),
-                VK_TAB => return self.edit(|d| d.insert("  ")),
-                VK_DELETE => {
-                    let before = self.doc.caret;
-                    self.doc.move_right();
-                    if self.doc.caret != before {
-                        return self.edit(|d| d.backspace());
-                    }
-                    return true;
-                }
+                VK_DELETE => return self.edit(|d| d.delete_forward()),
                 VK_F5 => {
                     self.build_exe();
                     return true;
@@ -874,6 +958,34 @@ main:
             self.after_caret();
             self.invalidate();
             true
+        }
+
+        fn clipboard_copy(&self) {
+            if let Some(text) = self.doc.copy() {
+                unsafe { clipboard_set(self.hwnd, &text) };
+            }
+        }
+        fn clipboard_cut(&mut self) {
+            if let Some(text) = self.doc.cut() {
+                unsafe { clipboard_set(self.hwnd, &text) };
+                self.after_edit();
+            }
+        }
+        fn clipboard_paste(&mut self) {
+            if let Some(text) = unsafe { clipboard_get(self.hwnd) } {
+                self.doc.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                self.after_edit();
+            }
+        }
+        fn do_undo(&mut self) {
+            if self.doc.undo() {
+                self.after_edit();
+            }
+        }
+        fn do_redo(&mut self) {
+            if self.doc.redo() {
+                self.after_edit();
+            }
         }
 
         /// Apply a text edit to the document, then re-check/re-assemble + repaint.
@@ -960,9 +1072,10 @@ main:
             self.invalidate();
         }
 
-        /// A click: position the editor caret, focus the search box, or follow a
-        /// card link — by which pane was hit.
-        fn on_click(&mut self, x: f32, y: f32) {
+        /// A mouse press: position the editor caret (starting a drag-selection),
+        /// focus the search box, or follow a card link — by pane. Shift extends
+        /// the selection from the current caret.
+        fn on_press(&mut self, x: f32, y: f32, shift: bool) {
             let (vw, vh) = self.viewport();
             let split = vw * SPLIT_FRAC;
             let editor_h = (vh - OUTPUT_H).max(0.0);
@@ -975,21 +1088,40 @@ main:
                 }
             } else if y < editor_h {
                 self.search_active = false;
+                if shift {
+                    self.doc.start_selection();
+                } else {
+                    self.doc.clear_selection();
+                }
                 self.place_caret(x, y);
+                if !shift {
+                    self.doc.start_selection(); // anchor here for the drag
+                }
+                self.dragging = true;
             }
         }
 
-        /// Place the editor caret nearest a click in the listing's source column.
-        fn place_caret(&mut self, x: f32, y: f32) {
+        /// Extend the selection by dragging (no per-move card refresh).
+        fn on_drag(&mut self, x: f32, y: f32) {
+            if !self.dragging {
+                return;
+            }
+            let (row, col) = self.caret_at_xy(x, y);
+            self.doc.set_caret(row, col);
+            self.ensure_caret_visible();
+            self.invalidate();
+        }
+
+        /// The (row, col) nearest a point in the editor's source column.
+        fn caret_at_xy(&self, x: f32, y: f32) -> (usize, usize) {
             let rows = self.row_layout();
-            let cy = y + self.editor_scroll; // click is in viewport space
+            let cy = y + self.editor_scroll; // viewport space
             let row = rows
                 .iter()
                 .position(|&(top, h)| cy >= top && cy < top + h)
                 .unwrap_or_else(|| self.doc.line_count().saturating_sub(1));
-            let line = self.doc.line(row).to_string();
+            let line = self.doc.line(row);
             let target = x - SRC_X;
-            // Walk char boundaries, keep the one whose x is nearest the click.
             let (mut best, mut best_d) = (0usize, f32::MAX);
             let mut idx = 0usize;
             loop {
@@ -1003,7 +1135,13 @@ main:
                 }
                 idx += line[idx..].chars().next().unwrap().len_utf8();
             }
-            self.doc.set_caret(row, best);
+            (row, best)
+        }
+
+        /// Place the caret nearest a click, refreshing the card for its symbol.
+        fn place_caret(&mut self, x: f32, y: f32) {
+            let (row, col) = self.caret_at_xy(x, y);
+            self.doc.set_caret(row, col);
             self.after_caret();
             self.invalidate();
         }
@@ -1205,7 +1343,8 @@ main:
             }
             WM_KEYDOWN => {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-                if app.on_key(VIRTUAL_KEY(wparam.0 as u16), ctrl) {
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                if app.on_key(VIRTUAL_KEY(wparam.0 as u16), ctrl, shift) {
                     LRESULT(0)
                 } else {
                     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1215,6 +1354,7 @@ main:
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 * scale;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 * scale;
                 app.last_mouse = (x, y);
+                app.on_drag(x, y);
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
@@ -1231,7 +1371,12 @@ main:
             WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 * scale;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 * scale;
-                app.on_click(x, y);
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                app.on_press(x, y, shift);
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                app.dragging = false;
                 LRESULT(0)
             }
             WM_DESTROY => {
