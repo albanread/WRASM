@@ -25,6 +25,230 @@ pub struct Diag {
     pub message: String,
 }
 
+/// One of the six caller-saved general registers an `invoke`/`call`/COM call
+/// destroys (rax is excluded: it's the *return value*, so using it after a call
+/// is the idiom, not a bug; xmm is left out to stay conservative).
+fn clobber_reg(s: &str) -> Option<&'static str> {
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => "rcx",
+        "rdx" | "edx" | "dx" | "dl" | "dh" => "rdx",
+        "r8" | "r8d" | "r8w" | "r8b" => "r8",
+        "r9" | "r9d" | "r9w" | "r9b" => "r9",
+        "r10" | "r10d" | "r10w" | "r10b" => "r10",
+        "r11" | "r11d" | "r11w" | "r11b" => "r11",
+        _ => return None,
+    })
+}
+
+const CLOBBER_REGS: [&str; 6] = ["rcx", "rdx", "r8", "r9", "r10", "r11"];
+
+/// Registers named inside a `[ … ]` memory operand (all reads — they form the
+/// address).
+fn mem_regs(op: &str) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if let (Some(a), Some(b)) = (op.find('['), op.rfind(']')) {
+        for tok in op[a + 1..b].split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if let Some(r) = clobber_reg(tok) {
+                v.push(r);
+            }
+        }
+    }
+    v
+}
+
+/// A bare register operand (not a `[mem]`, not an immediate), as a tracked reg.
+fn bare_clobber_reg(op: &str) -> Option<&'static str> {
+    let o = op.trim();
+    if o.contains('[') {
+        return None;
+    }
+    clobber_reg(o)
+}
+
+/// `obj.Method( … )` shape — a typed COM call (also a call site).
+fn is_method_call_shape(t: &str) -> bool {
+    t.split_once('.').is_some_and(|(obj, rest)| {
+        let obj_ok = !obj.is_empty() && obj.chars().all(|c| c.is_alphanumeric() || c == '_');
+        let m_ok = rest
+            .split_once('(')
+            .is_some_and(|(m, _)| !m.trim().is_empty() && m.trim().chars().all(|c| c.is_alphanumeric() || c == '_'));
+        obj_ok && m_ok
+    })
+}
+
+/// True if `t` is an `invoke`/`comcall`/`obj.Method(…)` — a call to *external*
+/// code (Windows API / COM) that strictly follows the Win64 ABI and so destroys
+/// the caller-saved registers. A plain `call <label>` is deliberately excluded:
+/// it targets one of your own functions, which may preserve more than the ABi
+/// requires (e.g. a helper that keeps the loop counters), so assuming a clobber
+/// there would be a false positive.
+fn is_call_site(t: &str) -> bool {
+    let l = t.to_ascii_lowercase();
+    l.starts_with("invoke ")
+        || l.starts_with("invoke\t")
+        || l.starts_with("comcall ")
+        || is_method_call_shape(t)
+}
+
+/// The tracked registers an instruction reads and writes (conservative — unknown
+/// mnemonics treat operand 0 as written so a clobber is cleared, never invented).
+fn reg_reads_writes(t: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+    let (mn, rest) = match t.find(char::is_whitespace) {
+        Some(p) => (t[..p].to_ascii_lowercase(), t[p..].trim()),
+        None => (t.to_ascii_lowercase(), ""),
+    };
+    let ops: Vec<String> = if rest.is_empty() { Vec::new() } else { split_top_commas(rest) };
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    // Implicit rdx:rax operands.
+    match mn.as_str() {
+        "cdq" | "cqo" | "cwd" => writes.push("rdx"),       // sign-extend rax → rdx
+        "mul" => writes.push("rdx"),                       // rdx:rax = rax * op
+        "div" | "idiv" => {
+            reads.push("rdx"); // dividend high half
+            writes.push("rdx");
+        }
+        _ => {}
+    }
+    for op in &ops {
+        reads.extend(mem_regs(op)); // address registers are always reads
+    }
+    let pure_write = matches!(
+        mn.as_str(),
+        "mov" | "lea" | "movzx" | "movsx" | "movsxd" | "movabs" | "pop" | "cvtsi2ss" | "cvtsi2sd"
+            | "cvttss2si" | "cvttsd2si" | "cvtss2si" | "cvtsd2si"
+    ) || mn.starts_with("set");
+    let read_modify = matches!(
+        mn.as_str(),
+        "add" | "sub" | "and" | "or" | "xor" | "adc" | "sbb" | "shl" | "shr" | "sar" | "sal"
+            | "rol" | "ror" | "rcl" | "rcr" | "inc" | "dec" | "neg" | "not" | "imul" | "xchg"
+    );
+    // `cmp`/`test`/`push` read op0; `mul`/`div`/`idiv` read their (single) operand.
+    let read_only_first = matches!(mn.as_str(), "cmp" | "test" | "push" | "mul" | "div" | "idiv");
+    // `xor r,r` / `sub r,r` zero the register — a pure write of both operands.
+    let zeroing = matches!(mn.as_str(), "xor" | "sub")
+        && ops.len() == 2
+        && bare_clobber_reg(&ops[0]).is_some()
+        && bare_clobber_reg(&ops[0]) == bare_clobber_reg(&ops[1]);
+    if let Some(r0) = ops.first().and_then(|o| bare_clobber_reg(o)) {
+        if zeroing || pure_write {
+            writes.push(r0);
+        } else if read_modify {
+            writes.push(r0);
+            reads.push(r0);
+        } else if read_only_first {
+            reads.push(r0);
+        } else {
+            writes.push(r0); // unknown: assume it defines op0 (avoids false positives)
+        }
+    }
+    if !zeroing {
+        for op in ops.iter().skip(1) {
+            if let Some(r) = bare_clobber_reg(op) {
+                reads.push(r);
+            }
+        }
+    }
+    (reads, writes)
+}
+
+/// Warn when a caller-saved register is read after an `invoke`/`call`/COM call
+/// destroyed its value — the classic Win64 bug of stashing a pointer in
+/// rcx/rdx/r8/r9/r10/r11, calling something, then using the now-garbage register.
+///
+/// Conservative by construction: it tracks only those six registers, resets at
+/// every label (so it never reasons across a branch it can't see), treats rax as
+/// the return value, and on a call checks the argument registers *before*
+/// clobbering. The aim is zero false positives on correct code.
+pub fn clobber_diags(src: &str) -> Vec<Diag> {
+    let pos = |r: &str| CLOBBER_REGS.iter().position(|&x| x == r).unwrap();
+    let mut clobbered: [Option<usize>; 6] = [None; 6]; // Some(line of the call)
+    let mut diags = Vec::new();
+    let mut in_code = true;
+    let mut in_macro = false;
+    let warn = |diags: &mut Vec<Diag>, line: usize, reg: &str, call: usize| {
+        diags.push(Diag {
+            line,
+            col: 1,
+            message: format!(
+                "`{reg}` may be clobbered by the call at line {call} — reload it before using it here (it's caller-saved)"
+            ),
+        });
+    };
+    for (i, raw) in src.lines().enumerate() {
+        let line = i + 1;
+        let body = strip_comment(raw);
+        let mut t = body.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.to_ascii_lowercase().as_str() {
+            ".data" => {
+                in_code = false;
+                continue;
+            }
+            ".code" | ".text" => {
+                in_code = true;
+                continue;
+            }
+            _ => {}
+        }
+        if !in_code {
+            continue;
+        }
+        if parse_macro_def(t).is_some() {
+            in_macro = true;
+            continue;
+        }
+        if is_endm(t) {
+            in_macro = false;
+            continue;
+        }
+        if in_macro {
+            continue;
+        }
+        // Peel a leading `label:`; a bare label (or any label) starts a new block
+        // whose incoming register state we can't know — reset.
+        if let Some((head, tail)) = t.split_once(':') {
+            if !head.is_empty()
+                && head.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+                && !head.contains(char::is_whitespace)
+            {
+                clobbered = [None; 6];
+                t = tail.trim();
+                if t.is_empty() {
+                    continue;
+                }
+            }
+        }
+        if is_call_site(t) {
+            for r in reg_reads_writes(t).0 {
+                if let Some(c) = clobbered[pos(r)] {
+                    warn(&mut diags, line, r, c);
+                }
+            }
+            // every caller-saved register is now destroyed
+            clobbered = [Some(line); 6];
+            continue;
+        }
+        let mn = t.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        let (reads, writes) = reg_reads_writes(t);
+        for r in reads {
+            if let Some(c) = clobbered[pos(r)] {
+                warn(&mut diags, line, r, c);
+            }
+        }
+        for r in writes {
+            clobbered[pos(r)] = None;
+        }
+        // After an unconditional transfer the fall-through is a new block.
+        if mn == "ret" || mn == "jmp" {
+            clobbered = [None; 6];
+        }
+    }
+    diags
+}
+
 /// Check `src` and return diagnostics — semantic (invoke arg count, unknown
 /// constants with a "did you mean", bad struct fields) plus a whole-file
 /// syntax/encode pass through rasm. Empty result = clean.
@@ -193,6 +417,8 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
             }
         }
     }
+    // Caller-saved register clobbered across a call — a hint, appended last.
+    diags.extend(clobber_diags(src));
     diags
 }
 
@@ -1588,6 +1814,34 @@ mod tests {
     fn split_commas_respects_brackets() {
         let p = split_top_commas("Func, [rsp + 8], 0x10, msg");
         assert_eq!(p, vec!["Func", " [rsp + 8]", " 0x10", " msg"]);
+    }
+
+    #[test]
+    fn clobber_check_catches_the_bug_and_spares_correct_code() {
+        // BUG: stash a pointer in rcx, call (clobbers rcx), then dereference rcx.
+        let bug = ".code\nf:\n  lea rcx, [rip + buf]\n  invoke GetTickCount\n  mov rax, [rcx]\n  ret\n";
+        let d = clobber_diags(bug);
+        assert_eq!(d.len(), 1, "exactly one warning: {d:?}");
+        assert!(d[0].line == 5 && d[0].message.contains("rcx"), "{d:?}");
+
+        // Correct patterns — must stay silent:
+        let cases = [
+            // saved in a non-volatile register
+            ".code\nf:\n  lea rbx, [rip + b]\n  invoke GetTickCount\n  mov rax, [rbx]\n  ret\n",
+            // using the return value (rax) after a call is the idiom
+            ".code\nf:\n  invoke GetTickCount\n  mov rsi, rax\n  ret\n",
+            // reloaded before use
+            ".code\nf:\n  invoke GetTickCount\n  lea rcx, [rip + b]\n  mov rax, [rcx]\n  ret\n",
+            // the zeroing idiom is a write, not a read
+            ".code\nf:\n  invoke GetTickCount\n  xor rcx, rcx\n  mov [rcx], al\n  ret\n",
+            // cdq writes rdx, so reading edx after is fine
+            ".code\nf:\n  invoke GetTickCount\n  mov eax, 7\n  cdq\n  xor eax, edx\n  ret\n",
+            // a plain call to a local function isn't assumed to clobber
+            ".code\nf:\n  mov rcx, 5\n  call helper\n  mov [rcx], al\n  ret\n",
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            assert!(clobber_diags(c).is_empty(), "case {i} should be clean: {:?}", clobber_diags(c));
+        }
     }
 
     #[test]
