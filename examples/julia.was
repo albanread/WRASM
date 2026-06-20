@@ -1,0 +1,216 @@
+; julia.was — an animated Julia set in SSE double precision.
+;
+;   was examples\julia.was -o julia.exe   &&   julia.exe
+;
+; z starts at the pixel; c is a constant we spin around a circle (radius |c0|)
+; one degree per frame by a rotation matrix — so the fractal morphs smoothly.
+; The first frame (c = -0.8 + 0.156i) is also written to julia.bmp.
+;
+; `render` recomputes the whole 640x480 frame; it touches only volatile
+; registers (rax,rcx,rdx,r8-r11, xmm0-xmm5), so it needs no prologue.
+
+.DATA
+four        QWORD  0x4010000000000000   ; 4.0
+xmin        QWORD  0xBFF999999999999A   ; -1.6
+xspan       QWORD  0x400999999999999A   ;  3.2
+ymin        QWORD  0xBFF3333333333333   ; -1.2
+yspan       QWORD  0x4003333333333333   ;  2.4
+dwidth      QWORD  0x4084000000000000   ;  640.0
+dheight     QWORD  0x407E000000000000   ;  480.0
+cx0         QWORD  0xBFE999999999999A   ; -0.8     (initial c real)
+cy0         QWORD  0x3FC3F7CED916872B   ;  0.156   (initial c imag)
+cosd        QWORD  0x3FEFFEC097F5AF8A   ; cos(1°)
+sind        QWORD  0x3F91DF0B2B89DD1E   ; sin(1°)
+cre         QWORD  ?                    ; current c (rotated each frame)
+cim         QWORD  ?
+
+className   WCHAR  "rasm_julia", 0
+titleText   WCHAR  "RASM — animated Julia (SSE)", 0
+fname       WCHAR  "julia.bmp", 0
+wc          BYTE   80 dup(0)
+bmi         BYTE   40 dup(0)
+msg         BYTE   48 dup(0)
+ps          BYTE   72 dup(0)
+filehdr     BYTE   0x42,0x4D, 0x36,0xC4,0x12,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+fb          QWORD  ?
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4
+    mov     [rip + fb], rax
+
+    ; c = (cx0, cy0)
+    movsd   xmm0, [rip + cx0]
+    movsd   [rip + cre], xmm0
+    movsd   xmm0, [rip + cy0]
+    movsd   [rip + cim], xmm0
+
+    call    render                      ; first frame
+
+    ; BITMAPINFOHEADER (top-down 32bpp)
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    ; save the first frame to julia.bmp
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 1228800, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; window
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0       ; ~60 Hz animation tick
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- render the current Julia frame into the framebuffer ----
+render:
+    mov     r11, [rip + fb]                 ; pixel pointer
+    xor     r8, r8                          ; py
+jr_y:
+    cvtsi2sd xmm3, r8                        ; zy0 = ymin + (py/480)*yspan
+    divsd   xmm3, [rip + dheight]
+    mulsd   xmm3, [rip + yspan]
+    addsd   xmm3, [rip + ymin]
+    xor     r9, r9                          ; px
+jr_x:
+    cvtsi2sd xmm2, r9                        ; zx0 = xmin + (px/640)*xspan
+    divsd   xmm2, [rip + dwidth]
+    mulsd   xmm2, [rip + xspan]
+    addsd   xmm2, [rip + xmin]
+    movsd   xmm0, xmm2                      ; zx = zx0
+    movsd   xmm1, xmm3                      ; zy = zy0
+    xor     r10, r10                        ; iter
+jr_it:
+    movsd   xmm4, xmm0
+    mulsd   xmm4, xmm0                      ; zx2
+    movsd   xmm5, xmm1
+    mulsd   xmm5, xmm1                      ; zy2
+    movsd   xmm2, xmm4
+    addsd   xmm2, xmm5                      ; zx2+zy2
+    ucomisd xmm2, [rip + four]
+    ja      jr_done
+    movsd   xmm2, xmm0
+    mulsd   xmm2, xmm1                      ; zx*zy
+    addsd   xmm2, xmm2                      ; 2*zx*zy
+    addsd   xmm2, [rip + cim]               ; + cy   -> zy'
+    subsd   xmm4, xmm5                      ; zx2-zy2
+    addsd   xmm4, [rip + cre]               ; + cx   -> zx'
+    movsd   xmm1, xmm2
+    movsd   xmm0, xmm4
+    inc     r10
+    cmp     r10, 128
+    jb      jr_it
+jr_done:
+    mov     eax, r10d                       ; iter -> colour bands
+    cmp     eax, 128
+    jb      jr_shade
+    xor     eax, eax
+    jmp     jr_put
+jr_shade:
+    mov     ecx, eax
+    shl     ecx, 4
+    and     ecx, 0xFF                       ; B
+    mov     edx, eax
+    shl     edx, 3
+    and     edx, 0xFF
+    shl     edx, 8
+    or      ecx, edx                        ; G
+    mov     edx, eax
+    shl     edx, 2
+    and     edx, 0xFF
+    shl     edx, 16
+    or      ecx, edx                        ; R
+    mov     eax, ecx
+jr_put:
+    mov     [r11], eax
+    add     r11, 4
+    inc     r9
+    cmp     r9, 640
+    jb      jr_x
+    inc     r8
+    cmp     r8, 480
+    jb      jr_y
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                         ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                          ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                        ; WM_TIMER (0x113)
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    ; rotate c by one degree: (cx,cy) = (cx*cos - cy*sin, cx*sin + cy*cos)
+    movsd   xmm0, [rip + cre]
+    movsd   xmm1, [rip + cim]
+    movsd   xmm2, xmm0
+    mulsd   xmm2, [rip + cosd]
+    movsd   xmm3, xmm1
+    mulsd   xmm3, [rip + sind]
+    subsd   xmm2, xmm3                      ; new cx
+    movsd   xmm4, xmm0
+    mulsd   xmm4, [rip + sind]
+    movsd   xmm5, xmm1
+    mulsd   xmm5, [rip + cosd]
+    addsd   xmm4, xmm5                      ; new cy
+    movsd   [rip + cre], xmm2
+    movsd   [rip + cim], xmm4
+    call    render
+    invoke  InvalidateRect, [rip + hwndSave], 0, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
