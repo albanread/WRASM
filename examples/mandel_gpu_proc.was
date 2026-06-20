@@ -1,0 +1,446 @@
+; mandel_gpu.was — a GPU (shader) Mandelbrot you can zoom into.
+;
+;   was examples\mandel_gpu.was -o mandel_gpu.exe   &&   mandel_gpu.exe
+;
+;   * Drag a box with the LEFT mouse button → zoom into it.
+;   * RIGHT-click → zoom back out one level.
+;
+; The Mandelbrot is a pixel shader: the GPU runs the z = z^2 + c loop for every
+; pixel in parallel, so full-resolution deep zooms are instant. The view (centre,
+; span) and the rubber-band rectangle live in a constant buffer the shader reads;
+; the shader even draws the rubber band.
+;
+; This is the COM/DirectX payoff — D3DCompile + the whole D3D11 pipeline driven
+; through the db-aware comcall / comobj / struct macros. The HLSL is embedded as a
+; data string (its `;` statement terminators live happily inside the literal now).
+
+.DATA
+; ---- shader source (compiled at runtime by D3DCompile) ----
+shaderSrc:
+.ASCIISTRING
+cbuffer CB:register(b0){float4 c0;float4 c1;float4 c2;};
+struct VO{float4 p:SV_Position;};
+VO VS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);return o;}
+float4 PS(float4 p:SV_Position):SV_Target{
+float cx=c0.x+(p.x/c1.x-0.5)*c0.z;
+float cy=c0.y+(p.y/c1.y-0.5)*c0.z*c0.w;
+float2 z=float2(0,0);int mi=(int)c1.w;int it;
+for(it=0;it<mi;it++){float a=z.x*z.x;float b=z.y*z.y;if(a+b>4.0)break;z=float2(a-b+cx,2.0*z.x*z.y+cy);}
+float3 col;
+if(it>=mi){col=float3(0,0,0);}else{float t=(float)it/mi;col=0.5+0.5*cos(6.2831*(t+float3(0.0,0.33,0.67)));}
+if(c1.z>0.5){float2 lo=min(c2.xy,c2.zw);float2 hi=max(c2.xy,c2.zw);
+if(p.x>=lo.x&&p.x<=hi.x&&p.y>=lo.y&&p.y<=hi.y&&(abs(p.x-lo.x)<1.5||abs(p.x-hi.x)<1.5||abs(p.y-lo.y)<1.5||abs(p.y-hi.y)<1.5)){col=float3(1,1,1);}}
+return float4(col,1);}
+.ENDASCIISTRING
+shaderEnd:
+    BYTE 0
+
+vsEntry   BYTE "VS", 0
+psEntry   BYTE "PS", 0
+vsTarget  BYTE "vs_4_0", 0
+psTarget  BYTE "ps_4_0", 0
+srcName   BYTE "mandel", 0
+
+; ---- float constants (single precision bit patterns) ----
+cx0       DWORD 0xBF000000        ; -0.5
+cy0       DWORD 0x00000000        ;  0.0
+span0     DWORD 0x40400000        ;  3.0
+aspect    DWORD 0x3F100000        ;  720/1280
+fW        DWORD 0x44A00000        ;  1280.0
+fH        DWORD 0x44340000        ;  720.0
+fMaxIter  DWORD 0x43800000        ;  256.0
+half      DWORD 0x3F000000        ;  0.5
+fOne      DWORD 0x3F800000        ;  1.0
+
+; ---- live view + interaction state ----
+vcx       DWORD ?                  ; current view centre + span (floats)
+vcy       DWORD ?
+vspan     DWORD ?
+dragging  DWORD 0
+dx0       DWORD 0                  ; rubber-band rectangle (client pixels)
+dy0       DWORD 0
+dx1       DWORD 0
+dy1       DWORD 0
+viewStack DWORD 96 dup(0)          ; up to 32 saved (cx,cy,span) for zoom-out
+stackTop  DWORD 0
+srcLen    QWORD ?
+tmpPtr    QWORD ?
+tmpSize   QWORD ?
+cbData    DWORD 0,0,0,0, 0,0,0,0, 0,0,0,0   ; 48-byte constant-buffer mirror
+
+; ---- COM objects ----
+comobj pDevice     : ID3D11Device
+comobj pContext    : ID3D11DeviceContext
+comobj pSwap       : IDXGISwapChain
+comobj pBackBuffer : ID3D11Texture2D
+comobj pVSBlob     : ID3DBlob
+comobj pPSBlob     : ID3DBlob
+pRTV      QWORD ?
+pVS       QWORD ?
+pPS       QWORD ?
+pCB       QWORD ?
+pRast     QWORD ?
+pErrBlob  QWORD ?
+iid_tex2d:
+    iid ID3D11Texture2D
+
+; ---- descriptors ----
+scd struct DXGI_SWAP_CHAIN_DESC
+    BufferCount       = 1
+    BufferDesc.Width  = 1280
+    BufferDesc.Height = 720
+    BufferDesc.Format = 28
+    BufferUsage       = 0x20
+    SampleDesc.Count  = 1
+    Windowed          = 1
+    SwapEffect        = 0
+    OutputWindow      = 0
+ends
+
+bdesc struct D3D11_BUFFER_DESC
+    ByteWidth = 48
+    Usage     = 0
+    BindFlags = 4
+ends
+
+vp struct D3D11_VIEWPORT
+    Width    = 0x44A00000        ; 1280.0f
+    Height   = 0x44340000        ; 720.0f
+    MaxDepth = 0x3F800000        ; 1.0f
+ends
+
+rdesc struct D3D11_RASTERIZER_DESC
+    FillMode = 3                 ; D3D11_FILL_SOLID
+    CullMode = 1                 ; D3D11_CULL_NONE — never cull the fullscreen triangle
+ends
+
+clearCol  DWORD 0, 0, 0x3E99999A, 0x3F800000   ; dark blue (diagnostic background)
+
+featureLevel DWORD 0
+className   WCHAR  "rasm_mandelgpu", 0
+titleText   WCHAR  "RASM — GPU Mandelbrot (drag to zoom, right-click out)", 0
+wc          BYTE   80 dup(0)
+msg         BYTE   48 dup(0)
+hwndSave    QWORD  ?
+winRect     BYTE   16 dup(0)       ; RECT for AdjustWindowRect
+winW        DWORD  ?
+winH        DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    ; size the window so the CLIENT area is exactly 1280x720 (the backbuffer size),
+    ; so mouse client coords and the shader's SV_Position share one pixel space —
+    ; otherwise the rubber band is offset/scaled away from the cursor.
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 1280       ; right
+    mov     dword ptr [rdi + 12], 720       ; bottom
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]                       ; width  = right - left
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]                   ; height = bottom - top
+    mov     [rip + winH], eax
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail_window
+
+    lea     rdi, [rip + scd]
+    mov     rax, [rip + hwndSave]
+    mov     [rdi + DXGI_SWAP_CHAIN_DESC.OutputWindow], rax
+
+    invoke  D3D11CreateDeviceAndSwapChain, 0, 1, 0, 0, 0, 0, 7, scd, pSwap, pDevice, featureLevel, pContext
+    test    eax, eax
+    js      fail_device
+
+    pSwap.GetBuffer(0, iid_tex2d, pBackBuffer)
+    test    eax, eax
+    js      fail_d3d
+    pDevice.CreateRenderTargetView([rip + pBackBuffer], 0, pRTV)
+    test    eax, eax
+    js      fail_d3d
+    pBackBuffer.Release()
+
+    ; ---- compile the shaders from the embedded HLSL ----
+    lea     rax, [rip + shaderEnd]
+    lea     rcx, [rip + shaderSrc]
+    sub     rax, rcx
+    mov     [rip + srcLen], rax
+    invoke  D3DCompile, shaderSrc, [rip + srcLen], srcName, 0, 0, vsEntry, vsTarget, 0, 0, pVSBlob, pErrBlob
+    test    eax, eax
+    js      fail_compile
+    invoke  D3DCompile, shaderSrc, [rip + srcLen], srcName, 0, 0, psEntry, psTarget, 0, 0, pPSBlob, pErrBlob
+    test    eax, eax
+    js      fail_compile
+
+    ; CreateVertexShader(blob bytes, blob size, NULL, &pVS) — ptr/size via memory
+    ; (comcall reuses rbx for its frame, so we can't keep them in registers).
+    pVSBlob.GetBufferPointer()
+    mov     [rip + tmpPtr], rax
+    pVSBlob.GetBufferSize()
+    mov     [rip + tmpSize], rax
+    pDevice.CreateVertexShader([rip + tmpPtr], [rip + tmpSize], 0, pVS)
+    test    eax, eax
+    js      fail_d3d
+    pPSBlob.GetBufferPointer()
+    mov     [rip + tmpPtr], rax
+    pPSBlob.GetBufferSize()
+    mov     [rip + tmpSize], rax
+    pDevice.CreatePixelShader([rip + tmpPtr], [rip + tmpSize], 0, pPS)
+    test    eax, eax
+    js      fail_d3d
+
+    ; constant buffer
+    pDevice.CreateBuffer(bdesc, 0, pCB)
+    test    eax, eax
+    js      fail_d3d
+
+    ; rasterizer state with culling off (so the triangle always draws)
+    pDevice.CreateRasterizerState(rdesc, pRast)
+    test    eax, eax
+    js      fail_d3d
+
+    ; initial view
+    mov     eax, [rip + cx0]
+    mov     [rip + vcx], eax
+    mov     eax, [rip + cy0]
+    mov     [rip + vcy], eax
+    mov     eax, [rip + span0]
+    mov     [rip + vspan], eax
+
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail_compile:
+    invoke  ExitProcess, 5
+fail_d3d:
+    invoke  ExitProcess, 3
+fail_device:
+    invoke  ExitProcess, 2
+fail_window:
+    invoke  ExitProcess, 1
+
+; ---- render one frame: update the constant buffer, run the pipeline ----
+; A `frame` proc: rbx is saved once, the shadow/arg area is reserved once, and the
+; ~14 COM calls below drop their per-call alignment — just arg moves + call.
+proc render uses rbx frame
+    lea     rbx, [rip + cbData]
+    ; c0 = (cx, cy, span, aspect)
+    mov     eax, [rip + vcx]
+    mov     [rbx], eax
+    mov     eax, [rip + vcy]
+    mov     [rbx + 4], eax
+    mov     eax, [rip + vspan]
+    mov     [rbx + 8], eax
+    mov     eax, [rip + aspect]
+    mov     [rbx + 12], eax
+    ; c1 = (W, H, dragActive, maxIter)
+    mov     eax, [rip + fW]
+    mov     [rbx + 16], eax
+    mov     eax, [rip + fH]
+    mov     [rbx + 20], eax
+    mov     eax, [rip + dragging]
+    test    eax, eax
+    jz      rd_nodrag
+    mov     eax, [rip + fOne]
+    jmp     rd_da
+rd_nodrag:
+    xor     eax, eax
+rd_da:
+    mov     [rbx + 24], eax
+    mov     eax, [rip + fMaxIter]
+    mov     [rbx + 28], eax
+    ; c2 = rubber band as floats
+    mov     eax, [rip + dx0]
+    cvtsi2ss xmm0, eax
+    movss   [rbx + 32], xmm0
+    mov     eax, [rip + dy0]
+    cvtsi2ss xmm0, eax
+    movss   [rbx + 36], xmm0
+    mov     eax, [rip + dx1]
+    cvtsi2ss xmm0, eax
+    movss   [rbx + 40], xmm0
+    mov     eax, [rip + dy1]
+    cvtsi2ss xmm0, eax
+    movss   [rbx + 44], xmm0
+
+    pContext.UpdateSubresource([rip + pCB], 0, 0, cbData, 0, 0)
+    pContext.OMSetRenderTargets(1, pRTV, 0)
+    pContext.ClearRenderTargetView([rip + pRTV], clearCol)
+    pContext.RSSetViewports(1, vp)
+    pContext.RSSetState([rip + pRast])
+    pContext.VSSetShader([rip + pVS], 0, 0)
+    pContext.PSSetShader([rip + pPS], 0, 0)
+    pContext.PSSetConstantBuffers(0, 1, pCB)
+    pContext.IASetPrimitiveTopology(4)
+    pContext.Draw(3, 0)
+    pSwap.Present(1, 0)
+endproc
+
+; ---- zoom into the rubber-band rectangle (push the current view) ----
+zoom_in:
+    mov     eax, [rip + stackTop]            ; push current view if room
+    cmp     eax, 31
+    jge     zi_compute
+    imul    ecx, eax, 12
+    lea     r8, [rip + viewStack]
+    mov     edx, [rip + vcx]
+    mov     [r8 + rcx], edx
+    mov     edx, [rip + vcy]
+    mov     [r8 + rcx + 4], edx
+    mov     edx, [rip + vspan]
+    mov     [r8 + rcx + 8], edx
+    inc     eax
+    mov     [rip + stackTop], eax
+zi_compute:
+    ; new cx = cx + ((dx0+dx1)/2 / W - 0.5) * span
+    mov     eax, [rip + dx0]
+    add     eax, [rip + dx1]
+    cvtsi2ss xmm0, eax
+    mulss   xmm0, [rip + half]
+    divss   xmm0, [rip + fW]
+    subss   xmm0, [rip + half]
+    mulss   xmm0, [rip + vspan]
+    addss   xmm0, [rip + vcx]
+    ; new cy = cy + ((dy0+dy1)/2 / H - 0.5) * span * aspect
+    mov     eax, [rip + dy0]
+    add     eax, [rip + dy1]
+    cvtsi2ss xmm1, eax
+    mulss   xmm1, [rip + half]
+    divss   xmm1, [rip + fH]
+    subss   xmm1, [rip + half]
+    mulss   xmm1, [rip + vspan]
+    mulss   xmm1, [rip + aspect]
+    addss   xmm1, [rip + vcy]
+    ; new span = span * |dx1-dx0| / W
+    mov     eax, [rip + dx1]
+    sub     eax, [rip + dx0]
+    cdq
+    xor     eax, edx
+    sub     eax, edx                         ; abs(dx1-dx0)
+    cvtsi2ss xmm2, eax
+    divss   xmm2, [rip + fW]
+    mulss   xmm2, [rip + vspan]
+    ; commit (old span was used above; store last)
+    movss   [rip + vcx], xmm0
+    movss   [rip + vcy], xmm1
+    movss   [rip + vspan], xmm2
+    ret
+
+; ---- zoom back out one level ----
+zoom_out:
+    mov     eax, [rip + stackTop]
+    test    eax, eax
+    jz      zo_done
+    dec     eax
+    mov     [rip + stackTop], eax
+    imul    ecx, eax, 12
+    lea     r8, [rip + viewStack]
+    mov     edx, [r8 + rcx]
+    mov     [rip + vcx], edx
+    mov     edx, [r8 + rcx + 4]
+    mov     [rip + vcy], edx
+    mov     edx, [r8 + rcx + 8]
+    mov     [rip + vspan], edx
+zo_done:
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 2                           ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                         ; WM_TIMER
+    je      wp_timer
+    cmp     edx, 0x201                       ; WM_LBUTTONDOWN
+    je      wp_ldown
+    cmp     edx, 0x200                       ; WM_MOUSEMOVE
+    je      wp_move
+    cmp     edx, 0x202                       ; WM_LBUTTONUP
+    je      wp_lup
+    cmp     edx, 0x204                       ; WM_RBUTTONDOWN
+    je      wp_rdown
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    render
+    xor     eax, eax
+    ret
+wp_ldown:
+    movzx   eax, r9w                         ; x = LOWORD(lParam)
+    mov     [rip + dx0], eax
+    mov     [rip + dx1], eax
+    mov     eax, r9d
+    shr     eax, 16                          ; y = HIWORD(lParam)
+    mov     [rip + dy0], eax
+    mov     [rip + dy1], eax
+    mov     dword ptr [rip + dragging], 1
+    invoke  SetCapture, [rip + hwndSave]     ; keep getting moves/up past the edge
+    call    render
+    xor     eax, eax
+    ret
+wp_move:
+    mov     eax, [rip + dragging]
+    test    eax, eax
+    jz      wp_move_done
+    movzx   eax, r9w
+    mov     [rip + dx1], eax
+    mov     eax, r9d
+    shr     eax, 16
+    mov     [rip + dy1], eax
+    call    render                           ; live rubber band (the timer is starved mid-drag)
+wp_move_done:
+    xor     eax, eax
+    ret
+wp_lup:
+    mov     eax, [rip + dragging]
+    test    eax, eax
+    jz      wp_lup_done
+    mov     dword ptr [rip + dragging], 0
+    invoke  ReleaseCapture
+    ; ignore a tiny (accidental) drag
+    mov     eax, [rip + dx1]
+    sub     eax, [rip + dx0]
+    cdq
+    xor     eax, edx
+    sub     eax, edx
+    cmp     eax, 4
+    jl      wp_lup_done
+    call    zoom_in
+wp_lup_done:
+    call    render                           ; show the zoom + clear the rubber band
+    xor     eax, eax
+    ret
+wp_rdown:
+    call    zoom_out
+    call    render
+    xor     eax, eax
+    ret
