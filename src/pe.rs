@@ -100,7 +100,20 @@ pub fn write_pe(
     }
 
     let iat_rva = rdata_rva + iat_off as u32;
-    let iat_slot_rva = |i: usize| iat_rva + (i * 8) as u32;
+    // The IAT stores each DLL's entries followed by a null terminator, so a
+    // function's slot index is NOT its flat index once there's more than one DLL.
+    // Map every function to its real slot so its thunk points at the right entry.
+    let mut iat_slot_of: BTreeMap<String, usize> = BTreeMap::new();
+    {
+        let mut s = 0usize;
+        for fns in by_dll.values() {
+            for f in fns {
+                iat_slot_of.insert(f.clone(), s);
+                s += 1;
+            }
+            s += 1; // null terminator
+        }
+    }
     let rdata_vsize = names_off + names.len();
 
     // ── assemble .rdata bytes ────────────────────────────────────────────────
@@ -135,9 +148,10 @@ pub fn write_pe(
 
     // ── assemble .text bytes (code + thunks, relocs patched) ─────────────────
     let mut text = module.code.clone();
-    for i in 0..flat.len() {
-        // jmp qword ptr [rip + disp32] -> IAT slot; rip = thunk_rva(i)+6
-        let disp = iat_slot_rva(i) as i64 - (thunk_rva(i) as i64 + THUNK as i64);
+    for (i, (f, _)) in flat.iter().enumerate() {
+        // jmp qword ptr [rip + disp32] -> this function's IAT slot; rip = thunk_rva(i)+6
+        let slot_rva = iat_rva + (iat_slot_of[f] * 8) as u32;
+        let disp = slot_rva as i64 - (thunk_rva(i) as i64 + THUNK as i64);
         text.push(0xFF);
         text.push(0x25);
         text.extend_from_slice(&(disp as i32).to_le_bytes());
@@ -305,6 +319,38 @@ mod tests {
         assert!(exe.windows(5).any(|w| w == b".data"), ".data section header present");
         // The code→data RIP-rel field (code off 3 → file 0x203) was patched.
         assert_ne!(&exe[0x203..0x207], &[0, 0, 0, 0], "code→data disp resolved, not a placeholder");
+    }
+
+    #[test]
+    fn multi_dll_thunks_skip_the_iat_null_terminators() {
+        // Two imports in two different DLLs. Each DLL's IAT run ends in a null
+        // slot, so the second DLL's function lives at slot index 2, not 1 — its
+        // thunk must skip the terminator. (Regression: thunks once used the flat
+        // function index and pointed one slot short.)
+        let m = EncodedModule {
+            code: vec![0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0], // call AFunc ; call BFunc
+            symbols: BTreeMap::from([("main".to_string(), 0usize)]),
+            relocs: vec![
+                Reloc { at: 1, size: 4, kind: RelocKind::BranchRel32, target: "AFunc".into(), addend: 0 },
+                Reloc { at: 6, size: 4, kind: RelocKind::BranchRel32, target: "BFunc".into(), addend: 0 },
+            ],
+            externs: vec!["AFunc".into(), "BFunc".into()],
+            ..Default::default()
+        };
+        let imports =
+            BTreeMap::from([("AFunc".to_string(), "a.dll".to_string()), ("BFunc".to_string(), "b.dll".to_string())]);
+        let exe = write_pe(&m, &imports, "main").unwrap();
+
+        // Thunks follow the 10 code bytes in .text (file offset 0x200 + 10).
+        let thunk0 = 0x200 + 10;
+        let thunk1 = thunk0 + 6;
+        let rip0 = 0x1000 + 10 + 6; // RVA just past thunk 0
+        let rip1 = 0x1000 + 10 + 12;
+        let disp0 = i32::from_le_bytes([exe[thunk0 + 2], exe[thunk0 + 3], exe[thunk0 + 4], exe[thunk0 + 5]]);
+        let disp1 = i32::from_le_bytes([exe[thunk1 + 2], exe[thunk1 + 3], exe[thunk1 + 4], exe[thunk1 + 5]]);
+        let target0 = rip0 as i64 + disp0 as i64; // IAT slot RVA for AFunc
+        let target1 = rip1 as i64 + disp1 as i64; // IAT slot RVA for BFunc
+        assert_eq!(target1 - target0, 16, "BFunc's IAT slot must be 2 slots after AFunc's (a null between)");
     }
 
     #[test]
