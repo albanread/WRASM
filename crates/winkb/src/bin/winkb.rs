@@ -72,6 +72,32 @@ fn run() -> anyhow::Result<()> {
                 for m in &i.methods {
                     println!("  vtbl[{:>2}] {}", m.vtable_index, m.name);
                 }
+                if let Some(m) = i.methods.first() {
+                    println!("\n  ; in WRASM:  comcall pObj, {}, {}, <args…>", i.name, m.name);
+                    println!("  ;            iid {}    ; emits the 16 IID bytes", i.name);
+                }
+            }
+        },
+        // A ready-to-paste struct-instance skeleton (leaf fields, dotted paths).
+        (Some("skel"), Some(name)) => match kb.layout(name)? {
+            None => eprintln!("struct/union '{name}' not found"),
+            Some(l) => {
+                println!("inst struct {}        ; {} bytes — fill in, drop unused lines", l.name, l.size);
+                for f in &l.fields {
+                    let sub = kb.layout(short(&f.type_name))?;
+                    match sub {
+                        // A genuine nested struct: expand its leaves with dotted
+                        // paths. Single-field handle/BOOL wrappers stay as one leaf.
+                        Some(s) if s.fields.len() > 1 => {
+                            for sf in &s.fields {
+                                let path = format!("{}.{}", f.name, sf.name);
+                                println!("    {:<28} = 0   ; {}", path, sf.type_name);
+                            }
+                        }
+                        _ => println!("    {:<28} = 0   ; {}", f.name, f.type_name),
+                    }
+                }
+                println!("ends");
             }
         },
         (Some("snippet"), Some(name)) => match kb.snippet(name)? {
@@ -98,11 +124,17 @@ fn run() -> anyhow::Result<()> {
                  winkb show <function>\n  \
                  winkb resolve <name>\n  \
                  winkb layout <struct>\n  \
-                 winkb iface <interface>"
+                 winkb iface <interface>\n  \
+                 winkb skel <struct>         struct-instance skeleton to paste"
             );
         }
     }
     Ok(())
+}
+
+/// Last component of a possibly fully-qualified type name.
+fn short(ty: &str) -> &str {
+    ty.rsplit('.').next().unwrap_or(ty)
 }
 
 fn print_func(f: &winkb::Func) {

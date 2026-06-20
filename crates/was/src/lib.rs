@@ -200,11 +200,13 @@ fn check_idents(body: &str, line: usize, kb: &Kb, labels: &HashSet<String>, diag
                 let (lhs, field) = (&tok[..dot], &tok[dot + 1..]);
                 if !is_register(lhs) && !labels.contains(lhs) {
                     if let Ok(Some(layout)) = kb.layout(lhs) {
-                        if !field.is_empty() && !layout.fields.iter().any(|f| f.name == field) {
+                        // Validate the (possibly nested) path; suggest against the head.
+                        if !field.is_empty() && matches!(field_path(kb, lhs, field), Ok(None)) {
+                            let head = field.split('.').next().unwrap_or(field);
                             let near = layout
                                 .fields
                                 .iter()
-                                .min_by_key(|f| lev(field, &f.name))
+                                .min_by_key(|f| lev(head, &f.name))
                                 .map(|f| format!(" — did you mean '{}.{}'?", lhs, f.name))
                                 .unwrap_or_default();
                             diags.push(Diag {
@@ -639,13 +641,35 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     // `.endX` matches its opener and `.break`/`.continue` find the inner loop.
     let mut block_ctr = 0usize;
     let mut block_stack: Vec<Block> = Vec::new();
+    let mut pending_struct: Option<StructAccum> = None;
     for (i, raw) in src.lines().enumerate() {
         let src_line = i + 1;
         let start = out.len();
         let body = strip_comment(raw);
         let t = body.trim();
-        if t.is_empty() {
+        if pending_struct.is_some() {
+            // Inside a `LABEL struct TYPE … ends` data block: collect each
+            // `field = value`, then lay the whole thing out on `ends`.
+            if t == "ends" || t == "endstruct" {
+                let acc = pending_struct.take().unwrap();
+                out.push_str(
+                    &emit_struct(kb, &acc)
+                        .with_context(|| format!("line {src_line}: struct {}", acc.label))?,
+                );
+            } else if !t.is_empty() {
+                let (lhs, rhs) = t.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("line {src_line}: struct field needs `name = value`, got `{t}`")
+                })?;
+                pending_struct
+                    .as_mut()
+                    .unwrap()
+                    .fields
+                    .push((lhs.trim().to_string(), rhs.trim().to_string()));
+            }
+        } else if t.is_empty() {
             out.push('\n');
+        } else if let Some((label, ty)) = parse_struct_open(t) {
+            pending_struct = Some(StructAccum { label, ty, fields: Vec::new() });
         } else if let Some(rest) = strip_keyword(t, "invoke") {
             // `invoke Func, args…`
             let expanded = expand_invoke(rest, kb, &labels)
@@ -799,6 +823,9 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
         // produced. (`rasm::assemble` enumerates the same lines() the same way.)
         let added = out[start..].bytes().filter(|&b| b == b'\n').count();
         map.resize(map.len() + added, src_line);
+    }
+    if let Some(acc) = pending_struct {
+        bail!("struct {} is missing its `ends`", acc.label);
     }
     Ok((out, map))
 }
@@ -1050,10 +1077,9 @@ fn resolve_token(tok: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String>
     if let Some(dot) = tok.find('.') {
         let (lhs, field) = (&tok[..dot], &tok[dot + 1..]);
         if !is_register(lhs) && !labels.contains(lhs) {
-            if let Some(layout) = kb.layout(lhs)? {
-                if let Some(f) = layout.fields.iter().find(|f| f.name == field) {
-                    return Ok(f.offset.to_string());
-                }
+            // `Struct.field` or nested `Struct.sub.field` -> its byte offset.
+            if let Some((off, _)) = field_path(kb, lhs, field)? {
+                return Ok(off.to_string());
             }
         }
         return Ok(tok.to_string());
@@ -1214,6 +1240,94 @@ fn emit_iid(rest: &str, kb: &Kb) -> Result<String> {
     Ok(o)
 }
 
+/// An accumulating `LABEL struct TYPE … ends` data block.
+struct StructAccum {
+    label: String,
+    ty: String,
+    fields: Vec<(String, String)>, // (field path, value)
+}
+
+/// `LABEL struct TYPE` — the opener of a struct-instance data block.
+fn parse_struct_open(t: &str) -> Option<(String, String)> {
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    (toks.len() == 3 && toks[1] == "struct").then(|| (toks[0].to_string(), toks[2].to_string()))
+}
+
+/// Byte size of a field from its db type name: primitives mapped directly,
+/// pointers are 8, otherwise the db `sizeof` (unknown enums fall back to 4).
+fn field_size(kb: &Kb, ty: &str) -> usize {
+    let t = ty.trim();
+    if t.ends_with('*') {
+        return 8;
+    }
+    match t {
+        "u8" | "i8" | "BYTE" | "byte" | "CHAR" | "BOOLEAN" => 1,
+        "u16" | "i16" | "WORD" | "WCHAR" | "SHORT" | "USHORT" => 2,
+        "u32" | "i32" | "DWORD" | "BOOL" | "LONG" | "ULONG" | "UINT" | "INT" | "FLOAT" | "f32" => 4,
+        "u64" | "i64" | "QWORD" | "f64" | "DOUBLE" | "HWND" | "HANDLE" | "HINSTANCE" | "HDC"
+        | "HMODULE" | "HMENU" | "HBRUSH" | "HICON" | "HCURSOR" | "LPARAM" | "WPARAM" | "LRESULT"
+        | "SIZE_T" | "INT_PTR" | "UINT_PTR" | "PVOID" | "LPVOID" | "PWSTR" | "PCWSTR" => 8,
+        _ => kb.sizeof(t).ok().flatten().map(|s| s as usize).unwrap_or(4),
+    }
+}
+
+/// Resolve a (possibly nested) field path like `BufferDesc.Width` within `root`
+/// to its byte offset and size, descending through nested struct types.
+fn field_path(kb: &Kb, root: &str, path: &str) -> Result<Option<(i64, usize)>> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur = root.to_string();
+    let mut off = 0i64;
+    for (i, part) in parts.iter().enumerate() {
+        let Some(layout) = kb.layout(&cur)? else { return Ok(None) };
+        let Some(f) = layout.fields.iter().find(|f| f.name == *part) else { return Ok(None) };
+        off += f.offset;
+        if i == parts.len() - 1 {
+            return Ok(Some((off, field_size(kb, &f.type_name))));
+        }
+        // Descend into the field's (possibly fully-qualified) struct type.
+        cur = f.type_name.rsplit('.').next().unwrap_or(&f.type_name).to_string();
+    }
+    Ok(None)
+}
+
+/// Lay out a struct-instance data block: a label, then each constant field at its
+/// db-resolved offset (zero-filled between), as visible `.long`/`.word`/`.byte`.
+fn emit_struct(kb: &Kb, acc: &StructAccum) -> Result<String> {
+    let size = kb
+        .sizeof(&acc.ty)?
+        .ok_or_else(|| anyhow::anyhow!("struct: unknown type '{}'", acc.ty))? as usize;
+    let mut entries: Vec<(usize, usize, String, String)> = Vec::new();
+    for (path, val) in &acc.fields {
+        let (o, fs) = field_path(kb, &acc.ty, path)?
+            .ok_or_else(|| anyhow::anyhow!("{} has no field '{path}'", acc.ty))?;
+        entries.push((o as usize, fs, val.clone(), path.clone()));
+    }
+    entries.sort_by_key(|e| e.0);
+
+    let mut o = format!("{}:\n  ; {} ({size} bytes)\n", acc.label, acc.ty);
+    let mut pos = 0usize;
+    for (off, fs, val, name) in &entries {
+        if *off < pos {
+            bail!("struct {}: field '{name}' overlaps an earlier field", acc.label);
+        }
+        if *off > pos {
+            o.push_str(&format!("  .zero {}\n", off - pos));
+        }
+        let dir = match fs {
+            1 => "byte",
+            2 => "word",
+            8 => "quad",
+            _ => "long",
+        };
+        o.push_str(&format!("  .{dir} {val}    ; {name} @ {off}\n"));
+        pos = off + fs;
+    }
+    if pos < size {
+        o.push_str(&format!("  .zero {}\n", size - pos));
+    }
+    Ok(o)
+}
+
 /// Emit the instruction(s) to load `arg` into `reg`. A bare label/symbol becomes
 /// its address (`lea`); a number/register/memory becomes a `mov`.
 fn load_arg(reg: &str, arg: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
@@ -1368,6 +1482,28 @@ mod tests {
         let db = std::env::var("WINKB_DB")
             .unwrap_or_else(|_| r"E:\windows_api\windows_api.db".to_string());
         Kb::open(&db).ok()
+    }
+
+    #[test]
+    fn comcall_resolves_via_base_chain() {
+        let Some(kb) = kb() else { return };
+        // Present is the interface's own slot (8); Release is inherited from
+        // IUnknown (2), found by walking the base chain.
+        assert_eq!(vtable_index_of(&kb, "IDXGISwapChain", "Present").unwrap(), Some(8));
+        assert_eq!(vtable_index_of(&kb, "IDXGISwapChain", "Release").unwrap(), Some(2));
+        let low = lower("main:\n  comcall [rip+p], IDXGISwapChain, Present, 1, 0\n", &kb).unwrap();
+        assert!(low.contains("mov rax, [rcx]"), "loads vtable: {low}");
+        assert!(low.contains("call qword ptr [rax + 64]"), "calls vtbl[8]: {low}");
+    }
+
+    #[test]
+    fn struct_instance_lays_out_nested_fields_at_db_offsets() {
+        let Some(kb) = kb() else { return };
+        let src = "scd struct DXGI_SWAP_CHAIN_DESC\n  BufferDesc.Format = 87\n  BufferCount = 2\nends\n";
+        let low = lower(src, &kb).unwrap();
+        assert!(low.contains("scd:"), "labelled: {low}");
+        assert!(low.contains("BufferDesc.Format @ 16"), "nested offset resolved: {low}");
+        assert!(low.contains("BufferCount @ 40"), "top-level offset: {low}");
     }
 
     #[test]
