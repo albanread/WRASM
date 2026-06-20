@@ -60,14 +60,15 @@ mod gui {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F5,
-        VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP, VIRTUAL_KEY,
+        VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
         GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
         ShowWindow, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG,
         SW_SHOW, WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSEXW, WNDCLASS_STYLES,
+        WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSEXW,
+        WNDCLASS_STYLES,
         WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
@@ -164,10 +165,16 @@ main:
         doc: Doc,
         diags: Vec<Diag>,
         /// The lowered listing per source line — `(bytes, asm)` for each expanded
-        /// instruction (re-fetched on every edit, one `listing` call per line).
+        /// instruction (re-fetched on every edit).
         line_listing: Vec<Vec<(Vec<u8>, String)>>,
         /// A short status line for the output pane (build result, snapshot path…).
         notice: String,
+        /// Vertical scroll of the editor pane, in DIPs (0 = top).
+        editor_scroll: f32,
+        /// Last pointer position in DIPs (client), to route the wheel by pane.
+        last_mouse: (f32, f32),
+        /// Whether the initial caret has been scrolled into view (one-shot).
+        revealed: bool,
 
         // Assistant: a search box + a card.
         search: String,
@@ -210,6 +217,9 @@ main:
                 card_laid_w: -1.0,
                 card_scroll: 0.0,
                 card_max_scroll: 0.0,
+                editor_scroll: 0.0,
+                last_mouse: (0.0, 0.0),
+                revealed: false,
             };
             // Land the caret on `WriteFile` so the first card is a real one.
             app.doc.set_caret(14, 9);
@@ -250,11 +260,13 @@ main:
             self.after_caret();
         }
 
-        /// After a caret move (no text change): just refresh the card.
+        /// After a caret move (no text change): refresh the card and keep the
+        /// caret on screen.
         fn after_caret(&mut self) {
             if !self.search_active {
                 self.refresh_card(lang_word(&self.doc));
             }
+            self.ensure_caret_visible();
         }
 
         /// The lowered instruction rows for source `row` (empty for a blank line).
@@ -391,6 +403,11 @@ main:
                 Some(t) => t,
                 None => return,
             };
+            // Now that the viewport size is known, scroll the initial caret in.
+            if !self.revealed {
+                self.revealed = true;
+                self.ensure_caret_visible();
+            }
             let (vw, vh) = self.viewport();
             let base: &ID2D1RenderTarget = &target;
             unsafe { self.render_frame(base, vw, vh) };
@@ -435,11 +452,15 @@ main:
         /// it needs no visible desktop, which is what makes it reviewable headless
         /// (and is the whole point of the `--shot` mode). Returns the file path.
         fn snapshot(&mut self, dir: &Path) -> anyhow::Result<PathBuf> {
-            let (vw, vh) = if self.client_w > 0 {
-                self.viewport()
-            } else {
-                (1100.0, 720.0)
-            };
+            // Headless (`--shot`, no window yet): adopt a default viewport and
+            // reveal the caret, so the frame matches a real first paint. A live
+            // F12 keeps the window's current size and scroll.
+            if self.client_w == 0 {
+                self.client_w = 1100;
+                self.client_h = 720;
+                self.ensure_caret_visible();
+            }
+            let (vw, vh) = self.viewport();
             let (pw, ph) = (vw.ceil() as u32, vh.ceil() as u32);
             let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
             let path = dir.join(format!("studio_shot_{stamp}.png"));
@@ -511,16 +532,20 @@ main:
             render::fill_rect(t, SRC_X - 4.0, 0.0, 1.0, editor_h, theme::BORDER); // rule
 
             let rows = self.row_layout();
-            for (row, &(top, _h)) in rows.iter().enumerate() {
-                if top > editor_h {
-                    break;
+            for (row, &(top, h)) in rows.iter().enumerate() {
+                let sy = top - self.editor_scroll;
+                if sy + h < 0.0 {
+                    continue; // entirely above the viewport
+                }
+                if sy > editor_h {
+                    break; // and everything below is too
                 }
                 let line = self.doc.line(row);
                 let macro_row = self.is_macro(row);
 
                 // Line number, top-aligned with the source.
                 render::draw_text(
-                    t, 2.0, top, LN_W - 6.0, LINE_H, &format!("{:>3}", row + 1),
+                    t, 2.0, sy, LN_W - 6.0, LINE_H, &format!("{:>3}", row + 1),
                     EDITOR_FONT, EDITOR_SIZE * 0.8, false, false, theme::TEXT_DIM, false,
                 );
 
@@ -529,7 +554,7 @@ main:
                     if let Some((bytes, _)) = self.listing(row).first() {
                         if !bytes.is_empty() {
                             render::draw_text(
-                                t, LN_W + 6.0, top, BYTES_W - 10.0, LINE_H,
+                                t, LN_W + 6.0, sy, BYTES_W - 10.0, LINE_H,
                                 &studio::bytes::hex(bytes), EDITOR_FONT, BYTE_SIZE, false, false,
                                 BYTE_COLOR, false,
                             );
@@ -544,7 +569,7 @@ main:
                         continue;
                     }
                     render::draw_text(
-                        t, x, top, text_right - x, LINE_H, &line[tok.start..tok.end],
+                        t, x, sy, text_right - x, LINE_H, &line[tok.start..tok.end],
                         EDITOR_FONT, EDITOR_SIZE, false, false, tok_color(tok.kind), false,
                     );
                 }
@@ -554,13 +579,16 @@ main:
                     let (s, e) = diagnostics::underline(line, d.col);
                     let ux = SRC_X + measure(&line[..s]);
                     let uw = (measure(&line[..e]) - measure(&line[..s])).max(3.0);
-                    render::fill_rect(t, ux, top + LINE_H - 2.5, uw, 2.0, SQUIGGLE);
+                    render::fill_rect(t, ux, sy + LINE_H - 2.5, uw, 2.0, SQUIGGLE);
                 }
 
                 // Macro expansion: gray ghost rows of `bytes : asm` beneath.
                 if macro_row {
                     for (i, (bytes, asm)) in self.listing(row).iter().enumerate() {
-                        let gy = top + (i as f32 + 1.0) * LINE_H;
+                        let gy = sy + (i as f32 + 1.0) * LINE_H;
+                        if gy + LINE_H < 0.0 {
+                            continue;
+                        }
                         if gy > editor_h {
                             break;
                         }
@@ -579,9 +607,10 @@ main:
             // Caret (only ever on a source line, never a ghost row).
             let cr = self.doc.caret;
             if let Some(&(top, _)) = rows.get(cr.row) {
-                if top <= editor_h {
+                let sy = top - self.editor_scroll;
+                if sy + LINE_H > 0.0 && sy <= editor_h {
                     let cx = SRC_X + measure(&self.doc.line(cr.row)[..cr.col]);
-                    render::fill_rect(t, cx, top + 1.0, 1.8, LINE_H - 2.0, CARET_COLOR);
+                    render::fill_rect(t, cx, sy + 1.0, 1.8, LINE_H - 2.0, CARET_COLOR);
                 }
             }
         }
@@ -725,6 +754,14 @@ main:
                 VK_DOWN => self.doc.move_down(),
                 VK_HOME => self.doc.home(),
                 VK_END => self.doc.end(),
+                VK_PRIOR => {
+                    self.page_move(false);
+                    return true;
+                }
+                VK_NEXT => {
+                    self.page_move(true);
+                    return true;
+                }
                 VK_BACK => return self.edit(|d| d.backspace()),
                 VK_RETURN => return self.edit(|d| d.insert("\n")),
                 VK_TAB => return self.edit(|d| d.insert("  ")),
@@ -772,6 +809,74 @@ main:
             }
         }
 
+        // ── editor scrolling ─────────────────────────────────────────────────
+
+        /// Visible height of the editor pane in DIPs (above the output pane).
+        fn editor_viewport_h(&self) -> f32 {
+            (self.viewport().1 - OUTPUT_H).max(0.0)
+        }
+        /// Total height of all rows (including macro expansions), plus a margin.
+        fn editor_content_h(&self) -> f32 {
+            self.row_layout().last().map(|&(t, h)| t + h).unwrap_or(TOP_PAD) + TOP_PAD
+        }
+        fn clamp_editor_scroll(&mut self) {
+            let max = (self.editor_content_h() - self.editor_viewport_h()).max(0.0);
+            self.editor_scroll = self.editor_scroll.clamp(0.0, max);
+        }
+        fn scroll_editor(&mut self, dips: f32) {
+            let prev = self.editor_scroll;
+            self.editor_scroll += dips;
+            self.clamp_editor_scroll();
+            if (self.editor_scroll - prev).abs() > 0.01 {
+                self.invalidate();
+            }
+        }
+
+        /// Scroll just enough to keep the caret's row in view (called after any
+        /// caret move; the wheel is free to scroll away between moves).
+        fn ensure_caret_visible(&mut self) {
+            let vh = self.editor_viewport_h();
+            if vh <= 1.0 {
+                return; // no viewport yet (pre first paint)
+            }
+            let rows = self.row_layout();
+            if let Some(&(top, h)) = rows.get(self.doc.caret.row) {
+                if top < self.editor_scroll {
+                    self.editor_scroll = top;
+                } else if top + h > self.editor_scroll + vh {
+                    self.editor_scroll = top + h - vh;
+                }
+                self.clamp_editor_scroll();
+            }
+        }
+
+        /// Move the caret up/down by about one viewport of rows (skipping the
+        /// ghost rows — the caret only ever lands on a source line).
+        fn page_move(&mut self, down: bool) {
+            let rows = self.row_layout();
+            let vh = self.editor_viewport_h().max(LINE_H);
+            let mut r = self.doc.caret.row;
+            let mut acc = 0.0;
+            while acc < vh {
+                if down {
+                    if r + 1 >= rows.len() {
+                        break;
+                    }
+                    acc += rows[r].1;
+                    r += 1;
+                } else {
+                    if r == 0 {
+                        break;
+                    }
+                    r -= 1;
+                    acc += rows[r].1;
+                }
+            }
+            self.doc.set_caret(r, self.doc.caret.col);
+            self.after_caret();
+            self.invalidate();
+        }
+
         /// A click: position the editor caret, focus the search box, or follow a
         /// card link — by which pane was hit.
         fn on_click(&mut self, x: f32, y: f32) {
@@ -794,9 +899,10 @@ main:
         /// Place the editor caret nearest a click in the listing's source column.
         fn place_caret(&mut self, x: f32, y: f32) {
             let rows = self.row_layout();
+            let cy = y + self.editor_scroll; // click is in viewport space
             let row = rows
                 .iter()
-                .position(|&(top, h)| y >= top && y < top + h)
+                .position(|&(top, h)| cy >= top && cy < top + h)
                 .unwrap_or_else(|| self.doc.line_count().saturating_sub(1));
             let line = self.doc.line(row).to_string();
             let target = x - SRC_X;
@@ -1016,9 +1122,21 @@ main:
                     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
                 }
             }
+            WM_MOUSEMOVE => {
+                let x = (lparam.0 & 0xFFFF) as i16 as f32 * scale;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 * scale;
+                app.last_mouse = (x, y);
+                LRESULT(0)
+            }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32;
-                app.scroll_card(-(delta / 120.0) * WHEEL_STEP);
+                let dips = -(delta / 120.0) * WHEEL_STEP;
+                // The wheel scrolls whichever pane the pointer is over.
+                if app.last_mouse.0 >= app.viewport().0 * SPLIT_FRAC {
+                    app.scroll_card(dips);
+                } else {
+                    app.scroll_editor(dips);
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
