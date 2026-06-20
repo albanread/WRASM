@@ -67,7 +67,212 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
     if let Some(md) = interface_card(kb, q)? {
         return Ok(md);
     }
+    // A register — the one card that needs no db, just the Win64 ABI.
+    if let Some(md) = register_card(q) {
+        return Ok(md);
+    }
     search_card(kb, q)
+}
+
+/// A card for a symbol defined in THIS buffer rather than in winkb: a local
+/// code label/function, a data variable, or a `struct` instance. Pure source
+/// scan, no db — `src` is the editor buffer. `None` if `name` isn't defined here.
+pub fn local_card(src: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let is_data_type = |w: &str| {
+        matches!(
+            w.to_ascii_lowercase().as_str(),
+            "byte" | "sbyte" | "word" | "sword" | "dword" | "sdword" | "qword" | "sqword"
+                | "wchar" | "char" | "real4" | "real8" | "tbyte"
+        )
+    };
+    let exported = src.lines().any(|l| {
+        let t = l.trim();
+        t.strip_prefix(".globl")
+            .or_else(|| t.strip_prefix(".global"))
+            .is_some_and(|r| r.trim() == name)
+    });
+    let mut in_code = true;
+    for (i, raw) in src.lines().enumerate() {
+        let line = raw.trim();
+        match line.to_ascii_lowercase().as_str() {
+            ".code" | ".text" => in_code = true,
+            ".data" => in_code = false,
+            _ => {}
+        }
+        let Some(rest) = line.strip_prefix(name) else { continue };
+        // Require a token boundary so `render` doesn't match `rendered:`.
+        if rest.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            continue;
+        }
+        let after = rest.trim_start();
+        let lineno = i + 1;
+        let decl = raw.trim_end();
+        // `name:` — a label.
+        if after.starts_with(':') {
+            let (kind, hint) = if in_code {
+                ("local code label", format!("A `call {name}` / `jmp {name}` here jumps to your own code."))
+            } else {
+                ("local data label", format!("Reference it PC-relative: `[rip + {name}]`."))
+            };
+            return Some(local_md(name, kind, exported, lineno, decl, &hint));
+        }
+        let first = after.split_whitespace().next().unwrap_or("");
+        // `name struct TYPE …` — a struct instance laid out at db offsets.
+        if first.eq_ignore_ascii_case("struct") {
+            let ty = after.split_whitespace().nth(1).unwrap_or("?");
+            let kind = format!("local `{ty}` instance");
+            let hint = format!("Address it `[rip + {name}]`; fields resolve via the db (`[reg + {ty}.field]`).");
+            return Some(local_md(name, &kind, exported, lineno, decl, &hint));
+        }
+        // `name <TYPE> …` — a data variable.
+        if is_data_type(first) {
+            let kind = format!("local data (`{}`)", first.to_ascii_uppercase());
+            let hint = format!("Reference it PC-relative: `[rip + {name}]`.");
+            return Some(local_md(name, &kind, exported, lineno, decl, &hint));
+        }
+    }
+    None
+}
+
+fn local_md(name: &str, kind: &str, exported: bool, lineno: usize, decl: &str, hint: &str) -> String {
+    let exp = if exported { "  ·  exported (`.globl`)" } else { "" };
+    format!(
+        "# {name}  —  {kind}{exp}\n\nDefined at line {lineno} of this file:\n\n```was\n{}\n```\n\n{hint}\n\n*Your own symbol — winkb has no entry for it.*\n",
+        decl.trim_start()
+    )
+}
+
+/// The register / ABI card: a register's conventional role and — the thing you
+/// actually need mid-line — whether an `invoke`/`call` destroys it. Pure static
+/// Win64 knowledge, no db. `None` if `name` isn't a register.
+pub fn register_card(name: &str) -> Option<String> {
+    let canon = canon_reg(name)?;
+    let (role, volatile, notes) = reg_info(&canon);
+    let mut s = format!("# {canon}  —  {role}\n\n");
+    if volatile {
+        s.push_str(
+            "**Volatile** (caller-saved) — an `invoke`/`call` may destroy it; save it \
+             yourself if you need the value afterward.\n",
+        );
+    } else {
+        s.push_str(
+            "**Preserved** (callee-saved) — it survives an `invoke`/`call`. If you clobber \
+             it in your own code, `push`/`pop` it (restore before `ret`).\n",
+        );
+    }
+    if !notes.is_empty() {
+        s.push('\n');
+        for n in &notes {
+            s.push_str(&format!("- {n}\n"));
+        }
+    }
+    s.push_str(
+        "\n*Win64 call ABI:* integer args in **RCX, RDX, R8, R9** (5th+ on the stack); \
+         float args in **XMM0–3**; return in **RAX** / **XMM0**. Caller reserves a **32-byte \
+         shadow space**; **RSP is 16-byte aligned at every `call`**.\n",
+    );
+    Some(s)
+}
+
+/// Canonical 64-bit name for any width of a register (`eax`→`rax`, `r8d`→`r8`);
+/// `xmm/ymm/zmm` fold to `xmmN`. `None` if `name` isn't a register.
+fn canon_reg(name: &str) -> Option<String> {
+    let n = name.trim().to_ascii_lowercase();
+    let gp = match n.as_str() {
+        "rax" | "eax" | "ax" | "al" | "ah" => "rax",
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => "rbx",
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => "rcx",
+        "rdx" | "edx" | "dx" | "dl" | "dh" => "rdx",
+        "rsi" | "esi" | "si" | "sil" => "rsi",
+        "rdi" | "edi" | "di" | "dil" => "rdi",
+        "rbp" | "ebp" | "bp" | "bpl" => "rbp",
+        "rsp" | "esp" | "sp" | "spl" => "rsp",
+        "rip" => "rip",
+        _ => "",
+    };
+    if !gp.is_empty() {
+        return Some(gp.to_string());
+    }
+    for base in 8..=15u8 {
+        if [format!("r{base}"), format!("r{base}d"), format!("r{base}w"), format!("r{base}b")]
+            .contains(&n)
+        {
+            return Some(format!("r{base}"));
+        }
+    }
+    for pfx in ["xmm", "ymm", "zmm"] {
+        if let Some(num) = n.strip_prefix(pfx) {
+            if let Ok(k) = num.parse::<u8>() {
+                if k < 16 {
+                    return Some(format!("xmm{k}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Role, volatility (true = caller-saved/destroyed by a call), and notes.
+fn reg_info(canon: &str) -> (String, bool, Vec<String>) {
+    let s = |x: &str| x.to_string();
+    match canon {
+        "rax" => (s("return value"), true, vec![
+            s("Holds the call's return value — HRESULT, handle, count, pointer."),
+            s("Implicitly read/written by `mul`, `imul`, `div`, `idiv`, `cdq`/`cqo`."),
+        ]),
+        "rcx" => (s("integer argument 1"), true, vec![
+            s("First integer/pointer argument."),
+            s("COM vtable calls pass `this` here (argument 0): `mov rax,[rcx]; call [rax + slot*8]`."),
+            s("Shift/rotate counts come from `cl`."),
+        ]),
+        "rdx" => (s("integer argument 2"), true, vec![
+            s("Second integer/pointer argument."),
+            s("Upper half of the dividend (`rdx:rax`) in `div`/`idiv` — set it with `cdq`/`cqo`."),
+        ]),
+        "r8" => (s("integer argument 3"), true, vec![s("Third integer/pointer argument.")]),
+        "r9" => (s("integer argument 4"), true, vec![
+            s("Fourth integer/pointer argument."),
+            s("The 5th argument onward goes on the stack, above the 32-byte shadow space."),
+        ]),
+        "r10" | "r11" => (s("scratch"), true, vec![s("Caller-saved scratch — no argument role.")]),
+        "rbx" | "r12" | "r13" | "r14" | "r15" => (s("preserved general"), false, vec![
+            s("Callee-saved: a value here survives an `invoke`. If you clobber it, `push`/`pop` it."),
+        ]),
+        "rbp" => (s("frame pointer (by convention)"), false, vec![
+            s("Callee-saved. Conventionally the frame pointer, but usable as a general register if you save it."),
+        ]),
+        "rsi" | "rdi" => (s("preserved general"), false, vec![
+            s("Callee-saved **on Windows x64** — survives a call."),
+            s("Gotcha: on System V (Linux/macOS) RSI/RDI are *argument* registers and volatile — Win64 differs."),
+            s("Implicit source/dest of the string ops (`movs`, `stos`, `lods`)."),
+        ]),
+        "rsp" => (s("stack pointer"), false, vec![
+            s("Keep **16-byte aligned at every `call`** (so the callee sees `rsp % 16 == 8` after the return-address push)."),
+            s("Reserve **32 bytes of shadow space** below the four register arguments before calling."),
+        ]),
+        "rip" => (s("instruction pointer"), false, vec![
+            s("Not directly writable; `[rip + sym]` is how data is addressed PC-relative."),
+        ]),
+        c if c.starts_with("xmm") => {
+            let k: u8 = c[3..].parse().unwrap_or(0);
+            match k {
+                0 => (s("float argument 1 / float return"), true, vec![
+                    s("First floating-point argument; also the float/double return value."),
+                ]),
+                1..=3 => (format!("float argument {}", k + 1), true, vec![
+                    s("XMM0–3 carry the first four floating-point arguments."),
+                ]),
+                4 | 5 => (s("scratch"), true, vec![s("Caller-saved scratch.")]),
+                _ => (s("preserved"), false, vec![
+                    s("XMM6–15 are callee-saved (their low 128 bits) — a value here survives a call."),
+                ]),
+            }
+        }
+        _ => (s("register"), true, vec![]),
+    }
 }
 
 /// The function card: signature, docs link, a parameter table whose value
@@ -333,6 +538,38 @@ mod tests {
         assert!(md.contains("sizeof **16**"), "size:\n{md}");
         assert!(md.contains("`left`") && md.contains("`right`"), "fields:\n{md}");
         assert!(md.contains("| offset | field | type |"), "table:\n{md}");
+    }
+
+    #[test]
+    fn register_card_states_role_and_volatility() {
+        // Pure Win64 ABI — no db. Any width folds to the 64-bit name.
+        let rcx = register_card("ecx").expect("ecx → rcx");
+        assert!(rcx.contains("# rcx") && rcx.contains("argument 1"), "role:\n{rcx}");
+        assert!(rcx.contains("Volatile") && rcx.contains("this"), "volatility + COM this:\n{rcx}");
+        let rsi = register_card("rsi").expect("rsi");
+        assert!(rsi.contains("Preserved") && rsi.contains("Windows"), "rsi callee-saved on Win64:\n{rsi}");
+        assert!(register_card("xmm3").unwrap().contains("argument 4"), "xmm numbering");
+        assert!(register_card("r12").unwrap().contains("Preserved"));
+        assert!(register_card("notareg").is_none());
+    }
+
+    #[test]
+    fn local_card_recognizes_own_symbols() {
+        // Pure source scan — no db.
+        let src = ".DATA\ncbData DWORD 0,0,0,0\n.CODE\n.globl main\nmain:\n    ret\nrender:\n    ret\n";
+        let r = local_card(src, "render").expect("render");
+        assert!(r.contains("# render") && r.contains("local code label"), "kind:\n{r}");
+        assert!(r.contains("line 7"), "line number:\n{r}");
+        assert!(local_card(src, "main").unwrap().contains("exported"), "main is .globl");
+        assert!(local_card(src, "cbData").unwrap().contains("local data (`DWORD`)"), "data type");
+        assert!(local_card(src, "render").unwrap() != local_card(src, "main").unwrap());
+        // `render` must match as a whole token, not a prefix.
+        assert!(local_card("rendered:\n", "render").is_none(), "no prefix match");
+        assert!(local_card(src, "nope").is_none());
+        assert!(local_card(src, "CreateFileW").is_none(), "winkb names aren't local");
+
+        let s = ".DATA\nscd struct DXGI_SWAP_CHAIN_DESC\n    BufferCount = 1\nends\n";
+        assert!(local_card(s, "scd").unwrap().contains("DXGI_SWAP_CHAIN_DESC"), "struct instance");
     }
 
     #[test]

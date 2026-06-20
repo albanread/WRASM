@@ -562,7 +562,14 @@ main:
             if !self.search_active {
                 if let Some(word) = self.card_query() {
                     if word != self.card_word {
-                        if let Some(lang) = self.lang.as_ref() {
+                        // Your own symbols (local labels/data/struct instances)
+                        // resolve straight from the buffer — winkb has no card for
+                        // them. Everything else is an async db lookup.
+                        if let Some(md) = ide::local_card(&self.doc.text(), &word) {
+                            self.card_md = md;
+                            self.card_layout = None;
+                            self.card_scroll = 0.0;
+                        } else if let Some(lang) = self.lang.as_ref() {
                             self.pending_card = lang.post_card(&word);
                         }
                         self.card_word = word; // tentative; the reply fills card_md
@@ -684,6 +691,13 @@ main:
         fn refresh_card(&mut self, word: Option<String>) {
             let Some(word) = word else { return };
             if word == self.card_word {
+                return;
+            }
+            if let Some(md) = ide::local_card(&self.doc.text(), &word) {
+                self.card_word = word;
+                self.card_md = md;
+                self.card_layout = None;
+                self.card_scroll = 0.0;
                 return;
             }
             if let Some(lang) = self.lang.as_ref() {
@@ -1753,8 +1767,11 @@ main:
         let tok = studio::hover::token_at(line, doc.caret.col)?;
         match tok.kind {
             // Functions, struct/type names (Ident) and Windows constants — the
-            // things winkb has a card for. Registers/numbers/labels: no card.
-            TokKind::Ident | TokKind::Constant => Some(line[tok.start..tok.end].to_string()),
+            // things winkb has a card for; plus registers, which get the static
+            // Win64 ABI card. Numbers: no card.
+            TokKind::Ident | TokKind::Constant | TokKind::Register => {
+                Some(line[tok.start..tok.end].to_string())
+            }
             _ => None,
         }
     }
