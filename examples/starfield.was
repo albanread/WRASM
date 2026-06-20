@@ -1,0 +1,261 @@
+; starfield.was — a flying-through-space starfield (pseudo-3D).
+;
+;   was examples\starfield.was -o starfield.exe   &&   starfield.exe
+;
+; 512 stars, each with a 3D position (x, y, z). z is depth into the screen.
+; Perspective projection is just a divide:  screen = centre + position*FOV / z.
+; Every frame z shrinks (the star rushes toward you); when it passes the eye
+; (z < 1) the star respawns far away with a fresh random x, y. Nearer stars
+; (small z) project further out and are drawn brighter — so they streak outward
+; and the field looks like warp speed.
+;
+; The first frame is saved to starfield.bmp.
+
+.DATA
+starx       DWORD  512 dup(0)         ; per-star position
+stary       DWORD  512 dup(0)
+starz       DWORD  512 dup(0)
+seed        DWORD  ?
+
+className   WCHAR  "rasm_stars", 0
+titleText   WCHAR  "RASM — starfield", 0
+fname       WCHAR  "starfield.bmp", 0
+wc          BYTE   80 dup(0)
+bmi         BYTE   40 dup(0)
+msg         BYTE   48 dup(0)
+ps          BYTE   72 dup(0)
+filehdr     BYTE   0x42,0x4D, 0x36,0xC4,0x12,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+fb          QWORD  ?
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4
+    mov     [rip + fb], rax
+
+    invoke  GetTickCount
+    xor     eax, 0x2468ACE
+    or      eax, 1
+    mov     [rip + seed], eax
+
+    call    init_stars
+    call    render                      ; first frame
+
+    ; BITMAPINFOHEADER (top-down 32bpp)
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 1228800, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; window
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- give every star a random position ----
+init_stars:
+    lea     r8, [rip + starx]
+    lea     r9, [rip + stary]
+    lea     r10, [rip + starz]
+    mov     r11d, [rip + seed]
+    xor     rcx, rcx
+is_loop:
+    ; xorshift32 -> x in -2048..2047
+    mov     edx, r11d
+    shl     edx, 13
+    xor     r11d, edx
+    mov     edx, r11d
+    shr     edx, 17
+    xor     r11d, edx
+    mov     edx, r11d
+    shl     edx, 5
+    xor     r11d, edx
+    mov     eax, r11d
+    and     eax, 4095
+    sub     eax, 2048
+    mov     [r8 + rcx*4], eax
+    ; reuse the same state shifted for y and z (cheap, good enough)
+    mov     eax, r11d
+    shr     eax, 8
+    and     eax, 4095
+    sub     eax, 2048
+    mov     [r9 + rcx*4], eax
+    mov     eax, r11d
+    shr     eax, 16
+    and     eax, 2047
+    add     eax, 1                      ; z in 1..2048
+    mov     [r10 + rcx*4], eax
+    inc     rcx
+    cmp     rcx, 512
+    jb      is_loop
+    mov     [rip + seed], r11d
+    ret
+
+; ---- advance + draw the stars ----
+render:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+
+    ; clear the framebuffer to black
+    mov     rdi, [rip + fb]
+    mov     ecx, 307200
+    xor     eax, eax
+clr:
+    mov     [rdi], eax
+    add     rdi, 4
+    dec     ecx
+    jnz     clr
+
+    lea     r8, [rip + starx]
+    lea     r9, [rip + stary]
+    lea     r10, [rip + starz]
+    mov     rdi, [rip + fb]
+    mov     r13d, [rip + seed]
+    xor     rsi, rsi                    ; star index
+st_loop:
+    mov     ebx, [r10 + rsi*4]          ; z
+    sub     ebx, 6                      ; fly toward the eye
+    cmp     ebx, 1
+    jge     st_alive
+    ; respawn far away with a new x, y
+    mov     edx, r13d                   ; xorshift32
+    shl     edx, 13
+    xor     r13d, edx
+    mov     edx, r13d
+    shr     edx, 17
+    xor     r13d, edx
+    mov     edx, r13d
+    shl     edx, 5
+    xor     r13d, edx
+    mov     eax, r13d
+    and     eax, 4095
+    sub     eax, 2048
+    mov     [r8 + rsi*4], eax           ; new x
+    mov     eax, r13d
+    shr     eax, 12
+    and     eax, 4095
+    sub     eax, 2048
+    mov     [r9 + rsi*4], eax           ; new y
+    mov     ebx, 2048                   ; back to the far plane
+st_alive:
+    mov     [r10 + rsi*4], ebx          ; store z
+
+    ; sx = x*256 / z + 320
+    mov     eax, [r8 + rsi*4]
+    shl     eax, 8
+    cdq
+    idiv    ebx
+    add     eax, 320
+    cmp     eax, 0
+    jl      st_next
+    cmp     eax, 640
+    jge     st_next
+    mov     r12d, eax                   ; sx (in range)
+
+    ; sy = y*256 / z + 240
+    mov     eax, [r9 + rsi*4]
+    shl     eax, 8
+    cdq
+    idiv    ebx
+    add     eax, 240
+    cmp     eax, 0
+    jl      st_next
+    cmp     eax, 480
+    jge     st_next
+
+    ; plot at sy*640 + sx, brighter when nearer (small z)
+    imul    eax, eax, 640
+    add     eax, r12d                   ; pixel index
+    mov     edx, ebx
+    shr     edx, 3
+    mov     ecx, 255
+    sub     ecx, edx                    ; brightness = 255 - z/8
+    jns     st_bok                      ; clamp far stars (would go negative) to 0
+    xor     ecx, ecx
+st_bok:
+    imul    ecx, ecx, 0x010101          ; grey
+    mov     [rdi + eax*4], ecx
+st_next:
+    inc     rsi
+    cmp     rsi, 512
+    jb      st_loop
+    mov     [rip + seed], r13d
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                     ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                      ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                    ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    render
+    invoke  InvalidateRect, [rip + hwndSave], 0, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
