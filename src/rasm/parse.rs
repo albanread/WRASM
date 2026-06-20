@@ -98,8 +98,16 @@ pub enum Line {
 /// top level — not inside `[]` (no comment chars occur in operands anyway).
 pub fn strip_comment(s: &str) -> &str {
     let mut depth = 0i32;
+    let mut quote = None::<char>;
     for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
         match c {
+            '\'' | '"' => quote = Some(c), // a `;`/`#` inside `.ascii "…"` isn't a comment
             '[' => depth += 1,
             ']' => depth -= 1,
             '#' | ';' if depth == 0 => return &s[..i],
