@@ -209,6 +209,43 @@ main:
         }
     }
 
+    /// How many visual rows `text` wraps to in `max_w` at `size` — a greedy
+    /// word-wrap over measured widths (matches the renderer), so a long ghost
+    /// line (a wide string's many `.word` values, or its many bytes) reserves
+    /// the room it actually needs instead of overprinting the next line.
+    fn wrap_rows(text: &str, max_w: f32, size: f32) -> f32 {
+        if text.trim().is_empty() {
+            return 1.0;
+        }
+        let max_w = max_w.max(1.0);
+        let m = |s: &str| render::measure_text(s, EDITOR_FONT, size, false, false);
+        let mut rows = 1.0_f32;
+        let mut x = 0.0_f32;
+        let mut rest = text;
+        while !rest.is_empty() {
+            let ws_end = rest.find(|c: char| !c.is_whitespace()).unwrap_or(rest.len());
+            let ws_w = if ws_end == 0 { 0.0 } else { m(&rest[..ws_end]) };
+            rest = &rest[ws_end..];
+            if rest.is_empty() {
+                break;
+            }
+            let w_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let word_w = m(&rest[..w_end]);
+            rest = &rest[w_end..];
+            if x > 0.0 && x + ws_w + word_w > max_w {
+                rows += 1.0;
+                x = word_w;
+            } else {
+                x += ws_w + word_w;
+            }
+            while x > max_w {
+                rows += 1.0;
+                x -= max_w;
+            }
+        }
+        rows
+    }
+
     /// Hex for a listing row, rendering reloc-placeholder bytes (extern fields,
     /// resolved at link) as `??` instead of a misleading `00`.
     fn hex_masked(bytes: &[u8], mask: &[bool]) -> String {
@@ -881,12 +918,26 @@ main:
             let mut out = Vec::with_capacity(self.doc.line_count());
             let mut y = TOP_PAD;
             for row in 0..self.doc.line_count() {
-                let extra = if self.is_macro(row) { self.listing(row).len() } else { 0 };
-                let h = (1 + extra) as f32 * LINE_H;
+                let extra: f32 = if self.is_macro(row) {
+                    self.listing(row).iter().map(|(b, m, a)| self.ghost_line_rows(b, m, a)).sum()
+                } else {
+                    0.0
+                };
+                let h = (1.0 + extra) * LINE_H;
                 out.push((y, h));
                 y += h;
             }
             out
+        }
+
+        /// How many text rows a ghost listing line needs — the taller of its asm
+        /// column and its byte column, so a wide string's long `.word` line (and
+        /// its many bytes) gets the vertical room it wraps into.
+        fn ghost_line_rows(&self, bytes: &[u8], mask: &[bool], asm: &str) -> f32 {
+            let asm_w = (self.viewport().0 * SPLIT_FRAC - 6.0 - SRC_X - 14.0).max(20.0);
+            let asm_rows = wrap_rows(asm, asm_w, EDITOR_SIZE * 0.92);
+            let byte_rows = wrap_rows(&hex_masked(bytes, mask), BYTES_W - 10.0, BYTE_SIZE);
+            asm_rows.max(byte_rows)
         }
 
         /// Draw the editor as an ASM listing: a gray byte margin on the left,
@@ -1007,24 +1058,23 @@ main:
                     render::fill_rect(t, ux, sy + LINE_H - 2.5, uw, 2.0, SQUIGGLE);
                 }
 
-                // Macro expansion: gray ghost rows of `bytes : asm` beneath.
+                // Macro expansion: gray ghost rows of `bytes : asm` beneath. Each
+                // line is as tall as it wraps, so wide data shows fully.
                 if macro_row {
-                    for (i, (bytes, mask, asm)) in self.listing(row).iter().enumerate() {
-                        let gy = sy + (i as f32 + 1.0) * LINE_H;
-                        if gy + LINE_H < 0.0 {
-                            continue;
+                    let mut gy = sy + LINE_H;
+                    for (bytes, mask, asm) in self.listing(row).iter() {
+                        let gh = self.ghost_line_rows(bytes, mask, asm) * LINE_H;
+                        if gy + gh >= 0.0 && gy <= editor_h {
+                            render::draw_text(
+                                t, LN_W + 6.0, gy, BYTES_W - 10.0, gh, &hex_masked(bytes, mask),
+                                EDITOR_FONT, BYTE_SIZE, false, false, BYTE_COLOR, false,
+                            );
+                            render::draw_text(
+                                t, SRC_X + 14.0, gy, text_right - SRC_X - 14.0, gh, asm,
+                                EDITOR_FONT, EDITOR_SIZE * 0.92, false, true, GHOST_COLOR, false,
+                            );
                         }
-                        if gy > editor_h {
-                            break;
-                        }
-                        render::draw_text(
-                            t, LN_W + 6.0, gy, BYTES_W - 10.0, LINE_H, &hex_masked(bytes, mask),
-                            EDITOR_FONT, BYTE_SIZE, false, false, BYTE_COLOR, false,
-                        );
-                        render::draw_text(
-                            t, SRC_X + 14.0, gy, text_right - SRC_X - 14.0, LINE_H, asm,
-                            EDITOR_FONT, EDITOR_SIZE * 0.92, false, true, GHOST_COLOR, false,
-                        );
+                        gy += gh;
                     }
                 }
             }
