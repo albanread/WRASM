@@ -178,7 +178,8 @@ endproc\n\
 | `uses R…` | Callee-saved registers the body clobbers — pushed in the prologue, popped at `endproc`/`ret`. The contract check **errors** if the body writes any *other* callee-saved register (you'd silently destroy the caller's value). |\n\
 | `in R…` | Input registers — documentation (drives the uninitialized-input check). |\n\
 | `out R…` | Result registers — documentation (drives the unset-output check). |\n\
-| `frame` | Reserve the 32-byte shadow space + outgoing-arg area **once** in the prologue (a single visible `sub rsp, K`, 16-aligned). Each `invoke`/`comcall` inside then drops its per-call alignment — just the arg moves and the `call`. |\n\n\
+| `frame` | Align the stack **once** in the prologue (an `rbp` anchor + `and rsp,-16`, then `sub rsp, K` for the 32-byte shadow space + outgoing args) and unwind via `mov rsp, rbp`. Each `invoke`/`comcall` inside then drops its per-call alignment — just the arg moves and the `call`. Correct no matter how the caller entered. |\n\n\
+- A `frame` proc reserves **`rbp`** as its alignment anchor — don't use `rbp` in the body (the contract check flags it, by design).\n\
 - A bare `ret` inside a proc restores the saved registers first; **`.ret`** is the explicit early exit.\n\
 - A `proc` inside a `proc` is an error.\n\
 - Dual check, caller side: the **clobber** warning flags a value left in a volatile register (rcx/rdx/r8–r11) across a call that destroys it.\n\n\
