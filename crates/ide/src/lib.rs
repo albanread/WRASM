@@ -58,6 +58,14 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
             return Ok(md);
         }
     }
+    // Cards that need no db — the ABI and the ISA. A register or mnemonic is an
+    // unambiguous keyword in asm, so resolve it ahead of the db lookups.
+    if let Some(md) = register_card(q) {
+        return Ok(md);
+    }
+    if let Some(md) = mnemonic_card(q) {
+        return Ok(md);
+    }
     if let Some(md) = function_card(kb, q)? {
         return Ok(md);
     }
@@ -65,10 +73,6 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
         return Ok(md);
     }
     if let Some(md) = interface_card(kb, q)? {
-        return Ok(md);
-    }
-    // A register — the one card that needs no db, just the Win64 ABI.
-    if let Some(md) = register_card(q) {
         return Ok(md);
     }
     search_card(kb, q)
@@ -175,6 +179,114 @@ pub fn register_card(name: &str) -> Option<String> {
          shadow space**; **RSP is 16-byte aligned at every `call`**.\n",
     );
     Some(s)
+}
+
+/// Where `invoke` puts the n-th argument (1-based) under the Win64 ABI: the
+/// first four integer/pointer args in rcx/rdx/r8/r9 (float args in xmm0–3 by
+/// position), the rest on the stack above the 32-byte shadow space.
+fn abi_slot(n: u32, type_name: &str) -> String {
+    let t = type_name.to_ascii_lowercase();
+    let is_float = t.contains("float") || t.contains("double");
+    match n {
+        1..=4 => {
+            let i = (n - 1) as usize;
+            if is_float {
+                format!("`xmm{i}`")
+            } else {
+                ["`rcx`", "`rdx`", "`r8`", "`r9`"][i].to_string()
+            }
+        }
+        _ => format!("`[rsp+{}]`", 32 + 8 * (n - 5)),
+    }
+}
+
+/// The instruction card — the mnemonics that trip people up: the signed/unsigned
+/// conditional-jump split, the implicit `rdx:rax` of mul/div, the flag-only
+/// `cmp`/`test`, the `cl`-count shifts. Pure static ISA knowledge, no db. `None`
+/// for mnemonics not worth a reminder.
+pub fn mnemonic_card(name: &str) -> Option<String> {
+    let m = name.trim().to_ascii_lowercase();
+    if let Some(card) = jcc_card(&m) {
+        return Some(card);
+    }
+    let (title, body): (&str, &str) = match m.as_str() {
+        "cmp" => ("compare — subtract, set flags, discard the result",
+            "Sets ZF/SF/CF/OF from `dst - src` but stores nothing. Follow with a conditional jump — **signed** `jg/jge/jl/jle` or **unsigned** `ja/jae/jb/jbe`. Picking the wrong family is the classic bug."),
+        "test" => ("bitwise AND for flags — discard the result",
+            "Sets ZF/SF/PF from `dst & src`, clears CF/OF, stores nothing. `test rax, rax` then `jz`/`js` is the idiom for is-zero / is-negative."),
+        "mul" => ("unsigned multiply — implicit rdx:rax",
+            "`mul r/m` does rax × r/m into **rdx:rax** (high half in rdx). Use `imul` for signed."),
+        "imul" => ("signed multiply",
+            "The 2/3-operand forms (`imul dst, src`) write one register; the 1-operand form uses **rdx:rax** like `mul`."),
+        "div" => ("unsigned divide — implicit rdx:rax",
+            "Divides **rdx:rax** by r/m → quotient in rax, remainder in rdx. **Zero rdx first** (`xor edx, edx`), or a stale rdx faults (#DE)."),
+        "idiv" => ("signed divide — implicit rdx:rax",
+            "Divides **rdx:rax** by r/m. **Sign-extend rax into rdx first** with `cdq`/`cqo` — not `xor edx, edx`."),
+        "cdq" | "cqo" | "cwd" | "cbw" => ("sign-extend the accumulator",
+            "`cdq` fills edx, `cqo` fills rdx, from the sign of the accumulator — the required setup before `idiv`."),
+        "lea" => ("load effective address — no memory access",
+            "Stores the address `[…]` would form; touches no memory and **sets no flags**. Doubles as cheap arithmetic: `lea rax, [rax + rax*4]`."),
+        "shl" | "shr" | "sal" | "sar" => ("shift — variable count from cl only",
+            "A register count must be **cl** (or an imm8). `shl`/`shr` are logical; `sar` is arithmetic (keeps the sign); `sal` == `shl`."),
+        "rol" | "ror" | "rcl" | "rcr" => ("rotate — count from cl or imm8",
+            "`rcl`/`rcr` rotate through CF; `rol`/`ror` don't."),
+        "movzx" => ("move zero-extended",
+            "Widens an 8/16-bit source into a 32/64-bit dest, zero-filling the top. (A 32-bit `mov` already zeroes the top 32 bits.)"),
+        "movsx" | "movsxd" => ("move sign-extended",
+            "Widens a smaller source into the dest, copying the sign bit through the top."),
+        "movabs" => ("move a 64-bit immediate",
+            "The only `mov` form that loads a full 64-bit immediate into a register."),
+        "add" | "sub" | "and" | "or" | "xor" | "adc" | "sbb" | "neg" => ("ALU op — sets flags",
+            "Writes the destination and sets ZF/SF/CF/OF — so a following `jcc` reads *this* result. `xor reg, reg` is the idiom for a zeroed register."),
+        "inc" | "dec" => ("increment / decrement — sets flags except CF",
+            "Updates ZF/SF/OF but **leaves CF unchanged** (unlike `add`/`sub` by 1) — a gotcha if a later branch expects CF."),
+        "push" | "pop" => ("stack push / pop",
+            "Moves rsp by 8 (in 64-bit) and transfers the operand. Keep the net effect even so rsp stays 16-byte aligned at calls."),
+        "call" => ("call — push return address, jump",
+            "Pushes the return address (rsp -= 8) then jumps. The callee expects **rsp 16-byte aligned at the `call`** and **32 bytes of shadow space** already reserved."),
+        "ret" => ("return — pop into rip",
+            "Pops the return address into rip. The stack must be exactly where the matching `call` left it."),
+        _ => return None,
+    };
+    Some(format!("# {m}  —  {title}\n\n{body}\n"))
+}
+
+/// Conditional-jump card: meaning, **signedness**, and the flags it tests.
+fn jcc_card(m: &str) -> Option<String> {
+    let (meaning, kind, flags, also): (&str, &str, &str, &str) = match m {
+        "je" | "jz" => ("equal / zero", "", "ZF = 1", "jne/jnz"),
+        "jne" | "jnz" => ("not equal / not zero", "", "ZF = 0", "je/jz"),
+        "jg" | "jnle" => ("greater", "signed", "ZF = 0 and SF = OF", "unsigned: `ja`"),
+        "jge" | "jnl" => ("greater or equal", "signed", "SF = OF", "unsigned: `jae`"),
+        "jl" | "jnge" => ("less", "signed", "SF ≠ OF", "unsigned: `jb`"),
+        "jle" | "jng" => ("less or equal", "signed", "ZF = 1 or SF ≠ OF", "unsigned: `jbe`"),
+        "ja" | "jnbe" => ("above", "unsigned", "CF = 0 and ZF = 0", "signed: `jg`"),
+        "jae" | "jnb" | "jnc" => ("above or equal / no carry", "unsigned", "CF = 0", "signed: `jge`"),
+        "jb" | "jnae" | "jc" => ("below / carry", "unsigned", "CF = 1", "signed: `jl`"),
+        "jbe" | "jna" => ("below or equal", "unsigned", "CF = 1 or ZF = 1", "signed: `jle`"),
+        "js" => ("sign (negative)", "", "SF = 1", "jns"),
+        "jns" => ("not sign (non-negative)", "", "SF = 0", "js"),
+        "jo" => ("overflow", "", "OF = 1", "jno"),
+        "jno" => ("no overflow", "", "OF = 0", "jo"),
+        "jp" | "jpe" => ("parity even", "", "PF = 1", "jnp/jpo"),
+        "jnp" | "jpo" => ("parity odd", "", "PF = 0", "jp/jpe"),
+        "jrcxz" => ("rcx is zero", "", "rcx == 0 (tests the register, not a flag)", ""),
+        _ => return None,
+    };
+    let kindline = match kind {
+        "signed" => "  ·  **signed**",
+        "unsigned" => "  ·  **unsigned**",
+        _ => "",
+    };
+    let note = match kind {
+        "signed" => "\n\n⚠ **Signed** test — using it to compare *unsigned* values is a classic bug (addresses, sizes, counts are unsigned).",
+        "unsigned" => "\n\n⚠ **Unsigned** test — for *signed* values use the signed sibling.",
+        _ => "",
+    };
+    let also = if also.is_empty() { String::new() } else { format!("\n\nSibling: {also}.") };
+    Some(format!(
+        "# {m}  —  jump if {meaning}{kindline}\n\nTaken when **{flags}**. Set the flags with `cmp`/`test`/an ALU op on the line(s) just above.{note}{also}\n"
+    ))
 }
 
 /// Canonical 64-bit name for any width of a register (`eax`→`rax`, `r8d`→`r8`);
@@ -303,17 +415,22 @@ pub fn function_card(kb: &Kb, name: &str) -> Result<Option<String>> {
     }
 
     if !f.params.is_empty() {
-        s.push_str("| # | parameter | type | values |\n|--:|---|---|---|\n");
-        for p in &f.params {
+        s.push_str("| # | parameter | type | slot | values |\n|--:|---|---|---|---|\n");
+        for (i, p) in f.params.iter().enumerate() {
             s.push_str(&format!(
-                "| {} | `{}` | {} | {} |\n",
+                "| {} | `{}` | {} | {} | {} |\n",
                 p.ordinal,
                 p.name,
                 short_type(&p.type_name),
+                abi_slot((i + 1) as u32, &p.type_name),
                 values_cell(&p.related),
             ));
         }
         s.push('\n');
+        s.push_str(
+            "*Slots: integer/pointer args → rcx, rdx, r8, r9, then the stack above the \
+             32-byte shadow space; float args → xmm0–3. This is what `invoke` marshals.*\n\n",
+        );
     }
 
     s.push_str("### Insert\n\n");
@@ -515,11 +632,35 @@ mod tests {
         let md = function_card(&kb, "CreateFileW").unwrap().expect("CreateFileW");
         assert!(md.contains("# CreateFileW"), "title:\n{md}");
         assert!(md.contains("KERNEL32"), "dll:\n{md}");
-        assert!(md.contains("| # | parameter | type | values |"), "table:\n{md}");
+        assert!(md.contains("| # | parameter | type | slot | values |"), "table:\n{md}");
         assert!(md.contains("```was"), "insert frame:\n{md}");
         assert!(md.contains("invoke CreateFileW"), "invoke:\n{md}");
         // dwShareMode is an enum param: its members should populate a value cell.
         assert!(md.contains("FILE_SHARE"), "enum values:\n{md}");
+        // The marshaling column: arg 1 → rcx, and a stack slot for later args.
+        assert!(md.contains("`rcx`"), "arg1 slot:\n{md}");
+        assert!(md.contains("[rsp+"), "stack slot for later args:\n{md}");
+    }
+
+    #[test]
+    fn mnemonic_card_flags_the_signed_unsigned_split() {
+        let jg = mnemonic_card("jg").unwrap();
+        assert!(jg.contains("signed") && jg.contains("ZF = 0 and SF = OF"), "jg:\n{jg}");
+        let jb = mnemonic_card("jb").unwrap();
+        assert!(jb.contains("unsigned") && jb.contains("CF = 1"), "jb:\n{jb}");
+        assert!(mnemonic_card("idiv").unwrap().contains("rdx:rax"), "idiv implicit ops");
+        assert!(mnemonic_card("inc").unwrap().contains("CF"), "inc/dec CF gotcha");
+        assert!(mnemonic_card("lea").unwrap().contains("no flags"));
+        assert!(mnemonic_card("frobnicate").is_none());
+    }
+
+    #[test]
+    fn abi_slot_follows_win64() {
+        assert_eq!(abi_slot(1, "HANDLE"), "`rcx`");
+        assert_eq!(abi_slot(4, "DWORD"), "`r9`");
+        assert_eq!(abi_slot(5, "LPVOID"), "`[rsp+32]`");
+        assert_eq!(abi_slot(6, "int"), "`[rsp+40]`");
+        assert_eq!(abi_slot(1, "float"), "`xmm0`"); // float args go in xmm by position
     }
 
     #[test]

@@ -1767,9 +1767,9 @@ main:
         let tok = studio::hover::token_at(line, doc.caret.col)?;
         match tok.kind {
             // Functions, struct/type names (Ident) and Windows constants — the
-            // things winkb has a card for; plus registers, which get the static
-            // Win64 ABI card. Numbers: no card.
-            TokKind::Ident | TokKind::Constant | TokKind::Register => {
+            // things winkb has a card for; registers → the Win64 ABI card;
+            // mnemonics → the instruction/flags card. Numbers: no card.
+            TokKind::Ident | TokKind::Constant | TokKind::Register | TokKind::Mnemonic => {
                 Some(line[tok.start..tok.end].to_string())
             }
             _ => None,
