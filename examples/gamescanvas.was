@@ -1,0 +1,281 @@
+; gamescanvas.was — the CPU GamesCanvas: a retro indexed-colour surface.
+;
+;   was examples\gamescanvas.was -o gamescanvas.exe   &&   gamescanvas.exe
+;
+; A 320x200 8-bit *index* framebuffer + a 256-entry palette, presented to the
+; window via a 32-bit BGRX DIB with a 3x nearest-neighbour upscale (the chunky
+; DOS/Amiga look). Primitives write palette indices; `present` resolves them
+; through the palette and blits. The 5x7 font lives in its own file, pulled in
+; with the new `.include`. This frame: the CGA palette bars + a title, animated by
+; cycling the palette — zero redraw, classic raster trick.
+;
+; Foundation for the full spec (sprites, lines, discs, scrolling GPU profile);
+; this is the CPU core that defines the palette, font, and present pipeline.
+
+.DATA
+.include "gc_font.inc"               ; fontTab: 128 glyphs x 7 bytes (5x7)
+
+fb        BYTE  64000 dup(0)         ; 320x200 index framebuffer (top-down)
+pbuf      DWORD 64000 dup(0)         ; 320x200 BGRX present buffer
+
+; 256-entry palette, 0x00RRGGBB (little-endian → B,G,R,0 = BGRX, no swizzle).
+; The canonical CGA/EGA 16, then black.
+palette:
+    DWORD 0x000000, 0x0000AA, 0x00AA00, 0x00AAAA
+    DWORD 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA
+    DWORD 0x555555, 0x5555FF, 0x55FF55, 0x55FFFF
+    DWORD 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+    DWORD 240 dup(0)
+
+; BITMAPINFO (header only; 32bpp BI_RGB needs no colour table). biHeight < 0 =
+; top-down, matching the framebuffer.
+bmi:
+    DWORD 40                          ; biSize
+    DWORD 320                         ; biWidth
+    DWORD 0xFFFFFF38                  ; biHeight = -200 (top-down)
+    WORD  1, 32                       ; biPlanes=1, biBitCount=32
+    DWORD 0, 0, 0, 0, 0, 0            ; biCompression(BI_RGB)=0, …
+
+title1    BYTE "RASM GAMESCANVAS", 0
+title2    BYTE "320X200 INDEXED  CYCLING PALETTE", 0
+
+className WCHAR "rasm_gc", 0
+titleW    WCHAR "RASM — GamesCanvas (CPU)", 0
+wc        BYTE  80 dup(0)
+msg       BYTE  48 dup(0)
+hwndSave  QWORD ?
+hdcTmp    QWORD ?
+winRect   BYTE  16 dup(0)
+winW      DWORD ?
+winH      DWORD ?
+
+.CODE
+.globl main
+main:
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+
+    ; client area exactly 960x600 (320x200 at 3x)
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 960
+    mov     dword ptr [rdi + 12], 600
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + winH], eax
+    invoke  CreateWindowExW, 0, className, titleW, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+
+    call    draw_scene                ; draw once; the timer just cycles + presents
+    invoke  SetTimer, [rip + hwndSave], 1, 60, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     mdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+mdone:
+    invoke  ExitProcess, 0
+
+; ---- draw the demo scene into the framebuffer ----
+draw_scene:
+    mov     cl, 0
+    call    Cls                       ; black
+    ; 16 vertical palette bars across the width (each 20 wide, full height)
+    xor     r12d, r12d                ; bar index 0..15
+ds_bar:
+    mov     ecx, r12d
+    imul    ecx, ecx, 20              ; x = bar*20
+    mov     edx, 30                   ; y
+    mov     r8d, 20                   ; w
+    mov     r9d, 140                  ; h
+    mov     r10b, r12b                ; colour = bar index
+    call    FillRect
+    inc     r12d
+    cmp     r12d, 16
+    jl      ds_bar
+    ; titles (white = 15, bright cyan = 11)
+    mov     ecx, 84
+    mov     edx, 8
+    mov     r8b, 15
+    lea     r9, [rip + title1]
+    call    Text
+    mov     ecx, 44
+    mov     edx, 182
+    mov     r8b, 11
+    lea     r9, [rip + title2]
+    call    Text
+    ret
+
+; ---- Cls(cl = index): fill the framebuffer ----
+proc Cls uses rdi in rcx
+    lea     rdi, [rip + fb]
+    mov     al, cl
+    mov     ecx, 64000
+    rep     stosb
+endproc
+
+; ---- FillRect(ecx=x, edx=y, r8d=w, r9d=h, r10b=index) ----
+proc FillRect uses rbx rsi rdi in rcx rdx r8 r9 r10
+    mov     ebx, edx                  ; y (row counter)
+fr_row:
+    test    r9d, r9d
+    jle     fr_done
+    cmp     ebx, 200
+    jae     fr_next                   ; row off-screen → skip (still advance)
+    ; row start = fb + y*320 + x
+    mov     eax, ebx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     rdi, [rip + fb]
+    add     rdi, rax
+    mov     esi, r8d                  ; w
+    mov     edx, ecx                  ; x (for clip)
+fr_col:
+    test    esi, esi
+    jle     fr_next
+    cmp     edx, 320
+    jae     fr_next
+    mov     [rdi], r10b
+    inc     rdi
+    inc     edx
+    dec     esi
+    jmp     fr_col
+fr_next:
+    inc     ebx
+    dec     r9d
+    jmp     fr_row
+fr_done:
+endproc
+
+; ---- Text(ecx=x, edx=y, r8b=index, r9=asciiz) — 5x7 font, 6px advance ----
+proc Text uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx r8 r9
+    mov     rsi, r9                   ; string
+    mov     r13d, ecx                 ; pen x
+    mov     r14d, edx                 ; pen y
+    mov     r15b, r8b                 ; colour
+    lea     rbx, [rip + fontTab]
+tx_char:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      tx_done
+    inc     rsi
+    cmp     al, 97                    ; 'a'
+    jb      tx_up
+    cmp     al, 122                   ; 'z'
+    ja      tx_up
+    sub     al, 32                    ; → uppercase
+tx_up:
+    cmp     al, 128
+    jae     tx_adv                    ; unprintable → blank cell
+    movzx   ecx, al
+    imul    ecx, ecx, 7
+    lea     r12, [rbx + rcx]          ; glyph (7 rows)
+    xor     r8d, r8d                  ; row 0..6
+tx_row:
+    movzx   r9d, byte ptr [r12 + r8]  ; row bits (bit4 = leftmost)
+    xor     ecx, ecx                  ; col 0..4
+tx_col:
+    mov     edx, 16
+    mov     eax, ecx
+    shr     edx, cl                   ; mask = 16 >> col   (cl = col)
+    mov     ecx, eax                  ; restore col
+    test    r9d, edx
+    jz      tx_skip
+    ; plot pixel at (penx+col, peny+row)
+    mov     eax, r14d
+    add     eax, r8d                  ; y
+    cmp     eax, 200
+    jae     tx_skip
+    imul    eax, eax, 320
+    mov     edx, r13d
+    add     edx, ecx                  ; x
+    cmp     edx, 320
+    jae     tx_skip
+    add     eax, edx
+    lea     rdi, [rip + fb]
+    mov     [rdi + rax], r15b
+tx_skip:
+    inc     ecx
+    cmp     ecx, 5
+    jl      tx_col
+    inc     r8d
+    cmp     r8d, 7
+    jl      tx_row
+tx_adv:
+    add     r13d, 6                   ; advance the pen
+    jmp     tx_char
+tx_done:
+endproc
+
+; ---- CyclePalette(ecx=lo, edx=hi): rotate palette[lo..hi] up by one ----
+proc CyclePalette in rcx rdx
+    lea     r8, [rip + palette]
+    mov     eax, [r8 + rcx*4]         ; tmp = palette[lo]
+cp_loop:
+    cmp     ecx, edx
+    jge     cp_last
+    mov     r9d, [r8 + rcx*4 + 4]     ; palette[i+1]
+    mov     [r8 + rcx*4], r9d         ; palette[i] = palette[i+1]
+    inc     ecx
+    jmp     cp_loop
+cp_last:
+    mov     [r8 + rcx*4], eax         ; palette[hi] = tmp
+endproc
+
+; ---- present: resolve indices through the palette, blit upscaled ----
+proc present uses rsi rdi frame
+    lea     rsi, [rip + fb]
+    lea     rdi, [rip + pbuf]
+    lea     r8, [rip + palette]
+    xor     ecx, ecx
+pr_px:
+    movzx   eax, byte ptr [rsi + rcx]
+    mov     edx, [r8 + rax*4]
+    mov     [rdi + rcx*4], edx
+    inc     ecx
+    cmp     ecx, 64000
+    jl      pr_px
+    invoke  GetDC, [rip + hwndSave]
+    mov     [rip + hdcTmp], rax
+    invoke  SetStretchBltMode, [rip + hdcTmp], 3
+    invoke  StretchDIBits, [rip + hdcTmp], 0, 0, 960, 600, 0, 0, 320, 200, pbuf, bmi, 0, 0x00CC0020
+    invoke  ReleaseDC, [rip + hwndSave], [rip + hdcTmp]
+endproc
+
+.globl WndProc
+WndProc:
+    cmp     edx, 2                    ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                  ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    mov     ecx, 1
+    mov     edx, 15
+    call    CyclePalette              ; animate the bars (palette trick, no redraw)
+    call    present
+    xor     eax, eax
+    ret
