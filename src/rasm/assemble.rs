@@ -52,7 +52,7 @@ impl Branch {
 
 enum Item {
     /// Fixed code/data bytes, with RIP-rel fixups (offset-within-bytes, target).
-    Code { bytes: Vec<u8>, riprel: Vec<(usize, String)> },
+    Code { bytes: Vec<u8>, riprel: Vec<(usize, usize, String)> },
     Label(String),
     Globl(String),
     /// `.align`/`.p2align` — pad to a 2^n boundary (n already normalized).
@@ -187,7 +187,14 @@ fn assemble_impl(text: &str, flatten: bool) -> Result<(EncodedModule, Vec<(usize
                         let mut riprel = Vec::new();
                         for f in &enc.fixups {
                             match f.kind {
-                                FixupKind::RipRel32 => riprel.push((f.at, f.target.clone())),
+                                // `trailing` = bytes after the disp32 field within
+                                // this instruction (an immediate, if any). RIP points
+                                // at the instruction *end*, so the disp must reach
+                                // past those bytes too.
+                                FixupKind::RipRel32 => {
+                                    let trailing = enc.bytes.len() - f.at - 4;
+                                    riprel.push((f.at, trailing, f.target.clone()));
+                                }
                                 FixupKind::Rel32 => {
                                     // A non-branch rel32 fixup shouldn't occur here.
                                     bail!("line {}: unexpected branch fixup in `{raw}`", lineno + 1);
@@ -279,12 +286,15 @@ fn assemble_impl(text: &str, flatten: bool) -> Result<(EncodedModule, Vec<(usize
             Item::Code { bytes, riprel } => {
                 let base = buf.len();
                 buf.extend_from_slice(bytes);
-                for (at, target) in riprel {
+                for (at, trailing, target) in riprel {
                     let field = base + at;
+                    // RIP = instruction end = disp field end (+4) + any trailing
+                    // immediate; carry that as a negative addend for the writers.
+                    let addend = -(*trailing as i64);
                     match labels.get(target) {
                         // Same-section internal reference → resolve the disp now.
                         Some(&(tsect, tgt)) if tsect == sect => {
-                            let disp = tgt as i64 - (field as i64 + 4);
+                            let disp = tgt as i64 - (field as i64 + 4 + *trailing as i64);
                             let d = i32::try_from(disp).context("RIP-rel disp32 overflow")?;
                             buf[field..field + 4].copy_from_slice(&d.to_le_bytes());
                         }
@@ -295,7 +305,7 @@ fn assemble_impl(text: &str, flatten: bool) -> Result<(EncodedModule, Vec<(usize
                             size: 4,
                             kind: RelocKind::RipRel32,
                             target: target.clone(),
-                            addend: 0,
+                            addend,
                         }),
                         // Undefined here → an extern to bind.
                         None => {
@@ -304,7 +314,7 @@ fn assemble_impl(text: &str, flatten: bool) -> Result<(EncodedModule, Vec<(usize
                                 size: 4,
                                 kind: RelocKind::RipRel32,
                                 target: target.clone(),
-                                addend: 0,
+                                addend,
                             });
                             externs.push(target.clone());
                         }
@@ -501,6 +511,33 @@ ret
         assert_eq!(m.relocs.len(), 1);
         assert_eq!(m.relocs[0].kind, RelocKind::RipRel32);
         assert_eq!(m.relocs[0].target, "rt_emit");
+    }
+
+    #[test]
+    fn rip_relative_store_accounts_for_trailing_immediate() {
+        // `mov dword ptr [rip+sym], imm32`: RIP points past the imm32, so the disp
+        // must reach 4 bytes beyond the disp field. Regression — a missing
+        // adjustment stored the value 4 bytes past `sym`. Cross-section/extern →
+        // reloc carries the trailing length as a negative addend; same-section →
+        // the disp is resolved with it baked in.
+        let ext32 = assemble(".text\n.globl m\nm:\nmov dword ptr [rip + ext], 7\nret\n").unwrap();
+        let r = ext32.relocs.iter().find(|r| r.target == "ext").unwrap();
+        assert_eq!(r.kind, RelocKind::RipRel32);
+        assert_eq!(r.addend, -4, "imm32 trailing the disp field → addend -4");
+
+        let ext8 = assemble(".text\n.globl m\nm:\nmov byte ptr [rip + ext], 7\nret\n").unwrap();
+        assert_eq!(ext8.relocs.iter().find(|r| r.target == "ext").unwrap().addend, -1);
+
+        // No immediate (lea) → addend 0, unchanged.
+        let lea = assemble(".text\n.globl m\nm:\nlea rax, [rip + ext]\nret\n").unwrap();
+        assert_eq!(lea.relocs.iter().find(|r| r.target == "ext").unwrap().addend, 0);
+
+        // Same-section internal store: C7 05 <disp32> <imm32> is 10 bytes and `sym`
+        // sits right after, so disp = 10 - instruction_end(10) = 0 (the buggy value
+        // was 4 — pointing the CPU at the imm32, not at `sym`).
+        let int = assemble(".text\n.globl m\nm:\nmov dword ptr [rip + sym], 7\nsym:\nret\n").unwrap();
+        let disp = i32::from_le_bytes([int.code[2], int.code[3], int.code[4], int.code[5]]);
+        assert_eq!(disp, 0, "disp must reach the instruction end, not the disp field");
     }
 
     #[test]

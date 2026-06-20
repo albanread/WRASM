@@ -157,7 +157,10 @@ pub fn write_coff(m: &EncodedModule) -> Vec<u8> {
     // ── relocations (all against `.text`) ─────────────────────────────────────
     for r in &m.relocs {
         let typ = match r.kind {
-            RelocKind::BranchRel32 | RelocKind::RipRel32 => IMAGE_REL_AMD64_REL32,
+            RelocKind::BranchRel32 => IMAGE_REL_AMD64_REL32,
+            // REL32_N (= REL32 + N) for N trailing immediate bytes after the RIP-rel
+            // disp field, so the linker measures relative to the instruction end.
+            RelocKind::RipRel32 => IMAGE_REL_AMD64_REL32 + (-r.addend) as u16,
             RelocKind::Abs64 => IMAGE_REL_AMD64_ADDR64,
         };
         out.extend_from_slice(&(r.at as u32).to_le_bytes()); // VirtualAddress
