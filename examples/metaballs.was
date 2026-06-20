@@ -1,0 +1,252 @@
+; metaballs.was — organic blobby "metaballs".
+;
+;   was examples\metaballs.was -o metaballs.exe   &&   metaballs.exe
+;
+; Each ball contributes a scalar field that falls off with distance:
+;   field(pixel) = sum over balls of  SCALE / (distance^2 + 1)
+; Sum the fields and colour by the total: where two balls' fields overlap the
+; sum stays high between them, so the blobs appear to merge and stretch like
+; mercury. Five balls bounce around inside the frame.
+;
+; That's one divide per ball per pixel, so we render at 320x240 and let
+; StretchDIBits scale it up 2x to the window. A 256-entry palette
+; (dark -> blue -> cyan -> white) maps field strength to colour.
+;
+; The first frame is saved to metaballs.bmp.
+
+.DATA
+; ---- field-strength palette: 0..255 -> 0x00RRGGBB (blue -> cyan -> white) ----
+palette DWORD 0x000000, 0x000004, 0x000008, 0x00000C, 0x000010, 0x000014, 0x000018, 0x00001C
+        DWORD 0x000020, 0x000024, 0x000028, 0x00002C, 0x000030, 0x000034, 0x000038, 0x00003C
+        DWORD 0x000040, 0x000044, 0x000048, 0x00004C, 0x000050, 0x000054, 0x000058, 0x00005C
+        DWORD 0x000060, 0x000064, 0x000068, 0x00006C, 0x000070, 0x000074, 0x000078, 0x00007C
+        DWORD 0x000080, 0x000084, 0x000088, 0x00008C, 0x000090, 0x000094, 0x000098, 0x00009C
+        DWORD 0x0000A0, 0x0000A4, 0x0000A8, 0x0000AC, 0x0000B0, 0x0000B4, 0x0000B8, 0x0000BC
+        DWORD 0x0000C0, 0x0000C4, 0x0000C8, 0x0000CC, 0x0000D0, 0x0000D4, 0x0000D8, 0x0000DC
+        DWORD 0x0000E0, 0x0000E4, 0x0000E8, 0x0000EC, 0x0000F0, 0x0000F4, 0x0000F8, 0x0000FC
+        DWORD 0x0000FF, 0x0003FF, 0x0006FF, 0x0009FF, 0x000CFF, 0x000FFF, 0x0012FF, 0x0015FF
+        DWORD 0x0018FF, 0x001BFF, 0x001EFF, 0x0021FF, 0x0024FF, 0x0027FF, 0x002AFF, 0x002DFF
+        DWORD 0x0030FF, 0x0033FF, 0x0036FF, 0x0039FF, 0x003CFF, 0x003FFF, 0x0042FF, 0x0045FF
+        DWORD 0x0048FF, 0x004BFF, 0x004EFF, 0x0051FF, 0x0054FF, 0x0057FF, 0x005AFF, 0x005DFF
+        DWORD 0x0060FF, 0x0063FF, 0x0066FF, 0x0069FF, 0x006CFF, 0x006FFF, 0x0072FF, 0x0075FF
+        DWORD 0x0078FF, 0x007BFF, 0x007EFF, 0x0081FF, 0x0084FF, 0x0087FF, 0x008AFF, 0x008DFF
+        DWORD 0x0090FF, 0x0093FF, 0x0096FF, 0x0099FF, 0x009CFF, 0x009FFF, 0x00A2FF, 0x00A5FF
+        DWORD 0x00A8FF, 0x00ABFF, 0x00AEFF, 0x00B1FF, 0x00B4FF, 0x00B7FF, 0x00BAFF, 0x00BDFF
+        DWORD 0x00C0FF, 0x00C3FF, 0x00C6FF, 0x00C9FF, 0x00CCFF, 0x00CFFF, 0x00D2FF, 0x00D5FF
+        DWORD 0x00D8FF, 0x00DBFF, 0x00DEFF, 0x00E1FF, 0x00E4FF, 0x03E7FF, 0x06EAFF, 0x09EDFF
+        DWORD 0x0CF0FF, 0x0FF3FF, 0x12F6FF, 0x15F9FF, 0x18FCFF, 0x1BFFFF, 0x1EFFFF, 0x21FFFF
+        DWORD 0x24FFFF, 0x27FFFF, 0x2AFFFF, 0x2DFFFF, 0x30FFFF, 0x33FFFF, 0x36FFFF, 0x39FFFF
+        DWORD 0x3CFFFF, 0x3FFFFF, 0x42FFFF, 0x45FFFF, 0x48FFFF, 0x4BFFFF, 0x4EFFFF, 0x51FFFF
+        DWORD 0x54FFFF, 0x57FFFF, 0x5AFFFF, 0x5DFFFF, 0x60FFFF, 0x63FFFF, 0x66FFFF, 0x69FFFF
+        DWORD 0x6CFFFF, 0x6FFFFF, 0x72FFFF, 0x75FFFF, 0x78FFFF, 0x7BFFFF, 0x7EFFFF, 0x81FFFF
+        DWORD 0x84FFFF, 0x87FFFF, 0x8AFFFF, 0x8DFFFF, 0x90FFFF, 0x93FFFF, 0x96FFFF, 0x99FFFF
+        DWORD 0x9CFFFF, 0x9FFFFF, 0xA2FFFF, 0xA5FFFF, 0xA8FFFF, 0xABFFFF, 0xAEFFFF, 0xB1FFFF
+        DWORD 0xB4FFFF, 0xB7FFFF, 0xBAFFFF, 0xBDFFFF, 0xC0FFFF, 0xC3FFFF, 0xC6FFFF, 0xC9FFFF
+        DWORD 0xCCFFFF, 0xCFFFFF, 0xD2FFFF, 0xD5FFFF, 0xD8FFFF, 0xDBFFFF, 0xDEFFFF, 0xE1FFFF
+        DWORD 0xE4FFFF, 0xE7FFFF, 0xEAFFFF, 0xEDFFFF, 0xF0FFFF, 0xF3FFFF, 0xF6FFFF, 0xF9FFFF
+        DWORD 0xFCFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF
+        DWORD 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF
+        DWORD 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF
+        DWORD 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF
+
+ballx       DWORD  60, 160, 250, 100, 200      ; five balls, position + velocity
+bally       DWORD  60, 120, 180, 200, 80
+ballvx      DWORD  2, -3, 2, -2, 3
+ballvy      DWORD  3, 2, -3, 2, -2
+
+className   WCHAR  "rasm_meta", 0
+titleText   WCHAR  "RASM — metaballs", 0
+fname       WCHAR  "metaballs.bmp", 0
+wc          BYTE   80 dup(0)
+bmi         BYTE   40 dup(0)
+msg         BYTE   48 dup(0)
+ps          BYTE   72 dup(0)
+; BITMAPFILEHEADER for 320*240*4 = 307200 bytes (bfSize = 54 + 307200 = 0x0004B0B6)
+filehdr     BYTE   0x42,0x4D, 0xB6,0xB0,0x04,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+fb          QWORD  ?
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  VirtualAlloc, 0, 307200, 0x3000, 4     ; 320*240 BGRA
+    mov     [rip + fb], rax
+
+    call    render                      ; first frame
+
+    ; BITMAPINFOHEADER (top-down, 320x240, 32bpp)
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 320
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -240
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 307200, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; window
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- move the balls, bouncing off the walls (keep them 8px inside) ----
+move_balls:
+    lea     r8, [rip + ballx]
+    lea     r9, [rip + bally]
+    lea     r10, [rip + ballvx]
+    lea     r11, [rip + ballvy]
+    xor     rcx, rcx
+mv_loop:
+    mov     eax, [r8 + rcx*4]
+    add     eax, [r10 + rcx*4]
+    cmp     eax, 8
+    jge     mv_x2
+    neg     dword ptr [r10 + rcx*4]
+    mov     eax, 8
+    jmp     mv_xs
+mv_x2:
+    cmp     eax, 312
+    jle     mv_xs
+    neg     dword ptr [r10 + rcx*4]
+    mov     eax, 312
+mv_xs:
+    mov     [r8 + rcx*4], eax
+    mov     eax, [r9 + rcx*4]
+    add     eax, [r11 + rcx*4]
+    cmp     eax, 8
+    jge     mv_y2
+    neg     dword ptr [r11 + rcx*4]
+    mov     eax, 8
+    jmp     mv_ys
+mv_y2:
+    cmp     eax, 232
+    jle     mv_ys
+    neg     dword ptr [r11 + rcx*4]
+    mov     eax, 232
+mv_ys:
+    mov     [r9 + rcx*4], eax
+    inc     rcx
+    cmp     rcx, 5
+    jb      mv_loop
+    ret
+
+; ---- evaluate the field for every pixel ----
+;   rdi=fb pointer  r8=&ballx  r9=&bally  r12=&palette
+;   r10=px  r11=py  rbx=accumulated field  rsi=ball index
+render:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    lea     r8, [rip + ballx]
+    lea     r9, [rip + bally]
+    lea     r12, [rip + palette]
+    mov     rdi, [rip + fb]
+    xor     r11d, r11d                  ; py
+mb_y:
+    xor     r10d, r10d                  ; px
+mb_x:
+    xor     ebx, ebx                    ; field accumulator
+    xor     rsi, rsi                    ; ball index
+mb_k:
+    mov     eax, r10d
+    sub     eax, [r8 + rsi*4]           ; dx
+    imul    eax, eax
+    mov     ecx, r11d
+    sub     ecx, [r9 + rsi*4]           ; dy
+    imul    ecx, ecx
+    add     eax, ecx
+    inc     eax                         ; d2 = dx^2 + dy^2 + 1
+    mov     ecx, eax                    ; divisor
+    mov     eax, 90000                  ; SCALE (bigger -> chunkier blobs that merge)
+    xor     edx, edx
+    div     ecx                         ; SCALE / d2
+    add     ebx, eax                    ; field += contribution
+    inc     rsi
+    cmp     rsi, 5
+    jb      mb_k
+    cmp     ebx, 255                    ; clamp to the palette
+    jbe     mb_ok
+    mov     ebx, 255
+mb_ok:
+    mov     eax, [r12 + rbx*4]          ; palette[field]
+    mov     [rdi], eax
+    add     rdi, 4
+    inc     r10d
+    cmp     r10d, 320
+    jb      mb_x
+    inc     r11d
+    cmp     r11d, 240
+    jb      mb_y
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                     ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                      ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                    ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    move_balls
+    call    render
+    invoke  InvalidateRect, [rip + hwndSave], 0, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    ; stretch the 320x240 field up to the 640x480 window
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 320, 240, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
