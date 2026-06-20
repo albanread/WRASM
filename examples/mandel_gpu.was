@@ -122,6 +122,9 @@ titleText   WCHAR  "RASM — GPU Mandelbrot (drag to zoom, right-click out)", 0
 wc          BYTE   80 dup(0)
 msg         BYTE   48 dup(0)
 hwndSave    QWORD  ?
+winRect     BYTE   16 dup(0)       ; RECT for AdjustWindowRect
+winW        DWORD  ?
+winH        DWORD  ?
 
 .CODE
 .globl main
@@ -140,7 +143,21 @@ main:
     lea     rdi, [rip + wc]
     mov     [rdi + WNDCLASSEXW.hCursor], rax
     invoke  RegisterClassExW, wc
-    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 1296, 759, 0, 0, rsi, 0
+    ; size the window so the CLIENT area is exactly 1280x720 (the backbuffer size),
+    ; so mouse client coords and the shader's SV_Position share one pixel space —
+    ; otherwise the rubber band is offset/scaled away from the cursor.
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 1280       ; right
+    mov     dword ptr [rdi + 12], 720       ; bottom
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]                       ; width  = right - left
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]                   ; height = bottom - top
+    mov     [rip + winH], eax
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
     mov     [rip + hwndSave], rax
     test    rax, rax
     jz      fail_window
@@ -388,6 +405,7 @@ wp_ldown:
     mov     [rip + dy0], eax
     mov     [rip + dy1], eax
     mov     dword ptr [rip + dragging], 1
+    invoke  SetCapture, [rip + hwndSave]     ; keep getting moves/up past the edge
     call    render
     xor     eax, eax
     ret
@@ -409,6 +427,7 @@ wp_lup:
     test    eax, eax
     jz      wp_lup_done
     mov     dword ptr [rip + dragging], 0
+    invoke  ReleaseCapture
     ; ignore a tiny (accidental) drag
     mov     eax, [rip + dx1]
     sub     eax, [rip + dx0]
