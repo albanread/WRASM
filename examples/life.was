@@ -1,0 +1,246 @@
+; life.was — Conway's Game of Life, 640x480, in a software framebuffer.
+;
+;   was examples\life.was -o life.exe   &&   life.exe
+;
+; A double-buffered cell grid (1 byte/cell), seeded random with an xorshift
+; PRNG, stepped with the 8-neighbour B3/S23 rule, and drawn 1 cell/pixel. The
+; 1-cell border is held dead so the inner loop needs no bounds checks. A timer
+; advances one generation per tick. After 24 warm-up generations the frame is
+; saved to life.bmp.
+;
+; step/render/init touch only volatile registers, so they need no prologue and
+; preserve rbx for main's warm-up counter.
+
+.DATA
+seed        DWORD  ?
+gcur        QWORD  ?                  ; current generation grid
+gnext       QWORD  ?                  ; next generation grid
+className   WCHAR  "rasm_life", 0
+titleText   WCHAR  "RASM — Conway's Game of Life", 0
+fname       WCHAR  "life.bmp", 0
+wc          BYTE   80 dup(0)
+bmi         BYTE   40 dup(0)
+msg         BYTE   48 dup(0)
+ps          BYTE   72 dup(0)
+filehdr     BYTE   0x42,0x4D, 0x36,0xC4,0x12,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+fb          QWORD  ?
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4     ; framebuffer (640*480*4)
+    mov     [rip + fb], rax
+    invoke  VirtualAlloc, 0, 307200, 0x3000, 4      ; grid A (640*480)
+    mov     [rip + gcur], rax
+    invoke  VirtualAlloc, 0, 307200, 0x3000, 4      ; grid B
+    mov     [rip + gnext], rax
+
+    ; seed the PRNG from the tick count (forced non-zero)
+    invoke  GetTickCount
+    xor     eax, 0x9E3779B9
+    mov     [rip + seed], eax
+
+    call    init_grid
+
+    ; warm up 24 generations so the BMP shows settled structure
+    mov     rbx, 24
+warm:
+    call    step
+    mov     rax, [rip + gcur]
+    mov     rdx, [rip + gnext]
+    mov     [rip + gcur], rdx
+    mov     [rip + gnext], rax
+    dec     rbx
+    jnz     warm
+
+    call    render
+
+    ; BITMAPINFOHEADER (top-down 32bpp)
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 1228800, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; window
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+    invoke  SetTimer, [rip + hwndSave], 1, 60, 0     ; one generation per ~60 ms
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- seed the interior with ~25% live cells (border stays dead) ----
+init_grid:
+    mov     r8, [rip + gcur]
+    mov     r10, 1                          ; y
+    mov     rcx, 641                        ; p = y*640 + x
+ig_y:
+    mov     r11, 1                          ; x
+ig_x:
+    mov     eax, [rip + seed]               ; xorshift32
+    mov     edx, eax
+    shl     edx, 13
+    xor     eax, edx
+    mov     edx, eax
+    shr     edx, 17
+    xor     eax, edx
+    mov     edx, eax
+    shl     edx, 5
+    xor     eax, edx
+    mov     [rip + seed], eax
+    and     eax, 3                          ; ~1 in 4 alive
+    cmp     eax, 0
+    jne     ig_dead
+    mov     byte ptr [r8 + rcx], 1
+    jmp     ig_next
+ig_dead:
+    mov     byte ptr [r8 + rcx], 0
+ig_next:
+    inc     rcx
+    inc     r11
+    cmp     r11, 639
+    jb      ig_x
+    add     rcx, 2                          ; step over the two border columns
+    inc     r10
+    cmp     r10, 479
+    jb      ig_y
+    ret
+
+; ---- one generation: gcur -> gnext, B3/S23 ----
+step:
+    mov     r8, [rip + gcur]
+    mov     r9, [rip + gnext]
+    mov     r10, 1                          ; y
+    mov     rcx, 641                        ; p
+st_y:
+    mov     r11, 1                          ; x
+st_x:
+    movzx   eax, byte ptr [r8 + rcx - 641]  ; sum the 8 neighbours (W = 640)
+    movzx   edx, byte ptr [r8 + rcx - 640]
+    add     eax, edx
+    movzx   edx, byte ptr [r8 + rcx - 639]
+    add     eax, edx
+    movzx   edx, byte ptr [r8 + rcx - 1]
+    add     eax, edx
+    movzx   edx, byte ptr [r8 + rcx + 1]
+    add     eax, edx
+    movzx   edx, byte ptr [r8 + rcx + 639]
+    add     eax, edx
+    movzx   edx, byte ptr [r8 + rcx + 640]
+    add     eax, edx
+    movzx   edx, byte ptr [r8 + rcx + 641]
+    add     eax, edx
+    ; next = (n==3) | (n==2 & cur) — B3/S23
+    cmp     eax, 3
+    je      st_live
+    cmp     eax, 2
+    jne     st_dead
+    movzx   edx, byte ptr [r8 + rcx]        ; n==2 → survives iff currently live
+    jmp     st_put
+st_live:
+    mov     edx, 1
+    jmp     st_put
+st_dead:
+    xor     edx, edx
+st_put:
+    mov     byte ptr [r9 + rcx], dl
+    inc     rcx
+    inc     r11
+    cmp     r11, 639
+    jb      st_x
+    add     rcx, 2
+    inc     r10
+    cmp     r10, 479
+    jb      st_y
+    ret
+
+; ---- draw gcur into the framebuffer (live = pale, dead = dark) ----
+render:
+    mov     r8, [rip + gcur]
+    mov     r9, [rip + fb]
+    xor     rcx, rcx
+rn:
+    movzx   eax, byte ptr [r8 + rcx]
+    mov     edx, 0x00101018                 ; dead
+    test    eax, eax
+    jz      rn_put
+    mov     edx, 0x00E8FFE8                 ; live
+rn_put:
+    mov     [r9], edx
+    add     r9, 4
+    inc     rcx
+    cmp     rcx, 307200
+    jb      rn
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                         ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                          ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                        ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    step
+    mov     rax, [rip + gcur]               ; swap grids
+    mov     rdx, [rip + gnext]
+    mov     [rip + gcur], rdx
+    mov     [rip + gnext], rax
+    call    render
+    invoke  InvalidateRect, [rip + hwndSave], 0, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
