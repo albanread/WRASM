@@ -66,6 +66,10 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
     if let Some(md) = mnemonic_card(q) {
         return Ok(md);
     }
+    // `was` language constructs (proc/frame/…) — no db, just the convention.
+    if let Some(md) = was_card(q) {
+        return Ok(md);
+    }
     if let Some(md) = function_card(kb, q)? {
         return Ok(md);
     }
@@ -146,6 +150,40 @@ fn local_md(name: &str, kind: &str, exported: bool, lineno: usize, decl: &str, h
     format!(
         "# {name}  —  {kind}{exp}\n\nDefined at line {lineno} of this file:\n\n```was\n{}\n```\n\n{hint}\n\n*Your own symbol — winkb has no entry for it.*\n",
         decl.trim_start()
+    )
+}
+
+/// Documentation for a `was` language construct (currently the `proc`/`frame`
+/// subroutine convention). Reached by a caret on the keyword or a search for it.
+/// `None` if `name` isn't a documented construct.
+pub fn was_card(name: &str) -> Option<String> {
+    let n = name.trim().trim_start_matches('.').to_ascii_lowercase();
+    if !matches!(
+        n.as_str(),
+        "proc" | "endproc" | "frame" | "uses" | "ret" | "return" | "subroutine" | "prologue" | "epilogue"
+    ) {
+        return None;
+    }
+    Some(
+        "# proc … endproc  —  a checked subroutine\n\n\
+A declared subroutine: the prologue and epilogue are generated as **visible** \
+`push`/`pop`, and the body is checked against the contract. Nothing hidden.\n\n\
+```was\n\
+proc NAME  uses rbx rsi  in rcx rdx  out rax  frame\n\
+    … body …\n\
+endproc\n\
+```\n\n\
+| clause | meaning |\n\
+|---|---|\n\
+| `uses R…` | Callee-saved registers the body clobbers — pushed in the prologue, popped at `endproc`/`ret`. The contract check **errors** if the body writes any *other* callee-saved register (you'd silently destroy the caller's value). |\n\
+| `in R…` | Input registers — documentation (drives the uninitialized-input check). |\n\
+| `out R…` | Result registers — documentation (drives the unset-output check). |\n\
+| `frame` | Reserve the 32-byte shadow space + outgoing-arg area **once** in the prologue (a single visible `sub rsp, K`, 16-aligned). Each `invoke`/`comcall` inside then drops its per-call alignment — just the arg moves and the `call`. |\n\n\
+- A bare `ret` inside a proc restores the saved registers first; **`.ret`** is the explicit early exit.\n\
+- A `proc` inside a `proc` is an error.\n\
+- Dual check, caller side: the **clobber** warning flags a value left in a volatile register (rcx/rdx/r8–r11) across a call that destroys it.\n\n\
+*Generated, but never hidden — the `push`/`pop` and the one-time `sub rsp, K` are real instructions in your listing and byte view.*\n"
+            .to_string(),
     )
 }
 
@@ -679,6 +717,21 @@ mod tests {
         assert!(md.contains("sizeof **16**"), "size:\n{md}");
         assert!(md.contains("`left`") && md.contains("`right`"), "fields:\n{md}");
         assert!(md.contains("| offset | field | type |"), "table:\n{md}");
+    }
+
+    #[test]
+    fn proc_doc_card_from_keyword_and_search() {
+        let md = was_card("proc").expect("proc");
+        assert!(md.contains("checked subroutine"), "title:\n{md}");
+        assert!(md.contains("`uses`") && md.contains("`frame`") && md.contains("contract check"));
+        // reachable from the related keywords (and a leading-dot directive) + a search term
+        for k in ["frame", "endproc", "uses", ".ret", "subroutine"] {
+            assert!(was_card(k).is_some(), "{k} should resolve");
+        }
+        assert!(was_card("mov").is_none());
+        // routes through answer() too — the search-box path
+        let Some(kb) = kb() else { return };
+        assert_eq!(answer(&kb, "proc").unwrap(), md);
     }
 
     #[test]
