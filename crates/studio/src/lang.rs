@@ -52,6 +52,10 @@ pub struct Diag {
     pub message: String,
 }
 
+/// One instruction in the lowered listing: its bytes, a per-byte "unresolved"
+/// mask (reloc placeholders the editor renders as `??`), and the asm text.
+pub type ListingRow = (Vec<u8>, Vec<bool>, String);
+
 /// A unit of work for the language thread. `id` correlates the reply.
 #[derive(Debug, Clone)]
 pub enum Request {
@@ -98,8 +102,8 @@ pub enum Response {
     /// The bytes a single line encodes to (empty if it isn't self-encodable,
     /// e.g. a label-only line or one that references an undefined label).
     LineBytes { id: u64, bytes: Vec<u8> },
-    /// Per source line, the `(bytes, asm)` of every instruction it lowers to.
-    Listing { id: u64, rows: Vec<Vec<(Vec<u8>, String)>> },
+    /// Per source line, each lowered instruction as a [`ListingRow`].
+    Listing { id: u64, rows: Vec<Vec<ListingRow>> },
     /// A request failed; `id` is the originating request's id.
     Error { id: u64, message: String },
 }
@@ -439,29 +443,75 @@ fn handle(kb: &Kb, req: Request) -> Response {
 }
 
 /// Lower the whole buffer once and group the result per source line: for each
-/// source line, the `(bytes, asm)` of every instruction it lowered to. Lowering
-/// the whole buffer (not each line alone) is what lets stateful constructs —
-/// `.while`/`.endw` and their matched labels — resolve. Each lowered instruction
-/// is then assembled on its own for its bytes; per-instruction isolation means an
-/// extern `call`/branch shows its reloc placeholder (`e8 00 00 00 00`), which is
-/// exactly what's emitted there. Blank and comment lines are dropped.
-fn buffer_listing(kb: &Kb, src: &str) -> Vec<Vec<(Vec<u8>, String)>> {
+/// source line, the `(bytes, unresolved, asm)` of every instruction it lowered
+/// to. Lowering the whole buffer (not each line alone) lets stateful constructs
+/// — `.while`/`.endw` and their matched labels — resolve, and assembling it whole
+/// gives *real* branch displacements (relaxed `rel8`/`rel32`, resolved offsets);
+/// only true externs stay as reloc placeholders, flagged for `??`. If the buffer
+/// can't assemble yet (mid-edit), fall back to per-instruction isolation.
+fn buffer_listing(kb: &Kb, src: &str) -> Vec<Vec<ListingRow>> {
     let n = src.lines().count();
-    let mut out: Vec<Vec<(Vec<u8>, String)>> = vec![Vec::new(); n];
-    let Ok((lowered, map)) = was::lower_mapped(src, kb) else {
+    let mut out = vec![Vec::new(); n];
+    let Ok((lowered, src_map)) = was::lower_mapped(src, kb) else {
         return out;
     };
+    let Ok((module, spans)) = rasm::assemble_listing(&lowered) else {
+        return isolated_listing(&lowered, &src_map, n);
+    };
+    let unresolved = reloc_mask(&module);
     for (i, line) in lowered.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() || t.starts_with(';') || t.starts_with('#') {
             continue;
         }
-        let Some(&src_line) = map.get(i) else { continue };
+        let Some(&src_line) = src_map.get(i) else { continue };
         if src_line == 0 || src_line > n {
             continue;
         }
-        let bytes = rasm::assemble(t).map(|m| m.code).unwrap_or_default();
-        out[src_line - 1].push((bytes, t.to_string()));
+        let (start, len) = spans.get(i).copied().unwrap_or((0, 0));
+        let end = (start + len).min(module.code.len());
+        let start = start.min(end);
+        out[src_line - 1].push((
+            module.code[start..end].to_vec(),
+            unresolved[start..end].to_vec(),
+            t.to_string(),
+        ));
+    }
+    out
+}
+
+/// A per-byte mask of `code`: true where a relocation covers the byte (an extern
+/// field whose value isn't known until link).
+fn reloc_mask(m: &rasm::EncodedModule) -> Vec<bool> {
+    let mut mask = vec![false; m.code.len()];
+    for r in &m.relocs {
+        let end = (r.at + r.size as usize).min(m.code.len());
+        for b in &mut mask[r.at.min(end)..end] {
+            *b = true;
+        }
+    }
+    mask
+}
+
+/// Per-instruction fallback for when the whole buffer can't assemble: each
+/// lowered instruction alone, with its reloc fields flagged unresolved (so a
+/// branch to a label outside this one line shows `??`, not a misleading `00`).
+fn isolated_listing(lowered: &str, src_map: &[usize], n: usize) -> Vec<Vec<ListingRow>> {
+    let mut out = vec![Vec::new(); n];
+    for (i, line) in lowered.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(';') || t.starts_with('#') {
+            continue;
+        }
+        let Some(&src_line) = src_map.get(i) else { continue };
+        if src_line == 0 || src_line > n {
+            continue;
+        }
+        let (bytes, mask) = match rasm::assemble(t) {
+            Ok(m) => (m.code.clone(), reloc_mask(&m)),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+        out[src_line - 1].push((bytes, mask, t.to_string()));
     }
     out
 }

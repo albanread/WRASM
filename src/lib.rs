@@ -22,4 +22,4 @@ pub mod rasm;
 pub use backend::{EncodedModule, Encoder, Reloc, RelocKind};
 pub use coff::write_coff;
 pub use pe::write_pe;
-pub use rasm::{assemble, is_register, looks_like_number, RasmEncoder};
+pub use rasm::{assemble, assemble_listing, is_register, looks_like_number, RasmEncoder};

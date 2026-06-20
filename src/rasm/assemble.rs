@@ -121,47 +121,63 @@ fn branch_for(mnemonic: &str, target: &str) -> Option<Branch> {
 
 /// Assemble a whole module's worth of text into an [`EncodedModule`].
 pub fn assemble(text: &str) -> Result<EncodedModule> {
-    // ── Pass 1: parse into items ────────────────────────────────────────────
+    Ok(assemble_listing(text)?.0)
+}
+
+/// Like [`assemble`], but also return a per-input-line byte span — `(start, len)`
+/// into the final `code` for each line of `text` (`len == 0` for labels,
+/// directives, blank lines). Additive: the encoding is identical; this only
+/// records where each line's bytes landed (after relaxation + label resolution),
+/// which is what a listing view needs to show real branch displacements.
+pub fn assemble_listing(text: &str) -> Result<(EncodedModule, Vec<(usize, usize)>)> {
+    // ── Pass 1: parse into items (tracking each item's source line) ─────────
     let mut items: Vec<Item> = Vec::new();
+    let mut item_line: Vec<usize> = Vec::new();
     for (lineno, raw) in text.lines().enumerate() {
+        let start = items.len();
         // MC allows `label: insn` / `label: .quad ...` on one line; peel any
         // leading label into its own Item, then parse the remainder.
         let clean = super::parse::strip_comment(raw);
         let (label, rest) = super::parse::split_leading_label(clean);
         if let Some(name) = label {
             items.push(Item::Label(name.to_string()));
-            if rest.is_empty() {
-                continue;
+        }
+        let label_only = label.is_some() && rest.is_empty();
+        if !label_only {
+            let body = if label.is_some() { rest } else { clean };
+            let line = parse_line(body).with_context(|| format!("line {}: `{raw}`", lineno + 1))?;
+            match line {
+                Line::Empty => {}
+                Line::Label(name) => items.push(Item::Label(name)),
+                Line::Directive(d) => push_directive(&mut items, d)?,
+                Line::Insn { mnemonic, ops } => {
+                    // Relaxable branch/call to a symbol?
+                    let branch = match ops.as_slice() {
+                        [Operand::Sym(target)] => branch_for(&mnemonic, target),
+                        _ => None,
+                    };
+                    if let Some(br) = branch {
+                        items.push(Item::Branch(br));
+                    } else {
+                        let enc = encode(&mnemonic, &ops)
+                            .with_context(|| format!("line {}: encode `{raw}`", lineno + 1))?;
+                        let mut riprel = Vec::new();
+                        for f in &enc.fixups {
+                            match f.kind {
+                                FixupKind::RipRel32 => riprel.push((f.at, f.target.clone())),
+                                FixupKind::Rel32 => {
+                                    // A non-branch rel32 fixup shouldn't occur here.
+                                    bail!("line {}: unexpected branch fixup in `{raw}`", lineno + 1);
+                                }
+                            }
+                        }
+                        items.push(Item::Code { bytes: enc.bytes, riprel });
+                    }
+                }
             }
         }
-        let body = if label.is_some() { rest } else { clean };
-        let line = parse_line(body).with_context(|| format!("line {}: `{raw}`", lineno + 1))?;
-        match line {
-            Line::Empty => {}
-            Line::Label(name) => items.push(Item::Label(name)),
-            Line::Directive(d) => push_directive(&mut items, d)?,
-            Line::Insn { mnemonic, ops } => {
-                // Relaxable branch/call to a symbol?
-                if let [Operand::Sym(target)] = ops.as_slice() {
-                    if let Some(br) = branch_for(&mnemonic, target) {
-                        items.push(Item::Branch(br));
-                        continue;
-                    }
-                }
-                let enc = encode(&mnemonic, &ops)
-                    .with_context(|| format!("line {}: encode `{raw}`", lineno + 1))?;
-                let mut riprel = Vec::new();
-                for f in &enc.fixups {
-                    match f.kind {
-                        FixupKind::RipRel32 => riprel.push((f.at, f.target.clone())),
-                        FixupKind::Rel32 => {
-                            // A non-branch rel32 fixup shouldn't occur here.
-                            bail!("line {}: unexpected branch fixup in `{raw}`", lineno + 1);
-                        }
-                    }
-                }
-                items.push(Item::Code { bytes: enc.bytes, riprel });
-            }
+        for _ in start..items.len() {
+            item_line.push(lineno);
         }
     }
 
@@ -204,11 +220,15 @@ pub fn assemble(text: &str) -> Result<EncodedModule> {
     let mut externs: Vec<String> = Vec::new();
     let mut globls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    let nlines = text.lines().count();
+    let mut spans: Vec<Option<(usize, usize)>> = vec![None; nlines];
     let mut idx = 0usize;
     for it in &items {
         let off = offsets[idx];
+        let line = item_line[idx];
         idx += 1;
         debug_assert_eq!(off, code.len());
+        let s = code.len();
         match it {
             Item::Label(n) => {
                 symbols.insert(n.clone(), code.len());
@@ -261,6 +281,12 @@ pub fn assemble(text: &str) -> Result<EncodedModule> {
                 let _ = base;
             }
         }
+        let e = code.len();
+        if e > s {
+            let span = spans[line].get_or_insert((s, e));
+            span.0 = span.0.min(s);
+            span.1 = span.1.max(e);
+        }
     }
 
     // Only export symbols that were .globl'd (others are module-local labels).
@@ -268,7 +294,11 @@ pub fn assemble(text: &str) -> Result<EncodedModule> {
     externs.sort();
     externs.dedup();
 
-    Ok(EncodedModule { code, symbols, relocs, externs })
+    let listing = spans
+        .into_iter()
+        .map(|o| o.map_or((0, 0), |(s, e)| (s, e - s)))
+        .collect();
+    Ok((EncodedModule { code, symbols, relocs, externs }, listing))
 }
 
 /// Compute the byte offset of each item and the offset of every label.
@@ -397,5 +427,31 @@ ret
         assert_eq!(m.relocs.len(), 1);
         assert_eq!(m.relocs[0].kind, RelocKind::RipRel32);
         assert_eq!(m.relocs[0].target, "rt_emit");
+    }
+
+    #[test]
+    fn listing_spans_map_lines_to_bytes() {
+        let src = ".text\n.globl w\nw:\nmov rax, rcx\nret\n";
+        let (m, spans) = assemble_listing(src).unwrap();
+        assert_eq!(m.code, assemble(src).unwrap().code, "same bytes as assemble()");
+        assert_eq!(spans.len(), src.lines().count(), "one span per input line");
+        // Directive/label lines contribute no bytes.
+        assert_eq!((spans[0], spans[1], spans[2]), ((0, 0), (0, 0), (0, 0)));
+        // `mov rax, rcx` is 3 bytes at offset 0; `ret` is 1 byte right after.
+        assert_eq!(spans[3], (0, 3));
+        assert_eq!(spans[4], (3, 1));
+    }
+
+    #[test]
+    fn listing_resolves_internal_branch_displacement() {
+        // A short forward jcc to a local label: the listed bytes carry the real
+        // rel8 displacement, not a zero placeholder.
+        let src = ".globl w\nw:\ntest rax, rax\njz done\nnop\ndone:\nret\n";
+        let (m, spans) = assemble_listing(src).unwrap();
+        let (s, len) = spans[3]; // `jz done`
+        assert_eq!(len, 2, "short jz is `74 disp8`: {spans:?}");
+        assert_eq!(m.code[s], 0x74, "short jz opcode");
+        assert_eq!(m.code[s + 1], 0x01, "disp8 jumps over the 1-byte nop");
+        assert!(m.relocs.is_empty(), "all-internal module has no relocs");
     }
 }

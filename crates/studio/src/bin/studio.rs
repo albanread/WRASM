@@ -77,7 +77,7 @@ mod gui {
 
     use studio::diagnostics;
     use studio::doc::Doc;
-    use studio::lang::{Diag, Emit, Lang, Response};
+    use studio::lang::{Diag, Emit, Lang, ListingRow, Response};
     use studio::syntax::TokKind;
 
     const CLASS: PCWSTR = w!("RasmStudioMain");
@@ -154,6 +154,23 @@ main:
         }
     }
 
+    /// Hex for a listing row, rendering reloc-placeholder bytes (extern fields,
+    /// resolved at link) as `??` instead of a misleading `00`.
+    fn hex_masked(bytes: &[u8], mask: &[bool]) -> String {
+        bytes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if mask.get(i).copied().unwrap_or(false) {
+                    "??".to_string()
+                } else {
+                    format!("{b:02x}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     struct App {
         hwnd: HWND,
         dpi: u32,
@@ -164,9 +181,9 @@ main:
         lang: Option<Lang>,
         doc: Doc,
         diags: Vec<Diag>,
-        /// The lowered listing per source line — `(bytes, asm)` for each expanded
-        /// instruction (re-fetched on every edit).
-        line_listing: Vec<Vec<(Vec<u8>, String)>>,
+        /// The lowered listing per source line — a [`ListingRow`] for each
+        /// expanded instruction (re-fetched on every edit).
+        line_listing: Vec<Vec<ListingRow>>,
         /// A short status line for the output pane (build result, snapshot path…).
         notice: String,
         /// Vertical scroll of the editor pane, in DIPs (0 = top).
@@ -221,8 +238,9 @@ main:
                 last_mouse: (0.0, 0.0),
                 revealed: false,
             };
-            // Land the caret on `WriteFile` so the first card is a real one.
-            app.doc.set_caret(14, 9);
+            // Land the caret on `GetStdHandle` (a real card) just below the loop,
+            // so the resolved-branch listing is in view on startup.
+            app.doc.set_caret(11, 9);
             app.after_edit();
             app
         }
@@ -270,7 +288,7 @@ main:
         }
 
         /// The lowered instruction rows for source `row` (empty for a blank line).
-        fn listing(&self, row: usize) -> &[(Vec<u8>, String)] {
+        fn listing(&self, row: usize) -> &[ListingRow] {
             self.line_listing.get(row).map(Vec::as_slice).unwrap_or(&[])
         }
 
@@ -551,11 +569,11 @@ main:
 
                 // A non-macro line shows its bytes in the margin beside the source.
                 if !macro_row {
-                    if let Some((bytes, _)) = self.listing(row).first() {
+                    if let Some((bytes, mask, _)) = self.listing(row).first() {
                         if !bytes.is_empty() {
                             render::draw_text(
                                 t, LN_W + 6.0, sy, BYTES_W - 10.0, LINE_H,
-                                &studio::bytes::hex(bytes), EDITOR_FONT, BYTE_SIZE, false, false,
+                                &hex_masked(bytes, mask), EDITOR_FONT, BYTE_SIZE, false, false,
                                 BYTE_COLOR, false,
                             );
                         }
@@ -584,7 +602,7 @@ main:
 
                 // Macro expansion: gray ghost rows of `bytes : asm` beneath.
                 if macro_row {
-                    for (i, (bytes, asm)) in self.listing(row).iter().enumerate() {
+                    for (i, (bytes, mask, asm)) in self.listing(row).iter().enumerate() {
                         let gy = sy + (i as f32 + 1.0) * LINE_H;
                         if gy + LINE_H < 0.0 {
                             continue;
@@ -593,7 +611,7 @@ main:
                             break;
                         }
                         render::draw_text(
-                            t, LN_W + 6.0, gy, BYTES_W - 10.0, LINE_H, &studio::bytes::hex(bytes),
+                            t, LN_W + 6.0, gy, BYTES_W - 10.0, LINE_H, &hex_masked(bytes, mask),
                             EDITOR_FONT, BYTE_SIZE, false, false, BYTE_COLOR, false,
                         );
                         render::draw_text(
@@ -621,8 +639,8 @@ main:
             render::fill_rect(t, 0.0, top, w, vh - top, theme::CODE_BG);
             render::fill_rect(t, 0.0, top, w, 1.0, theme::BORDER);
             let pad = 12.0;
-            let bytes: usize = self.line_listing.iter().flatten().map(|(b, _)| b.len()).sum();
-            let insns = self.line_listing.iter().flatten().filter(|(b, _)| !b.is_empty()).count();
+            let bytes: usize = self.line_listing.iter().flatten().map(|(b, _, _)| b.len()).sum();
+            let insns = self.line_listing.iter().flatten().filter(|(b, _, _)| !b.is_empty()).count();
             render::draw_text(
                 t, pad, top + 8.0, w - 2.0 * pad, 16.0,
                 &format!("OUTPUT · {} lines · {insns} insns · {bytes} bytes", self.doc.line_count()),

@@ -12,7 +12,7 @@ pub mod assemble;
 pub mod encode;
 pub mod parse;
 
-pub use assemble::assemble;
+pub use assemble::{assemble, assemble_listing};
 pub use encode::{encode, Encoded, Fixup, FixupKind};
 pub use parse::{
     is_register, looks_like_number, Directive, Line, Mem, MemSize, Operand, Reg, RegClass,
