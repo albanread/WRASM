@@ -1,5 +1,9 @@
 # WRASM
 
+### Powerful assistance that conceals nothing
+
+![The WRASM studio — hand-written asm with its live machine-code bytes on the left, the WNDCLASSEXW struct card (offsets, field types, ready-to-insert frame) on the right](selfie.png)
+
 A from-scratch, self-contained **x86-64 assembler for Windows** — and the
 knowledge-driven IDE growing around it. No LLVM, no JIT, no external linker:
 source text goes in, a running `.exe` comes out.
