@@ -112,19 +112,32 @@ mod gui {
     const STARTER: &str = "\
 .globl main
 main:
-  sub rsp, 64               ; a 26-byte buffer + scratch on the stack
+  sub rsp, 64               ; a buffer + scratch on the stack
   lea rdi, [rsp + 32]       ; rdi = &buffer  (survives the calls below)
   xor rcx, rcx              ; rcx = index
-  mov al, 'a'
-  .while al <= 'z'
-    mov [rdi + rcx], al     ; buffer[i] = letter
-    inc al
+
+  mov al, '0'               ; digits 0..9 with repeat / until
+  .repeat
+    mov [rdi + rcx], al
     inc rcx
+    inc al
+  .until al > '9'
+
+  mov al, 'a'               ; letters a.., stopping at 'f' with if / break
+  .while al <= 'z'
+    .if al == 'f'
+      .break
+    .endif
+    mov [rdi + rcx], al
+    inc rcx
+    inc al
   .endw
+
+  mov r13, rcx              ; the byte count (saved before invoke clobbers rcx)
   invoke GetStdHandle, -11  ; STD_OUTPUT_HANDLE -> rax
-  mov rsi, rax              ; rsi = stdout (survives the call)
+  mov rsi, rax              ; rsi = stdout
   lea r12, [rsp + 24]       ; r12 = &bytesWritten
-  invoke WriteFile, rsi, rdi, 26, r12, 0
+  invoke WriteFile, rsi, rdi, r13, r12, 0
   invoke ExitProcess, 0
 ";
 
@@ -238,9 +251,9 @@ main:
                 last_mouse: (0.0, 0.0),
                 revealed: false,
             };
-            // Land the caret on `GetStdHandle` (a real card) just below the loop,
-            // so the resolved-branch listing is in view on startup.
-            app.doc.set_caret(11, 9);
+            // Open on the first high-level construct, so the expansion listing
+            // (repeat/until, then while/if/break) is in view on startup.
+            app.doc.set_caret(7, 2);
             app.after_edit();
             app
         }

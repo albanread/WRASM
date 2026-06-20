@@ -203,10 +203,10 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     let labels = collect_labels(src);
     let mut out = String::new();
     let mut map: Vec<usize> = Vec::new();
-    // High-level loop state: a counter for unique labels, and a stack matching
-    // each `.endw` to its `.while` so loops can nest.
-    let mut loop_ctr = 0usize;
-    let mut loop_stack: Vec<usize> = Vec::new();
+    // High-level block state: a counter for unique labels, and a stack so each
+    // `.endX` matches its opener and `.break`/`.continue` find the inner loop.
+    let mut block_ctr = 0usize;
+    let mut block_stack: Vec<Block> = Vec::new();
     for (i, raw) in src.lines().enumerate() {
         let src_line = i + 1;
         let start = out.len();
@@ -219,20 +219,94 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             let expanded = expand_invoke(rest, kb, &labels)
                 .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
             out.push_str(&expanded);
+        } else if let Some(cond) = strip_keyword(t, ".if") {
+            // `.if c` → test c; on false skip to the next clause.
+            let id = block_ctr;
+            block_ctr += 1;
+            block_stack.push(Block::If { id, next: 1, else_seen: false });
+            out.push_str(
+                &cond_test(cond, &format!("__if{id}_1"), kb, &labels)
+                    .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
+            );
+        } else if let Some(cond) = strip_keyword(t, ".elseif") {
+            // End the previous clause's body, land its skip, then test this one.
+            let (id, cur) = match block_stack.last_mut() {
+                Some(Block::If { id, next, else_seen }) if !*else_seen => {
+                    let r = (*id, *next);
+                    *next += 1;
+                    r
+                }
+                _ => bail!("line {src_line}: `.elseif` without an open `.if`"),
+            };
+            out.push_str(&format!("  jmp __if{id}_end\n__if{id}_{cur}:\n"));
+            out.push_str(
+                &cond_test(cond, &format!("__if{id}_{}", cur + 1), kb, &labels)
+                    .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
+            );
+        } else if t == ".else" {
+            let (id, cur) = match block_stack.last_mut() {
+                Some(Block::If { id, next, else_seen }) if !*else_seen => {
+                    *else_seen = true;
+                    (*id, *next)
+                }
+                _ => bail!("line {src_line}: `.else` without an open `.if`"),
+            };
+            out.push_str(&format!("  jmp __if{id}_end\n__if{id}_{cur}:\n"));
+        } else if t == ".endif" {
+            match block_stack.pop() {
+                // No `.else`: the last clause's skip lands here, which is the end.
+                Some(Block::If { id, next, else_seen: false }) => {
+                    out.push_str(&format!("__if{id}_{next}:\n__if{id}_end:\n"))
+                }
+                Some(Block::If { id, else_seen: true, .. }) => {
+                    out.push_str(&format!("__if{id}_end:\n"))
+                }
+                _ => bail!("line {src_line}: `.endif` without an open `.if`"),
+            }
         } else if let Some(cond) = strip_keyword(t, ".while") {
-            // `.while reg <relop> val` → top label, the test, and the exit branch.
-            let id = loop_ctr;
-            loop_ctr += 1;
-            loop_stack.push(id);
-            let expanded = expand_while(cond, id, kb, &labels)
-                .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
-            out.push_str(&expanded);
+            // `.while c` → top label, the test, and the exit branch.
+            let id = block_ctr;
+            block_ctr += 1;
+            block_stack.push(Block::While { id });
+            out.push_str(&format!("__while{id}_top:\n"));
+            out.push_str(
+                &cond_test(cond, &format!("__while{id}_end"), kb, &labels)
+                    .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
+            );
         } else if t == ".endw" {
-            // `.endw` → jump back to the matching top, then the exit label.
-            let id = loop_stack
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("line {src_line}: `.endw` without a `.while`"))?;
-            out.push_str(&expand_endw(id));
+            match block_stack.pop() {
+                Some(Block::While { id }) => {
+                    out.push_str(&format!("  jmp __while{id}_top\n__while{id}_end:\n"))
+                }
+                _ => bail!("line {src_line}: `.endw` without an open `.while`"),
+            }
+        } else if t == ".repeat" {
+            // `.repeat` … `.until c` → run the body, then loop back while c false.
+            let id = block_ctr;
+            block_ctr += 1;
+            block_stack.push(Block::Repeat { id });
+            out.push_str(&format!("__repeat{id}_top:\n"));
+        } else if let Some(cond) = strip_keyword(t, ".until") {
+            match block_stack.pop() {
+                Some(Block::Repeat { id }) => {
+                    out.push_str(&format!("__repeat{id}_test:\n"));
+                    out.push_str(
+                        &cond_test(cond, &format!("__repeat{id}_top"), kb, &labels)
+                            .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
+                    );
+                    out.push_str(&format!("__repeat{id}_end:\n"));
+                }
+                _ => bail!("line {src_line}: `.until` without an open `.repeat`"),
+            }
+        } else if t == ".break" || t == ".continue" {
+            // Jump out of / back into the innermost enclosing loop.
+            let (cont, brk) = block_stack
+                .iter()
+                .rev()
+                .find_map(Block::loop_targets)
+                .ok_or_else(|| anyhow::anyhow!("line {src_line}: `{t}` outside a loop"))?;
+            let target = if t == ".break" { brk } else { cont };
+            out.push_str(&format!("  jmp {target}\n"));
         } else if t.starts_with('.') {
             // Directives pass through untouched.
             out.push_str(body);
@@ -253,10 +327,33 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     Ok((out, map))
 }
 
-/// The conditional branch that *exits* a `.while` — taken when the loop
-/// condition is false. Unsigned (`ja`/`jb`/…), the right choice for the counters
-/// and characters these loops iterate.
-fn while_exit_branch(relop: &str) -> Option<&'static str> {
+/// An open high-level block during lowering. `If` tracks its next clause-label
+/// number and whether an `.else` has been seen; loops carry only their id (their
+/// labels are derived from it). The stack lets each `.endX` match its opener and
+/// `.break`/`.continue` find the innermost enclosing loop.
+enum Block {
+    If { id: usize, next: usize, else_seen: bool },
+    While { id: usize },
+    Repeat { id: usize },
+}
+
+impl Block {
+    /// `(continue_target, break_target)` if this block is a loop. `.continue`
+    /// jumps to the test (re-evaluating it); `.break` jumps past the loop.
+    fn loop_targets(&self) -> Option<(String, String)> {
+        match self {
+            Block::While { id } => Some((format!("__while{id}_top"), format!("__while{id}_end"))),
+            Block::Repeat { id } => Some((format!("__repeat{id}_test"), format!("__repeat{id}_end"))),
+            Block::If { .. } => None,
+        }
+    }
+}
+
+/// The branch taken when a `reg <relop> val` condition is *false* — used to skip
+/// a clause (`.if`/`.elseif`), leave a loop (`.while`), or repeat one (`.until`).
+/// Unsigned (`ja`/`jb`/…), the right choice for the counters and characters these
+/// constructs iterate.
+fn cond_false_branch(relop: &str) -> Option<&'static str> {
     Some(match relop {
         "<=" => "ja",
         "<" => "jae",
@@ -268,7 +365,7 @@ fn while_exit_branch(relop: &str) -> Option<&'static str> {
     })
 }
 
-/// Split a `.while` condition into `(lhs, relop, rhs)`; two-char operators first.
+/// Split a condition into `(lhs, relop, rhs)`; two-char operators first.
 fn split_condition(cond: &str) -> Option<(&str, &str, &str)> {
     for op in ["<=", ">=", "==", "!="] {
         if let Some(p) = cond.find(op) {
@@ -283,24 +380,17 @@ fn split_condition(cond: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
-/// Expand `.while reg <relop> val` to its top label, the comparison, and the
-/// branch that leaves the loop. Operands resolve like any instruction's, so a
-/// constant or `'z'` works as the bound.
-fn expand_while(cond: &str, id: usize, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+/// Lower `reg <relop> val` to `cmp reg, val` plus the false-branch to `target`.
+/// Shared by `.if`/`.elseif`, `.while`, and `.until`. Operands resolve like any
+/// instruction's, so a constant or `'z'` works as the bound.
+fn cond_test(cond: &str, target: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
     let (lhs, relop, rhs) = split_condition(cond)
-        .ok_or_else(|| anyhow::anyhow!("`.while` wants `reg <relop> value`, got `{cond}`"))?;
-    let branch = while_exit_branch(relop)
-        .ok_or_else(|| anyhow::anyhow!("`.while`: unknown operator `{relop}`"))?;
+        .ok_or_else(|| anyhow::anyhow!("condition wants `reg <relop> value`, got `{cond}`"))?;
+    let branch = cond_false_branch(relop)
+        .ok_or_else(|| anyhow::anyhow!("unknown relational operator `{relop}`"))?;
     let lhs = resolve_operands(lhs.trim(), kb, labels)?;
     let rhs = resolve_operands(rhs.trim(), kb, labels)?;
-    Ok(format!(
-        "__while{id}_top:\n  cmp {lhs}, {rhs}\n  {branch} __while{id}_end\n"
-    ))
-}
-
-/// Expand `.endw` to the back-jump to the loop top and the exit label.
-fn expand_endw(id: usize) -> String {
-    format!("  jmp __while{id}_top\n__while{id}_end:\n")
+    Ok(format!("  cmp {lhs}, {rhs}\n  {branch} {target}\n"))
 }
 
 /// Collect labels defined in this source so we never resolve them as constants.
@@ -663,14 +753,14 @@ mod tests {
     }
 
     #[test]
-    fn while_condition_parsing() {
+    fn condition_parsing_and_branches() {
         assert_eq!(split_condition("al <= 'z'"), Some(("al ", "<=", " 'z'")));
         assert_eq!(split_condition("rcx < 26"), Some(("rcx ", "<", " 26")));
         assert_eq!(split_condition("al != 0"), Some(("al ", "!=", " 0")));
         assert!(split_condition("al z").is_none());
-        assert_eq!(while_exit_branch("<="), Some("ja"));
-        assert_eq!(while_exit_branch(">"), Some("jbe"));
-        assert!(while_exit_branch("~~").is_none());
+        assert_eq!(cond_false_branch("<="), Some("ja"));
+        assert_eq!(cond_false_branch(">"), Some("jbe"));
+        assert!(cond_false_branch("~~").is_none());
     }
 
     #[test]
@@ -685,9 +775,46 @@ mod tests {
     }
 
     #[test]
-    fn endw_without_while_is_an_error() {
+    fn if_elseif_else_lowers_and_assembles() {
         let Some(kb) = kb() else { return };
-        let err = lower("main:\n  .endw\n", &kb).unwrap_err();
-        assert!(format!("{err:#}").contains(".endw"), "{err:#}");
+        let src = ".globl main\nmain:\n  mov al, 5\n  .if al == 1\n    mov bl, 10\n  .elseif al == 5\n    mov bl, 20\n  .else\n    mov bl, 30\n  .endif\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        for want in [
+            "cmp al, 1", "jne __if0_1", "__if0_1:", "cmp al, 5", "jne __if0_2", "__if0_2:",
+            "jmp __if0_end", "__if0_end:",
+        ] {
+            assert!(low.contains(want), "if-expansion missing {want:?}:\n{low}");
+        }
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn repeat_until_lowers_and_assembles() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  xor cl, cl\n  .repeat\n    inc cl\n  .until cl == 10\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        for want in ["__repeat0_top:", "__repeat0_test:", "cmp cl, 10", "jne __repeat0_top", "__repeat0_end:"] {
+            assert!(low.contains(want), "repeat-expansion missing {want:?}:\n{low}");
+        }
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn break_targets_the_inner_loop_through_an_if() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  mov al, 'a'\n  .while al <= 'z'\n    .if al == 'm'\n      .break\n    .endif\n    inc al\n  .endw\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        // `.break` inside the `.if` inside the `.while` jumps to the while's end.
+        assert!(low.contains("jmp __while0_end"), "break -> loop end:\n{low}");
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn mismatched_block_closers_error() {
+        let Some(kb) = kb() else { return };
+        assert!(lower("main:\n  .if al == 1\n  .endw\n", &kb).is_err(), ".endw must not close .if");
+        assert!(lower("main:\n  .endif\n", &kb).is_err(), ".endif without .if");
+        assert!(lower("main:\n  .break\n", &kb).is_err(), ".break outside a loop");
+        assert!(lower("main:\n  .until al == 1\n", &kb).is_err(), ".until without .repeat");
     }
 }
