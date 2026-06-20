@@ -64,12 +64,11 @@ mod gui {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
-        GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
-        ShowWindow, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG,
-        SW_SHOW, WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSEXW,
-        WNDCLASS_STYLES,
-        WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassExW, SetTimer,
+        SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA,
+        IDC_ARROW, MSG, SW_SHOW, WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
+        WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SIZE,
+        WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     use docpane::layout::Layout;
@@ -213,6 +212,12 @@ main:
         card_laid_w: f32,
         card_scroll: f32,
         card_max_scroll: f32,
+
+        /// Ids of the latest async per-keystroke requests; a reply is applied only
+        /// if it still matches (superseded replies are dropped).
+        pending_check: u64,
+        pending_listing: u64,
+        pending_card: u64,
     }
 
     impl App {
@@ -248,11 +253,14 @@ main:
                 editor_scroll: 0.0,
                 last_mouse: (0.0, 0.0),
                 revealed: false,
+                pending_check: 0,
+                pending_listing: 0,
+                pending_card: 0,
             };
             // Open on the macro definition — it generates no code (empty margin),
             // with the loop and the macro's expansion in the listing below.
             app.doc.set_caret(2, 2);
-            app.after_edit();
+            app.seed();
             app
         }
 
@@ -270,32 +278,75 @@ main:
 
         // ── language-thread refresh (synchronous; sub-ms on a small buffer) ──
 
-        /// After a text edit: re-check the buffer and re-fetch the per-line bytes,
-        /// then update the caret-driven card.
+        /// After a text edit: (re)request a check and the per-line listing
+        /// asynchronously, then update the caret-driven card. Replies arrive on
+        /// the poll timer; superseded ones are dropped by id.
         fn after_edit(&mut self) {
             if let Some(lang) = self.lang.as_ref() {
-                if let Some(Response::Check { diags, .. }) = lang.check_src(&self.doc.text()) {
-                    self.diags = diags;
-                }
+                let text = self.doc.text();
+                self.pending_check = lang.post_check(&text);
+                self.pending_listing = lang.post_listing(&text);
             }
-            self.line_listing = self
-                .lang
-                .as_ref()
-                .and_then(|l| match l.listing(&self.doc.text()) {
-                    Some(Response::Listing { rows, .. }) => Some(rows),
-                    _ => None,
-                })
-                .unwrap_or_default();
             self.after_caret();
         }
 
-        /// After a caret move (no text change): refresh the card and keep the
-        /// caret on screen.
+        /// After a caret move (no text change): request the card for the symbol
+        /// under the caret (async) and keep the caret on screen.
         fn after_caret(&mut self) {
+            if !self.search_active {
+                if let Some(word) = lang_word(&self.doc) {
+                    if word != self.card_word {
+                        if let Some(lang) = self.lang.as_ref() {
+                            self.pending_card = lang.post_card(&word);
+                        }
+                        self.card_word = word; // tentative; the reply fills card_md
+                    }
+                }
+            }
+            self.ensure_caret_visible();
+        }
+
+        /// Synchronous one-time population for the first paint (before the poll
+        /// timer runs); all runtime updates go through the async path above.
+        fn seed(&mut self) {
+            if let Some(lang) = self.lang.as_ref() {
+                let text = self.doc.text();
+                if let Some(Response::Check { diags, .. }) = lang.check_src(&text) {
+                    self.diags = diags;
+                }
+                if let Some(Response::Listing { rows, .. }) = lang.listing(&text) {
+                    self.line_listing = rows;
+                }
+            }
             if !self.search_active {
                 self.refresh_card(lang_word(&self.doc));
             }
             self.ensure_caret_visible();
+        }
+
+        /// Drain the language thread's replies, applying only those that still
+        /// match the latest request id (the rest are superseded). Runs each
+        /// poll-timer tick — the GUI thread never blocks on the worker.
+        fn poll_lang(&mut self) {
+            while let Some(resp) = self.lang.as_ref().and_then(Lang::poll) {
+                match resp {
+                    Response::Check { id, diags } if id == self.pending_check => {
+                        self.diags = diags;
+                        self.invalidate();
+                    }
+                    Response::Listing { id, rows } if id == self.pending_listing => {
+                        self.line_listing = rows;
+                        self.invalidate();
+                    }
+                    Response::Card { id, markdown } if id == self.pending_card => {
+                        self.card_md = markdown;
+                        self.card_layout = None;
+                        self.card_scroll = 0.0;
+                        self.invalidate();
+                    }
+                    _ => {} // a superseded reply, or one for a sync call() already taken
+                }
+            }
         }
 
         /// The lowered instruction rows for source `row` (empty for a blank line).
@@ -1070,6 +1121,8 @@ main:
         }?;
 
         let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+        // Poll the language thread ~30×/s to apply async replies.
+        let _ = unsafe { SetTimer(Some(hwnd), 1, 33, None) };
 
         let mut msg = MSG::default();
         unsafe {
@@ -1119,6 +1172,10 @@ main:
         let scale = app.dip_scale();
 
         match msg {
+            WM_TIMER => {
+                app.poll_lang();
+                LRESULT(0)
+            }
             WM_ERASEBKGND => LRESULT(1), // we paint the whole client in WM_PAINT
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();

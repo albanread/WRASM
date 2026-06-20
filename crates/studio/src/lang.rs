@@ -193,6 +193,11 @@ impl Lang {
         let _ = self.tx.send(Request::Check { id, src: src.to_string() });
         id
     }
+    pub fn post_listing(&self, src: &str) -> u64 {
+        let id = self.alloc();
+        let _ = self.tx.send(Request::Listing { id, src: src.to_string() });
+        id
+    }
     pub fn post_assemble(&self, src: &str, emit: Emit) -> u64 {
         let id = self.alloc();
         let _ = self.tx.send(Request::Assemble { id, src: src.to_string(), emit });
