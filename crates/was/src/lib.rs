@@ -517,6 +517,10 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
             string_block_end = Some(".endwidestring");
             continue;
         }
+        // `.include` is expanded before checking; ignore an unexpanded one.
+        if include_path(raw).is_some() {
+            continue;
+        }
         if t.is_empty() {
             continue;
         }
@@ -1117,6 +1121,43 @@ fn fits_width(v: i64, width: usize) -> bool {
 }
 
 /// Lower `src` to rasm-ready Intel-syntax text.
+/// Expand `.include "file"` directives, splicing each referenced file in place
+/// (path relative to the including file's directory), recursively — so a large
+/// program can be composed from a font, a palette, a primitives library, etc.
+/// Call this on the raw text (with the main file's path) before `lower`/`check`.
+pub fn expand_includes(src: &str, from: &std::path::Path) -> Result<String> {
+    let dir = from.parent().unwrap_or_else(|| std::path::Path::new("."));
+    expand_includes_rec(src, dir, 0)
+}
+
+fn include_path(line: &str) -> Option<&str> {
+    let r = strip_keyword(strip_comment(line).trim(), ".include")?.trim();
+    r.strip_prefix('"').and_then(|x| x.strip_suffix('"'))
+}
+
+fn expand_includes_rec(src: &str, dir: &std::path::Path, depth: usize) -> Result<String> {
+    if depth > 32 {
+        bail!("`.include` nested too deeply (a cycle?)");
+    }
+    let mut out = String::new();
+    for line in src.lines() {
+        if let Some(path) = include_path(line) {
+            let full = dir.join(path);
+            let content = std::fs::read_to_string(&full)
+                .with_context(|| format!("`.include \"{path}\"`: cannot read {}", full.display()))?;
+            let sub = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.to_path_buf());
+            out.push_str(&expand_includes_rec(&content, &sub, depth + 1)?);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 pub fn lower(src: &str, kb: &Kb) -> Result<String> {
     Ok(lower_mapped(src, kb)?.0)
 }
@@ -1414,6 +1455,10 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
                 _ if t == ".ret" => bail!("line {src_line}: `.ret` outside a `proc`"),
                 _ => out.push_str("  ret\n"),
             }
+        } else if include_path(raw).is_some() {
+            // `.include` is expanded by `expand_includes()` before lowering; if one
+            // reaches here unexpanded (e.g. the live IDE check), treat it as a no-op.
+            out.push('\n');
         } else if t.starts_with('.') {
             // GAS directives (our high-level ones are handled above) pass through.
             out.push_str(body);

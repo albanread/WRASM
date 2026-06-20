@@ -74,6 +74,7 @@ fn run() -> anyhow::Result<()> {
     let kb = Kb::open(&db)?;
 
     let src = std::fs::read_to_string(&input)?;
+    let src = was::expand_includes(&src, std::path::Path::new(&input))?;
 
     if check {
         let diags = was::check(&src, &kb);
