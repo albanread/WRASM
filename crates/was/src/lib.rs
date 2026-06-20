@@ -58,93 +58,225 @@ fn nonvol_reg(s: &str) -> Option<&'static str> {
     })
 }
 
-/// The callee-saved register an instruction writes via its destination operand
-/// (operand 0), if any. Read-only forms (cmp/test/push/branches/mul/div) and
-/// memory destinations write no register.
-fn nonvol_writes(t: &str) -> Vec<&'static str> {
-    let (mn, rest) = match t.find(char::is_whitespace) {
-        Some(p) => (t[..p].to_ascii_lowercase(), t[p..].trim()),
-        None => (t.to_ascii_lowercase(), ""),
-    };
-    let read_only = mn.starts_with('j')
-        || matches!(
-            mn.as_str(),
-            "cmp" | "test" | "push" | "mul" | "div" | "idiv" | "call" | "ret" | "nop"
-                | "cdq" | "cqo" | "cwd"
-        );
-    if read_only {
-        return Vec::new();
-    }
-    let ops: Vec<String> = if rest.is_empty() { Vec::new() } else { split_top_commas(rest) };
-    ops.first()
-        .filter(|o| !o.contains('['))
-        .and_then(|o| nonvol_reg(o))
-        .into_iter()
-        .collect()
+/// A bare integer immediate (`42` / `0x10`), for tracking `sub rsp, N`.
+fn simple_imm(s: &str) -> Option<i64> {
+    let s = s.trim();
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .and_then(|h| i64::from_str_radix(h, 16).ok())
+        .or_else(|| s.parse::<i64>().ok())
 }
 
-/// Enforce the `proc … endproc` contract: the body may not modify a callee-saved
-/// register that isn't in the proc's `uses` list (and so wasn't saved by the
-/// prologue) — otherwise the caller's value is silently destroyed. The dual of
-/// the caller-side clobber check.
+/// A label line (`name:`) — a block boundary for the rsp-balance reset.
+fn is_label_line(t: &str) -> bool {
+    t.strip_suffix(':')
+        .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$'))
+}
+
+/// Any call (external or a plain `call <label>`) — where a framed proc's stack
+/// must sit at the aligned frame level.
+fn is_any_call(t: &str) -> bool {
+    let l = t.to_ascii_lowercase();
+    is_call_site(t) || l == "call" || l.starts_with("call ") || l.starts_with("call\t")
+}
+
+/// Enforce the `proc … endproc` contract — three checks, each the dual of the
+/// caller-side analysis:
+///   * **uses**: the body may not modify a callee-saved register outside `uses`
+///     (else the caller's value is silently lost);
+///   * **in/out**: a register read but never set and not declared `in` is an
+///     uninitialized input; an `out` register never written is an unkept promise;
+///   * **frame balance**: inside a `frame` proc the stack must be at the aligned
+///     frame level at every call — a stray `push`/`sub rsp` would break it.
 pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
+    struct Acc {
+        name: String,
+        line: usize,
+        saved: Vec<&'static str>,
+        ins: Vec<&'static str>,
+        outs: Vec<&'static str>,
+        reads: HashMap<&'static str, usize>, // reg → first-read line
+        writes: HashSet<&'static str>,
+        framed: bool,
+        rsp: Option<i64>, // offset from the post-prologue level; None = untrackable
+    }
     let mut diags = Vec::new();
-    let mut cur: Option<(String, Vec<&'static str>)> = None;
+    let mut cur: Option<Acc> = None;
     let mut in_code = true;
     for (i, raw) in src.lines().enumerate() {
+        let line = i + 1;
         let t = strip_comment(raw).trim();
         if t.is_empty() {
             continue;
         }
         match t.to_ascii_lowercase().as_str() {
-            ".data" => {
-                in_code = false;
-                continue;
-            }
-            ".code" | ".text" => {
-                in_code = true;
-                continue;
-            }
+            ".data" => in_code = false,
+            ".code" | ".text" => in_code = true,
             _ => {}
         }
         if !in_code {
             continue;
         }
+        let col = raw.len() - raw.trim_start().len() + 1;
         if let Some(rest) = strip_keyword(t, "proc") {
             let h = parse_proc(rest);
-            let saved: Vec<&'static str> = h.uses.iter().filter_map(|u| nonvol_reg(u)).collect();
-            cur = Some((h.name, saved));
+            cur = Some(Acc {
+                name: h.name,
+                line,
+                saved: h.uses.iter().filter_map(|u| nonvol_reg(u)).collect(),
+                ins: h.ins.iter().filter_map(|u| gp_reg(u)).collect(),
+                outs: h.outs.iter().filter_map(|u| gp_reg(u)).collect(),
+                reads: HashMap::new(),
+                writes: HashSet::new(),
+                framed: h.frame,
+                rsp: Some(0),
+            });
             continue;
         }
         if t == "endproc" {
-            cur = None;
-            continue;
-        }
-        if let Some((name, saved)) = &cur {
-            for w in nonvol_writes(t) {
-                if !saved.contains(&w) {
-                    let col = raw.len() - raw.trim_start().len() + 1;
+            if let Some(p) = cur.take() {
+                // in: read but never set, and not declared `in`/`uses` → uninitialized.
+                let mut undeclared: Vec<(&'static str, usize)> = p
+                    .reads
+                    .iter()
+                    .filter(|(r, _)| {
+                        **r != "rsp"
+                            && **r != "rbp"
+                            && !p.writes.contains(*r)
+                            && !p.ins.contains(*r)
+                            && !p.saved.contains(*r)
+                    })
+                    .map(|(r, l)| (*r, *l))
+                    .collect();
+                undeclared.sort();
+                for (r, l) in undeclared {
                     diags.push(Diag {
-                        line: i + 1,
-                        col,
+                        line: l,
+                        col: 1,
                         message: format!(
-                            "proc `{name}` modifies `{w}` (callee-saved) without saving it — add `{w}` to its `uses` list, or the caller's value is lost"
+                            "proc `{}` reads `{r}` but never sets it — declare `in {r}` if it's an input",
+                            p.name
                         ),
                     });
                 }
+                // out: declared but never written.
+                for o in &p.outs {
+                    if !p.writes.contains(o) {
+                        diags.push(Diag {
+                            line: p.line,
+                            col: 1,
+                            message: format!("proc `{}` declares `out {o}` but never sets it", p.name),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(p) = cur.as_mut() else { continue };
+
+        // A call (invoke/comcall/obj.Method/plain call) isn't a plain instruction
+        // — it clobbers the volatiles, returns in rax, and never touches a
+        // callee-saved register. Don't run the instruction analyzer on it; just
+        // record the rax result and, in a framed proc, check the stack is level.
+        if is_any_call(t) {
+            p.writes.insert("rax");
+            if p.framed {
+                if let Some(off) = p.rsp {
+                    if off != 0 {
+                        diags.push(Diag {
+                            line,
+                            col,
+                            message: format!(
+                                "rsp is off the frame level by {off} byte(s) at this call in framed proc `{}` — a stray push/sub broke the 16-byte alignment the frame guarantees",
+                                p.name
+                            ),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // uses: a callee-saved register modified outside the saved set.
+        for w in reg_effects(t, &nonvol_reg).1 {
+            if !p.saved.contains(&w) {
+                diags.push(Diag {
+                    line,
+                    col,
+                    message: format!(
+                        "proc `{}` modifies `{w}` (callee-saved) without saving it — add `{w}` to its `uses` list, or the caller's value is lost",
+                        p.name
+                    ),
+                });
+            }
+        }
+
+        // Accumulate reads/writes for the in/out checks.
+        let (reads, writes) = reg_effects(t, &gp_reg);
+        for r in reads {
+            p.reads.entry(r).or_insert(line);
+        }
+        for w in &writes {
+            p.writes.insert(w);
+        }
+
+        // frame balance: track rsp across the body's own stack moves.
+        if p.framed {
+            let mn = t.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            let ops: Vec<&str> = t
+                .split_once(char::is_whitespace)
+                .map_or(Vec::new(), |(_, r)| r.split(',').map(|s| s.trim()).collect());
+            if is_label_line(t) {
+                p.rsp = Some(0);
+            } else if mn == "push" {
+                p.rsp = p.rsp.map(|o| o - 8);
+            } else if mn == "pop" {
+                p.rsp = p.rsp.map(|o| o + 8);
+            } else if (mn == "sub" || mn == "add")
+                && ops.first().copied().and_then(gp_reg) == Some("rsp")
+            {
+                match ops.get(1).copied().and_then(simple_imm) {
+                    Some(n) => p.rsp = p.rsp.map(|o| o + if mn == "sub" { -n } else { n }),
+                    None => p.rsp = None, // `sub rsp, reg` — can't track
+                }
+            } else if writes.contains(&"rsp") {
+                p.rsp = None; // some other write to rsp — stop tracking, don't guess
             }
         }
     }
     diags
 }
 
+/// Any general register, canonicalized to its 64-bit name (eax→rax, r8d→r8).
+fn gp_reg(s: &str) -> Option<&'static str> {
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "rax" | "eax" | "ax" | "al" | "ah" => "rax",
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => "rbx",
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => "rcx",
+        "rdx" | "edx" | "dx" | "dl" | "dh" => "rdx",
+        "rsi" | "esi" | "si" | "sil" => "rsi",
+        "rdi" | "edi" | "di" | "dil" => "rdi",
+        "rbp" | "ebp" | "bp" | "bpl" => "rbp",
+        "rsp" | "esp" | "sp" | "spl" => "rsp",
+        "r8" | "r8d" | "r8w" | "r8b" => "r8",
+        "r9" | "r9d" | "r9w" | "r9b" => "r9",
+        "r10" | "r10d" | "r10w" | "r10b" => "r10",
+        "r11" | "r11d" | "r11w" | "r11b" => "r11",
+        "r12" | "r12d" | "r12w" | "r12b" => "r12",
+        "r13" | "r13d" | "r13w" | "r13b" => "r13",
+        "r14" | "r14d" | "r14w" | "r14b" => "r14",
+        "r15" | "r15d" | "r15w" | "r15b" => "r15",
+        _ => return None,
+    })
+}
+
 /// Registers named inside a `[ … ]` memory operand (all reads — they form the
-/// address).
-fn mem_regs(op: &str) -> Vec<&'static str> {
+/// address), keeping only those `canon` tracks.
+fn mem_regs<F: Fn(&str) -> Option<&'static str>>(op: &str, canon: &F) -> Vec<&'static str> {
     let mut v = Vec::new();
     if let (Some(a), Some(b)) = (op.find('['), op.rfind(']')) {
         for tok in op[a + 1..b].split(|c: char| !c.is_alphanumeric() && c != '_') {
-            if let Some(r) = clobber_reg(tok) {
+            if let Some(r) = canon(tok) {
                 v.push(r);
             }
         }
@@ -153,12 +285,12 @@ fn mem_regs(op: &str) -> Vec<&'static str> {
 }
 
 /// A bare register operand (not a `[mem]`, not an immediate), as a tracked reg.
-fn bare_clobber_reg(op: &str) -> Option<&'static str> {
+fn bare_reg<F: Fn(&str) -> Option<&'static str>>(op: &str, canon: &F) -> Option<&'static str> {
     let o = op.trim();
     if o.contains('[') {
         return None;
     }
-    clobber_reg(o)
+    canon(o)
 }
 
 /// `obj.Method( … )` shape — a typed COM call (also a call site).
@@ -186,9 +318,13 @@ fn is_call_site(t: &str) -> bool {
         || is_method_call_shape(t)
 }
 
-/// The tracked registers an instruction reads and writes (conservative — unknown
-/// mnemonics treat operand 0 as written so a clobber is cleared, never invented).
-fn reg_reads_writes(t: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+/// The registers (that `canon` tracks) an instruction reads and writes —
+/// conservative: unknown mnemonics treat operand 0 as written so a clobber is
+/// cleared, never invented.
+fn reg_effects<F: Fn(&str) -> Option<&'static str>>(
+    t: &str,
+    canon: &F,
+) -> (Vec<&'static str>, Vec<&'static str>) {
     let (mn, rest) = match t.find(char::is_whitespace) {
         Some(p) => (t[..p].to_ascii_lowercase(), t[p..].trim()),
         None => (t.to_ascii_lowercase(), ""),
@@ -196,18 +332,25 @@ fn reg_reads_writes(t: &str) -> (Vec<&'static str>, Vec<&'static str>) {
     let ops: Vec<String> = if rest.is_empty() { Vec::new() } else { split_top_commas(rest) };
     let mut reads = Vec::new();
     let mut writes = Vec::new();
+    let mut rd = |r: &str| canon(r);
     // Implicit rdx:rax operands.
     match mn.as_str() {
-        "cdq" | "cqo" | "cwd" => writes.push("rdx"),       // sign-extend rax → rdx
-        "mul" => writes.push("rdx"),                       // rdx:rax = rax * op
+        "cdq" | "cqo" | "cwd" => {
+            if let Some(r) = rd("rdx") { writes.push(r); }
+            if let Some(r) = rd("rax") { reads.push(r); }
+        }
+        "mul" => {
+            if let Some(r) = rd("rax") { reads.push(r); writes.push(r); }
+            if let Some(r) = rd("rdx") { writes.push(r); }
+        }
         "div" | "idiv" => {
-            reads.push("rdx"); // dividend high half
-            writes.push("rdx");
+            if let Some(r) = rd("rax") { reads.push(r); writes.push(r); }
+            if let Some(r) = rd("rdx") { reads.push(r); writes.push(r); }
         }
         _ => {}
     }
     for op in &ops {
-        reads.extend(mem_regs(op)); // address registers are always reads
+        reads.extend(mem_regs(op, canon)); // address registers are always reads
     }
     let pure_write = matches!(
         mn.as_str(),
@@ -219,20 +362,19 @@ fn reg_reads_writes(t: &str) -> (Vec<&'static str>, Vec<&'static str>) {
         "add" | "sub" | "and" | "or" | "xor" | "adc" | "sbb" | "shl" | "shr" | "sar" | "sal"
             | "rol" | "ror" | "rcl" | "rcr" | "inc" | "dec" | "neg" | "not" | "imul" | "xchg"
     );
-    // `cmp`/`test`/`push` read op0; `mul`/`div`/`idiv` read their (single) operand.
     let read_only_first = matches!(mn.as_str(), "cmp" | "test" | "push" | "mul" | "div" | "idiv");
-    // `xor r,r` / `sub r,r` zero the register — a pure write of both operands.
+    let branch = mn.starts_with('j') || mn == "call"; // op0 is a target → a read
     let zeroing = matches!(mn.as_str(), "xor" | "sub")
         && ops.len() == 2
-        && bare_clobber_reg(&ops[0]).is_some()
-        && bare_clobber_reg(&ops[0]) == bare_clobber_reg(&ops[1]);
-    if let Some(r0) = ops.first().and_then(|o| bare_clobber_reg(o)) {
-        if zeroing || pure_write {
+        && bare_reg(&ops[0], canon).is_some()
+        && bare_reg(&ops[0], canon) == bare_reg(&ops[1], canon);
+    if let Some(r0) = ops.first().and_then(|o| bare_reg(o, canon)) {
+        if branch || read_only_first {
+            reads.push(r0);
+        } else if zeroing || pure_write {
             writes.push(r0);
         } else if read_modify {
             writes.push(r0);
-            reads.push(r0);
-        } else if read_only_first {
             reads.push(r0);
         } else {
             writes.push(r0); // unknown: assume it defines op0 (avoids false positives)
@@ -240,7 +382,7 @@ fn reg_reads_writes(t: &str) -> (Vec<&'static str>, Vec<&'static str>) {
     }
     if !zeroing {
         for op in ops.iter().skip(1) {
-            if let Some(r) = bare_clobber_reg(op) {
+            if let Some(r) = bare_reg(op, canon) {
                 reads.push(r);
             }
         }
@@ -318,7 +460,7 @@ pub fn clobber_diags(src: &str) -> Vec<Diag> {
             }
         }
         if is_call_site(t) {
-            for r in reg_reads_writes(t).0 {
+            for r in reg_effects(t, &clobber_reg).0 {
                 if let Some(c) = clobbered[pos(r)] {
                     warn(&mut diags, line, r, c);
                 }
@@ -328,7 +470,7 @@ pub fn clobber_diags(src: &str) -> Vec<Diag> {
             continue;
         }
         let mn = t.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        let (reads, writes) = reg_reads_writes(t);
+        let (reads, writes) = reg_effects(t, &clobber_reg);
         for r in reads {
             if let Some(c) = clobbered[pos(r)] {
                 warn(&mut diags, line, r, c);
@@ -1020,7 +1162,6 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     let mut proc_frame: HashMap<usize, usize> = HashMap::new();
     {
         let mut start = None;
-        let mut pushes = 0;
         let mut framed = false;
         let mut max_args = 0;
         for (i, raw) in src.lines().enumerate() {
@@ -1028,13 +1169,12 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             if let Some(rest) = strip_keyword(t, "proc") {
                 let h = parse_proc(rest);
                 start = Some(i + 1);
-                pushes = h.uses.len();
                 framed = h.frame;
                 max_args = 0;
             } else if t == "endproc" {
                 if framed {
                     if let Some(s) = start {
-                        proc_frame.insert(s, proc_frame_size(pushes, max_args));
+                        proc_frame.insert(s, proc_frame_size(max_args));
                     }
                 }
                 start = None;
@@ -1250,6 +1390,9 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
                 out.push_str(&format!("  push {r}\n"));
             }
             if frame_size > 0 {
+                // Align the stack once with an rbp anchor, so the lean calls
+                // inside are correct no matter how the caller entered us.
+                out.push_str("  push rbp\n  mov rbp, rsp\n  and rsp, -16\n");
                 out.push_str(&format!("  sub rsp, {frame_size}\n"));
             }
             block_stack.push(Block::Proc { uses: h.uses, frame_size });
@@ -1381,20 +1524,20 @@ fn call_arg_count(t: &str) -> Option<usize> {
     None
 }
 
-/// The bytes a framed proc reserves: 32 (shadow) + the outgoing stack args, padded
-/// so that with `pushes` saved registers the stack is 16-aligned at every call.
-fn proc_frame_size(pushes: usize, max_args: usize) -> usize {
-    let base = 32 + max_args.saturating_sub(4) * 8;
-    let target = if pushes % 2 == 1 { 0 } else { 8 }; // (8 - 8*pushes) mod 16
-    if base % 16 == target { base } else { base + 8 }
+/// The bytes a framed proc reserves: 32 (shadow) + the outgoing stack args,
+/// rounded to 16. A framed proc aligns the stack itself (an `rbp` anchor +
+/// `and rsp,-16`), so the size doesn't depend on the saved-register count — and
+/// the proc is correct no matter how the caller entered it.
+fn proc_frame_size(max_args: usize) -> usize {
+    (32 + max_args.saturating_sub(4) * 8 + 15) & !15
 }
 
-/// The proc epilogue: release the frame, restore the saved registers in reverse,
-/// then `ret`.
+/// The proc epilogue: release the frame (restore rsp from the rbp anchor),
+/// restore the saved registers in reverse, then `ret`.
 fn proc_epilogue(uses: &[String], frame_size: usize) -> String {
     let mut s = String::new();
     if frame_size > 0 {
-        s.push_str(&format!("  add rsp, {frame_size}\n"));
+        s.push_str("  mov rsp, rbp\n  pop rbp\n");
     }
     for r in uses.iter().rev() {
         s.push_str(&format!("  pop {r}\n"));
@@ -2099,15 +2242,37 @@ mod tests {
         assert!(!h.frame);
         assert!(parse_proc("f uses rbx frame").frame);
 
-        // modifies a callee-saved register it didn't declare
-        let bad = ".code\nproc f uses rbx\n  mov rsi, rcx\nendproc\n";
+        // `uses` check: modifies a callee-saved register it didn't declare
+        let bad = ".code\nproc f uses rbx in rcx\n  mov rsi, rcx\nendproc\n";
         let d = proc_contract_diags(bad);
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].message.contains("rsi") && d[0].line == 3, "{d:?}");
 
-        // declared → clean; volatile scratch (rcx/r10) is always free
-        let ok = ".code\nproc f uses rbx rsi\n  mov rsi, rcx\n  mov rbx, rdx\n  mov rcx, 1\n  xor r10, r10\nendproc\n";
+        // declared → clean; volatile scratch (rcx written, r10 zeroed) is free
+        let ok = ".code\nproc f uses rbx rsi in rcx rdx\n  mov rsi, rcx\n  mov rbx, rdx\n  mov rcx, 1\n  xor r10, r10\nendproc\n";
         assert!(proc_contract_diags(ok).is_empty(), "{:?}", proc_contract_diags(ok));
+    }
+
+    #[test]
+    fn proc_in_out_and_frame_balance_checks() {
+        // `in`: reads rcx but never sets it and didn't declare it
+        let undecl = ".code\nproc f uses rbx\n  mov rbx, rcx\nendproc\n";
+        let d = proc_contract_diags(undecl);
+        assert!(d.iter().any(|x| x.message.contains("reads `rcx`") && x.message.contains("in rcx")), "{d:?}");
+        // declaring it clears the warning
+        assert!(proc_contract_diags(".code\nproc f uses rbx in rcx\n  mov rbx, rcx\nendproc\n")
+            .iter().all(|x| !x.message.contains("reads")));
+
+        // `out`: declared but never written
+        let unset = ".code\nproc f out rax\n  nop\nendproc\n";
+        assert!(proc_contract_diags(unset).iter().any(|x| x.message.contains("out rax") && x.message.contains("never sets")), "");
+
+        // frame balance: a stray push before a call breaks the alignment
+        let stray = ".code\nproc f frame\n  push rcx\n  invoke Sleep, 0\nendproc\n";
+        assert!(proc_contract_diags(stray).iter().any(|x| x.message.contains("off the frame level")), "");
+        // balanced push/pop around no call → fine
+        let balanced = ".code\nproc f frame\n  push rcx\n  pop rcx\n  invoke Sleep, 0\nendproc\n";
+        assert!(proc_contract_diags(balanced).iter().all(|x| !x.message.contains("frame level")), "{:?}", proc_contract_diags(balanced));
     }
 
     #[test]
@@ -2117,19 +2282,20 @@ mod tests {
         assert_eq!(call_arg_count("comcall obj, I, M, a, b"), Some(3));
         assert_eq!(call_arg_count("p.Draw(3, 0)"), Some(3));
         assert_eq!(call_arg_count("mov rax, 1"), None);
-        // frame size: 32 shadow + outgoing stack args, padded so rsp is 16-aligned
-        // at the call given the saved-register pushes.
-        assert_eq!(proc_frame_size(1, 2), 32); // 1 push → already aligned
-        assert_eq!(proc_frame_size(0, 0), 40); // 0 push → +8 pad
-        assert_eq!(proc_frame_size(1, 6), 48); // 2 stack args
-        assert_eq!(proc_frame_size(2, 0), 40); // 2 push → +8 pad
+        // frame size: 32 shadow + outgoing stack args, rounded to 16 (the proc
+        // aligns itself, so size doesn't depend on the saved-register count).
+        assert_eq!(proc_frame_size(2), 32); // ≤4 args → shadow only
+        assert_eq!(proc_frame_size(4), 32);
+        assert_eq!(proc_frame_size(5), 48); // 1 stack arg
+        assert_eq!(proc_frame_size(7), 64); // 3 stack args
 
-        // A framed proc reserves once; the call inside drops its own ceremony.
+        // A framed proc aligns once (rbp anchor); the call inside drops its own
+        // ceremony and must not re-align.
         let Some(kb) = kb() else { return };
         let low = lower(".code\nproc w uses rbx frame\n  invoke Sleep, 0\nendproc\n", &kb).unwrap();
-        assert!(low.contains("sub rsp, 32") && low.contains("add rsp, 32"), "frame once:\n{low}");
+        assert!(low.contains("and rsp, -16") && low.contains("mov rsp, rbp"), "robust frame:\n{low}");
         let body = low.split("sub rsp, 32").nth(1).unwrap();
-        assert!(!body.contains("and rsp, -16"), "framed call must not re-align:\n{body}");
+        assert!(!body.contains("and rsp, -16"), "the lean call must not re-align:\n{body}");
         assert!(body.contains("call Sleep"));
     }
 
