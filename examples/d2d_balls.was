@@ -1,0 +1,365 @@
+; d2d_balls.was — Direct2D fountain of spinning translucent marbles.
+;
+;   was examples\d2d_balls.was -o d2d_balls.exe   &&   d2d_balls.exe
+;
+; The 2D sibling to the shader Mandelbrot, all through the COM macros. 18 marbles
+; cascade from the top under gravity, bounce off the walls and floor (each bounce
+; damped), spin (a bright highlight orbits the centre via a sine table), and when
+; one settles it pops back to the top — a perpetual fountain. Translucent fills
+; blend where they overlap; a crisp outline gives each its edge.
+;
+; `update` and `render` are `proc`s — `render` a `frame` proc, so its ~100 COM
+; calls per frame are lean. The outline's float strokeWidth rides `xmm3` via the
+; new `real4` arg annotation. Physics is hand-rolled SSE.
+
+.DATA
+comobj pFactory : ID2D1Factory
+comobj pRT      : ID2D1HwndRenderTarget
+comobj pBrush   : ID2D1SolidColorBrush
+iid_factory:
+    iid ID2D1Factory
+
+rtProps     BYTE 28 dup(0)
+hwndProps struct D2D1_HWND_RENDER_TARGET_PROPERTIES
+    pixelSize.width  = 1024
+    pixelSize.height = 768
+ends
+
+bgColor     DWORD 0x3D23D70A, 0x3D23D70A, 0x3DB851EC, 0x3F800000   ; near-black blue
+outlineCol  DWORD 0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000   ; white outline
+markCol     DWORD 0x3F800000, 0x3F800000, 0x3F19999A, 0x3F800000   ; bright spin dot
+
+ellipse struct D2D1_ELLIPSE
+    radiusX = 0x41D00000        ; 26.0  (point + radius set per draw)
+    radiusY = 0x41D00000
+ends
+
+; ---- balls: {x, y, vx, vy, angle(i32), angVel(i32)} — 24 bytes each ----
+balls:
+    DWORD 0x428C0000, 0x42700000, 0xC08CCCCD, 0x00000000, 0, -3
+    DWORD 0x42F60000, 0x42B20000, 0xC0533333, 0x3FE66666, 40, 4
+    DWORD 0x43300000, 0x42EC0000, 0xC00CCCCD, 0x3F19999A, 80, -5
+    DWORD 0x43650000, 0x43130000, 0xBF8CCCCD, 0x4019999A, 120, 6
+    DWORD 0x438D0000, 0x43300000, 0x00000000, 0x3F99999A, 160, -3
+    DWORD 0x43A78000, 0x42820000, 0x3F8CCCCD, 0x00000000, 200, 4
+    DWORD 0x43C20000, 0x42BC0000, 0x400CCCCD, 0x3FE66666, 240, -5
+    DWORD 0x43DC8000, 0x42F60000, 0x40533333, 0x3F19999A, 24, 6
+    DWORD 0x43F70000, 0x43180000, 0x408CCCCD, 0x4019999A, 64, -3
+    DWORD 0x4408C000, 0x43350000, 0xC08CCCCD, 0x3F99999A, 104, 4
+    DWORD 0x44160000, 0x428C0000, 0xC0533333, 0x00000000, 144, -5
+    DWORD 0x44234000, 0x42C60000, 0xC00CCCCD, 0x3FE66666, 184, 6
+    DWORD 0x44308000, 0x43000000, 0xBF8CCCCD, 0x3F19999A, 224, -3
+    DWORD 0x443DC000, 0x431D0000, 0x00000000, 0x4019999A, 8, 4
+    DWORD 0x444B0000, 0x433A0000, 0x3F8CCCCD, 0x3F99999A, 48, -5
+    DWORD 0x44584000, 0x42960000, 0x400CCCCD, 0x00000000, 88, 6
+    DWORD 0x44658000, 0x42D00000, 0x40533333, 0x3FE66666, 128, -3
+    DWORD 0x428E0000, 0x43050000, 0x408CCCCD, 0x3F19999A, 168, 4
+
+; ---- colours: translucent (alpha 0.5), padded to a 24-byte stride ----
+ballColors:
+    DWORD 0x3F800000, 0x3EE66666, 0x3EE66666, 0x3F000000, 0, 0
+    DWORD 0x3F800000, 0x3F222222, 0x3EE66666, 0x3F000000, 0, 0
+    DWORD 0x3F800000, 0x3F511111, 0x3EE66666, 0x3F000000, 0, 0
+    DWORD 0x3F800000, 0x3F800000, 0x3EE66666, 0x3F000000, 0, 0
+    DWORD 0x3F511111, 0x3F800000, 0x3EE66666, 0x3F000000, 0, 0
+    DWORD 0x3F222222, 0x3F800000, 0x3EE66666, 0x3F000000, 0, 0
+    DWORD 0x3EE66666, 0x3F800000, 0x3EE66666, 0x3F000000, 0, 0
+    DWORD 0x3EE66666, 0x3F800000, 0x3F222222, 0x3F000000, 0, 0
+    DWORD 0x3EE66666, 0x3F800000, 0x3F511111, 0x3F000000, 0, 0
+    DWORD 0x3EE66666, 0x3F800000, 0x3F800000, 0x3F000000, 0, 0
+    DWORD 0x3EE66666, 0x3F511111, 0x3F800000, 0x3F000000, 0, 0
+    DWORD 0x3EE66666, 0x3F222222, 0x3F800000, 0x3F000000, 0, 0
+    DWORD 0x3EE66666, 0x3EE66666, 0x3F800000, 0x3F000000, 0, 0
+    DWORD 0x3F222222, 0x3EE66666, 0x3F800000, 0x3F000000, 0, 0
+    DWORD 0x3F511111, 0x3EE66666, 0x3F800000, 0x3F000000, 0, 0
+    DWORD 0x3F800000, 0x3EE66666, 0x3F800000, 0x3F000000, 0, 0
+    DWORD 0x3F800000, 0x3EE66666, 0x3F511111, 0x3F000000, 0, 0
+    DWORD 0x3F800000, 0x3EE66666, 0x3F222222, 0x3F000000, 0, 0
+
+; ---- 256-entry sine table (one turn) ----
+sinTab:
+    DWORD 0x00000000, 0x3CC90AB0, 0x3D48FB30, 0x3D96A905, 0x3DC8BD36, 0x3DFAB273, 0x3E164083, 0x3E2F10A2
+    DWORD 0x3E47C5C2, 0x3E605C13, 0x3E78CFCC, 0x3E888E93, 0x3E94A031, 0x3EA09AE5, 0x3EAC7CD4, 0x3EB8442A
+    DWORD 0x3EC3EF15, 0x3ECF7BCA, 0x3EDAE880, 0x3EE63375, 0x3EF15AEA, 0x3EFC5D27, 0x3F039C3D, 0x3F08F59B
+    DWORD 0x3F0E39DA, 0x3F13682A, 0x3F187FC0, 0x3F1D7FD1, 0x3F226799, 0x3F273656, 0x3F2BEB4A, 0x3F3085BB
+    DWORD 0x3F3504F3, 0x3F396842, 0x3F3DAEF9, 0x3F41D870, 0x3F45E403, 0x3F49D112, 0x3F4D9F02, 0x3F514D3D
+    DWORD 0x3F54DB31, 0x3F584853, 0x3F5B941A, 0x3F5EBE05, 0x3F61C598, 0x3F64AA59, 0x3F676BD8, 0x3F6A09A7
+    DWORD 0x3F6C835E, 0x3F6ED89E, 0x3F710908, 0x3F731447, 0x3F74FA0B, 0x3F76BA07, 0x3F7853F8, 0x3F79C79D
+    DWORD 0x3F7B14BE, 0x3F7C3B28, 0x3F7D3AAC, 0x3F7E1324, 0x3F7EC46D, 0x3F7F4E6D, 0x3F7FB10F, 0x3F7FEC43
+    DWORD 0x3F800000, 0x3F7FEC43, 0x3F7FB10F, 0x3F7F4E6D, 0x3F7EC46D, 0x3F7E1324, 0x3F7D3AAC, 0x3F7C3B28
+    DWORD 0x3F7B14BE, 0x3F79C79D, 0x3F7853F8, 0x3F76BA07, 0x3F74FA0B, 0x3F731447, 0x3F710908, 0x3F6ED89E
+    DWORD 0x3F6C835E, 0x3F6A09A7, 0x3F676BD8, 0x3F64AA59, 0x3F61C598, 0x3F5EBE05, 0x3F5B941A, 0x3F584853
+    DWORD 0x3F54DB31, 0x3F514D3D, 0x3F4D9F02, 0x3F49D112, 0x3F45E403, 0x3F41D870, 0x3F3DAEF9, 0x3F396842
+    DWORD 0x3F3504F3, 0x3F3085BB, 0x3F2BEB4A, 0x3F273656, 0x3F226799, 0x3F1D7FD1, 0x3F187FC0, 0x3F13682A
+    DWORD 0x3F0E39DA, 0x3F08F59B, 0x3F039C3D, 0x3EFC5D27, 0x3EF15AEA, 0x3EE63375, 0x3EDAE880, 0x3ECF7BCA
+    DWORD 0x3EC3EF15, 0x3EB8442A, 0x3EAC7CD4, 0x3EA09AE5, 0x3E94A031, 0x3E888E93, 0x3E78CFCC, 0x3E605C13
+    DWORD 0x3E47C5C2, 0x3E2F10A2, 0x3E164083, 0x3DFAB273, 0x3DC8BD36, 0x3D96A905, 0x3D48FB30, 0x3CC90AB0
+    DWORD 0x00000000, 0xBCC90AB0, 0xBD48FB30, 0xBD96A905, 0xBDC8BD36, 0xBDFAB273, 0xBE164083, 0xBE2F10A2
+    DWORD 0xBE47C5C2, 0xBE605C13, 0xBE78CFCC, 0xBE888E93, 0xBE94A031, 0xBEA09AE5, 0xBEAC7CD4, 0xBEB8442A
+    DWORD 0xBEC3EF15, 0xBECF7BCA, 0xBEDAE880, 0xBEE63375, 0xBEF15AEA, 0xBEFC5D27, 0xBF039C3D, 0xBF08F59B
+    DWORD 0xBF0E39DA, 0xBF13682A, 0xBF187FC0, 0xBF1D7FD1, 0xBF226799, 0xBF273656, 0xBF2BEB4A, 0xBF3085BB
+    DWORD 0xBF3504F3, 0xBF396842, 0xBF3DAEF9, 0xBF41D870, 0xBF45E403, 0xBF49D112, 0xBF4D9F02, 0xBF514D3D
+    DWORD 0xBF54DB31, 0xBF584853, 0xBF5B941A, 0xBF5EBE05, 0xBF61C598, 0xBF64AA59, 0xBF676BD8, 0xBF6A09A7
+    DWORD 0xBF6C835E, 0xBF6ED89E, 0xBF710908, 0xBF731447, 0xBF74FA0B, 0xBF76BA07, 0xBF7853F8, 0xBF79C79D
+    DWORD 0xBF7B14BE, 0xBF7C3B28, 0xBF7D3AAC, 0xBF7E1324, 0xBF7EC46D, 0xBF7F4E6D, 0xBF7FB10F, 0xBF7FEC43
+    DWORD 0xBF800000, 0xBF7FEC43, 0xBF7FB10F, 0xBF7F4E6D, 0xBF7EC46D, 0xBF7E1324, 0xBF7D3AAC, 0xBF7C3B28
+    DWORD 0xBF7B14BE, 0xBF79C79D, 0xBF7853F8, 0xBF76BA07, 0xBF74FA0B, 0xBF731447, 0xBF710908, 0xBF6ED89E
+    DWORD 0xBF6C835E, 0xBF6A09A7, 0xBF676BD8, 0xBF64AA59, 0xBF61C598, 0xBF5EBE05, 0xBF5B941A, 0xBF584853
+    DWORD 0xBF54DB31, 0xBF514D3D, 0xBF4D9F02, 0xBF49D112, 0xBF45E403, 0xBF41D870, 0xBF3DAEF9, 0xBF396842
+    DWORD 0xBF3504F3, 0xBF3085BB, 0xBF2BEB4A, 0xBF273656, 0xBF226799, 0xBF1D7FD1, 0xBF187FC0, 0xBF13682A
+    DWORD 0xBF0E39DA, 0xBF08F59B, 0xBF039C3D, 0xBEFC5D27, 0xBEF15AEA, 0xBEE63375, 0xBEDAE880, 0xBECF7BCA
+    DWORD 0xBEC3EF15, 0xBEB8442A, 0xBEAC7CD4, 0xBEA09AE5, 0xBE94A031, 0xBE888E93, 0xBE78CFCC, 0xBE605C13
+    DWORD 0xBE47C5C2, 0xBE2F10A2, 0xBE164083, 0xBDFAB273, 0xBDC8BD36, 0xBD96A905, 0xBD48FB30, 0xBCC90AB0
+
+; ---- constants ----
+grav        DWORD 0x3EA3D70A        ; 0.32
+floorDamp   DWORD 0xBF3D70A4        ; -0.74 (flip + lose energy)
+radF        DWORD 0x41D00000        ; 26
+xmaxF       DWORD 0x44798000        ; 998
+ymaxF       DWORD 0x44398000        ; 742
+spawnY      DWORD 0x42200000        ; 40
+settleV     DWORD 0x3FC00000        ; 1.5  (settle threshold for vy)
+markOff     DWORD 0x41400000        ; 12   (spin-dot orbit)
+markRad     DWORD 0x40E00000        ; 7
+strokeW     DWORD 0x40000000        ; 2.0  outline width
+vxScale     DWORD 0x3F19999A        ; 0.6
+one         DWORD 0x3F800000        ; 1.0
+absMask     DWORD 0x7FFFFFFF, 0, 0, 0
+sgnMask     DWORD 0x80000000, 0, 0, 0
+rng         DWORD 0x1979CAFE
+
+className   WCHAR  "rasm_d2d", 0
+titleText   WCHAR  "RASM — Direct2D marbles", 0
+wc          BYTE   80 dup(0)
+msg         BYTE   48 dup(0)
+hwndSave    QWORD  ?
+winRect     BYTE   16 dup(0)
+winW        DWORD  ?
+winH        DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 1024
+    mov     dword ptr [rdi + 12], 768
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + winH], eax
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+
+    invoke  D2D1CreateFactory, 0, iid_factory, 0, pFactory
+    test    eax, eax
+    js      fail
+    lea     rdi, [rip + hwndProps]
+    mov     rax, [rip + hwndSave]
+    mov     [rdi + D2D1_HWND_RENDER_TARGET_PROPERTIES.hwnd], rax
+    pFactory.CreateHwndRenderTarget(rtProps, hwndProps, pRT)
+    test    eax, eax
+    js      fail
+    pRT.CreateSolidColorBrush(bgColor, 0, pBrush)
+    test    eax, eax
+    js      fail
+
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     mdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+mdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- physics: gravity, walls, damped floor, spin, settle→respawn ----
+proc update uses rsi rbx
+    lea     rsi, [rip + balls]
+    movups  xmm4, [rip + absMask]       ; |v|
+    movups  xmm5, [rip + sgnMask]       ; -|v|
+    xor     rbx, rbx
+uball:
+    movss   xmm0, [rsi + rbx]           ; x
+    movss   xmm1, [rsi + rbx + 4]       ; y
+    movss   xmm2, [rsi + rbx + 8]       ; vx
+    movss   xmm3, [rsi + rbx + 12]      ; vy
+    addss   xmm3, [rip + grav]          ; vy += gravity
+    addss   xmm0, xmm2                  ; x += vx
+    addss   xmm1, xmm3                  ; y += vy
+    comiss  xmm0, [rip + radF]
+    jae     ux_hi
+    andps   xmm2, xmm4                  ; left wall: vx = |vx|
+    movss   xmm0, [rip + radF]
+    jmp     ux_done
+ux_hi:
+    comiss  xmm0, [rip + xmaxF]
+    jbe     ux_done
+    orps    xmm2, xmm5                  ; right wall: vx = -|vx|
+    movss   xmm0, [rip + xmaxF]
+ux_done:
+    comiss  xmm1, [rip + radF]
+    jae     uy_floor
+    andps   xmm3, xmm4                  ; ceiling: vy = |vy|
+    movss   xmm1, [rip + radF]
+    jmp     uy_store
+uy_floor:
+    comiss  xmm1, [rip + ymaxF]
+    jbe     uy_store
+    movss   xmm1, [rip + ymaxF]         ; clamp to floor
+    mulss   xmm3, [rip + floorDamp]     ; vy = -0.74 * vy
+    movss   [rsi + rbx], xmm0
+    movss   [rsi + rbx + 4], xmm1
+    movss   [rsi + rbx + 8], xmm2
+    movss   [rsi + rbx + 12], xmm3
+    andps   xmm3, xmm4                  ; |vy| (reuse xmm3)
+    comiss  xmm3, [rip + settleV]
+    jae     uspin                       ; still lively → keep it
+    call    respawn                     ; settled → pop back to the top
+    jmp     unext
+uy_store:
+    movss   [rsi + rbx], xmm0
+    movss   [rsi + rbx + 4], xmm1
+    movss   [rsi + rbx + 8], xmm2
+    movss   [rsi + rbx + 12], xmm3
+uspin:
+    mov     eax, [rsi + rbx + 16]       ; angle += angVel  (mod 256)
+    add     eax, [rsi + rbx + 20]
+    and     eax, 255
+    mov     [rsi + rbx + 16], eax
+unext:
+    add     rbx, 24
+    cmp     rbx, 432
+    jl      uball
+endproc
+
+; ---- respawn the ball at [rsi+rbx] from the xorshift rng ----
+respawn:
+    mov     eax, [rip + rng]
+    mov     edx, eax
+    shl     edx, 13
+    xor     eax, edx
+    mov     edx, eax
+    shr     edx, 17
+    xor     eax, edx
+    mov     edx, eax
+    shl     edx, 5
+    xor     eax, edx
+    mov     [rip + rng], eax
+    mov     ecx, eax                    ; x = rng & 1023 (walls tuck in the edges)
+    and     ecx, 1023
+    cvtsi2ss xmm0, ecx
+    movss   [rsi + rbx], xmm0
+    movss   xmm0, [rip + spawnY]        ; y = spawnY
+    movss   [rsi + rbx + 4], xmm0
+    mov     ecx, eax                    ; vx = ((rng>>10 & 7) - 4) * 0.6
+    shr     ecx, 10
+    and     ecx, 7
+    sub     ecx, 4
+    cvtsi2ss xmm0, ecx
+    mulss   xmm0, [rip + vxScale]
+    movss   [rsi + rbx + 8], xmm0
+    mov     ecx, eax                    ; vy = 1 + (rng>>13 & 3)
+    shr     ecx, 13
+    and     ecx, 3
+    cvtsi2ss xmm0, ecx
+    addss   xmm0, [rip + one]
+    movss   [rsi + rbx + 12], xmm0
+    mov     ecx, eax                    ; angle = rng & 255
+    and     ecx, 255
+    mov     [rsi + rbx + 16], ecx
+    mov     ecx, eax                    ; angVel = (rng>>8 & 7) - 3
+    shr     ecx, 8
+    and     ecx, 7
+    sub     ecx, 3
+    mov     [rsi + rbx + 20], ecx
+    ret
+
+; ---- draw a frame: per ball, translucent fill + outline + spin dot ----
+proc render uses rbx rsi rdi r12 r13 frame
+    pRT.BeginDraw()
+    pRT.Clear(bgColor)
+    lea     rsi, [rip + balls]
+    lea     rdi, [rip + ballColors]
+    lea     r12, [rip + ellipse]
+    lea     r13, [rip + sinTab]
+    xor     rbx, rbx
+rball:
+    mov     eax, [rip + radF]           ; ellipse radius = rad
+    mov     [r12 + 8], eax
+    mov     [r12 + 12], eax
+    mov     eax, [rsi + rbx]            ; point = ball.xy
+    mov     [r12], eax
+    mov     eax, [rsi + rbx + 4]
+    mov     [r12 + 4], eax
+    lea     r8, [rdi + rbx]             ; &ballColors[i]
+    pBrush.SetColor(r8)
+    pRT.FillEllipse(ellipse, [rip + pBrush])
+    pBrush.SetColor(outlineCol)
+    pRT.DrawEllipse(ellipse, [rip + pBrush], real4 [rip + strokeW], 0)
+    ; spin highlight: a bright dot orbiting the centre
+    mov     eax, [rsi + rbx + 16]       ; angle
+    mov     ecx, eax
+    and     ecx, 255
+    movss   xmm1, [r13 + rcx*4]         ; sin
+    mov     ecx, eax
+    add     ecx, 64
+    and     ecx, 255
+    movss   xmm0, [r13 + rcx*4]         ; cos
+    mulss   xmm0, [rip + markOff]
+    addss   xmm0, [rsi + rbx]           ; markerX = x + cos*off
+    mulss   xmm1, [rip + markOff]
+    addss   xmm1, [rsi + rbx + 4]       ; markerY = y + sin*off
+    movss   [r12], xmm0
+    movss   [r12 + 4], xmm1
+    mov     eax, [rip + markRad]
+    mov     [r12 + 8], eax
+    mov     [r12 + 12], eax
+    pBrush.SetColor(markCol)
+    pRT.FillEllipse(ellipse, [rip + pBrush])
+    add     rbx, 24
+    cmp     rbx, 432
+    jl      rball
+    pRT.EndDraw(0, 0)
+endproc
+
+.globl WndProc
+WndProc:
+    cmp     edx, 2                      ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                    ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    update
+    call    render
+    xor     eax, eax
+    ret
