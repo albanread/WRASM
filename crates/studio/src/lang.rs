@@ -73,6 +73,9 @@ pub enum Request {
     Signature { id: u64, line: String, cursor: usize },
     /// The machine-code bytes for a single source line (the live-bytes view).
     LineBytes { id: u64, line: String },
+    /// The lowered listing of one source line: each expanded instruction with
+    /// its own bytes (the macro-expansion view — `invoke` → the Win64 sequence).
+    Listing { id: u64, line: String },
     /// Stop the worker and let the join complete.
     Shutdown,
 }
@@ -93,6 +96,8 @@ pub enum Response {
     /// The bytes a single line encodes to (empty if it isn't self-encodable,
     /// e.g. a label-only line or one that references an undefined label).
     LineBytes { id: u64, bytes: Vec<u8> },
+    /// Per-instruction `(bytes, asm)` rows the source line lowers to.
+    Listing { id: u64, rows: Vec<(Vec<u8>, String)> },
     /// A request failed; `id` is the originating request's id.
     Error { id: u64, message: String },
 }
@@ -109,6 +114,7 @@ impl Response {
             | Response::Completions { id, .. }
             | Response::Tip { id, .. }
             | Response::LineBytes { id, .. }
+            | Response::Listing { id, .. }
             | Response::Error { id, .. } => *id,
         }
     }
@@ -262,6 +268,9 @@ impl Lang {
     pub fn line_bytes(&self, line: &str) -> Option<Response> {
         self.call(|id| Request::LineBytes { id, line: line.to_string() })
     }
+    pub fn listing(&self, line: &str) -> Option<Response> {
+        self.call(|id| Request::Listing { id, line: line.to_string() })
+    }
 
     /// Stop the worker and wait for it to finish.
     pub fn shutdown(mut self) {
@@ -343,6 +352,7 @@ fn coalesce_tag(req: &Request) -> Option<u8> {
         Request::Hover { .. } => Some(2),
         Request::Signature { .. } => Some(3),
         Request::LineBytes { .. } => Some(4),
+        Request::Listing { .. } => Some(5),
         _ => None,
     }
 }
@@ -422,7 +432,28 @@ fn handle(kb: &Kb, req: Request) -> Response {
                 .unwrap_or_default();
             Response::LineBytes { id, bytes }
         }
+        Request::Listing { id, line } => Response::Listing { id, rows: line_listing(kb, &line) },
     }
+}
+
+/// Lower one source line and assemble each resulting instruction on its own, so
+/// the editor can show a macro's literal expansion as `(bytes, asm)` rows. Blank
+/// and comment lines in the lowering are dropped; a plain instruction yields a
+/// single row. Per-instruction isolation means an extern `call`/branch shows its
+/// reloc placeholder (`e8 00 00 00 00`), which is exactly what's emitted.
+fn line_listing(kb: &Kb, line: &str) -> Vec<(Vec<u8>, String)> {
+    let Ok(lowered) = was::lower(line, kb) else {
+        return Vec::new();
+    };
+    lowered
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with(';') && !t.starts_with('#'))
+        .map(|t| {
+            let bytes = rasm::assemble(t).map(|m| m.code).unwrap_or_default();
+            (bytes, t.to_string())
+        })
+        .collect()
 }
 
 /// Resolve a completion context into winkb candidates.
@@ -828,7 +859,8 @@ mod tests {
             | Request::Complete { id, .. }
             | Request::Hover { id, .. }
             | Request::Signature { id, .. }
-            | Request::LineBytes { id, .. } => *id,
+            | Request::LineBytes { id, .. }
+            | Request::Listing { id, .. } => *id,
             Request::Shutdown => 0,
         }
     }

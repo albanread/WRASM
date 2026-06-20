@@ -59,8 +59,8 @@ mod gui {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_F12, VK_F5, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT,
-        VK_TAB, VK_UP, VIRTUAL_KEY,
+        GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F5,
+        VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
@@ -86,14 +86,27 @@ mod gui {
     const EDITOR_FONT: &str = theme::CODE_FONT;
     const EDITOR_SIZE: f32 = 15.0;
     const LINE_H: f32 = EDITOR_SIZE * 1.5;
-    const GUTTER_W: f32 = 54.0;
     const TOP_PAD: f32 = 10.0;
-    const STATUS_H: f32 = 30.0;
     const SPLIT_FRAC: f32 = 0.56;
     const WHEEL_STEP: f32 = 48.0;
 
+    // The ASM-listing left margin: a line number, then the machine-code bytes for
+    // each instruction in gray. A macro line (e.g. `invoke`) is followed by gray,
+    // view-only "ghost" rows — its literal lowered expansion, `bytes : asm` — so
+    // you see the generated code without it touching the source.
+    const LN_W: f32 = 34.0; // line-number column
+    const BYTES_W: f32 = 188.0; // byte column
+    const BYTE_SIZE: f32 = 12.5;
+    const SRC_X: f32 = LN_W + BYTES_W + 8.0; // where source / ghost asm begins
+
+    const SEARCH_H: f32 = 40.0; // assistant search-box band
+    const OUTPUT_H: f32 = 120.0; // bottom-left output pane
+
     const SQUIGGLE: u32 = 0xF1_4C_4C; // VS Code error red
     const CARET_COLOR: u32 = theme::TEXT_BRIGHT;
+    const BYTE_COLOR: u32 = 0x6E_6E_6E; // listing bytes, dim gray
+    const GHOST_COLOR: u32 = 0x86_86_86; // expanded ghost asm, gray
+    const VK_F: VIRTUAL_KEY = VIRTUAL_KEY(0x46); // the 'F' key (Ctrl+F = search)
 
     const STARTER: &str = "\
 .globl main
@@ -138,10 +151,15 @@ main:
         lang: Option<Lang>,
         doc: Doc,
         diags: Vec<Diag>,
-        line_bytes: Vec<u8>,
-        status: String,
+        /// The lowered listing per source line — `(bytes, asm)` for each expanded
+        /// instruction (re-fetched on every edit, one `listing` call per line).
+        line_listing: Vec<Vec<(Vec<u8>, String)>>,
+        /// A short status line for the output pane (build result, snapshot path…).
+        notice: String,
 
-        // Assistant card.
+        // Assistant: a search box + a card.
+        search: String,
+        search_active: bool,
         card_md: String,
         card_word: String,
         card_layout: Option<Layout>,
@@ -156,6 +174,11 @@ main:
                 0 => 96,
                 d => d,
             };
+            let notice = if lang.is_none() {
+                "knowledge db not found — set WINKB_DB; editing + highlighting only".to_string()
+            } else {
+                String::new()
+            };
             let mut app = App {
                 hwnd,
                 dpi,
@@ -165,8 +188,10 @@ main:
                 lang,
                 doc: Doc::from_str(STARTER.trim_end()),
                 diags: Vec::new(),
-                line_bytes: Vec::new(),
-                status: String::new(),
+                line_listing: Vec::new(),
+                notice,
+                search: String::new(),
+                search_active: false,
                 card_md: welcome_card(),
                 card_word: String::new(),
                 card_layout: None,
@@ -176,7 +201,7 @@ main:
             };
             // Land the caret on `ExitProcess` so the first card is a real one.
             app.doc.set_caret(2, 9);
-            app.refresh();
+            app.after_edit();
             app
         }
 
@@ -188,36 +213,53 @@ main:
             let s = self.dip_scale();
             (self.client_w as f32 * s, self.client_h as f32 * s)
         }
-        fn split_x(&self) -> f32 {
-            self.viewport().0 * SPLIT_FRAC
-        }
         fn invalidate(&self) {
             let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
         }
 
         // ── language-thread refresh (synchronous; sub-ms on a small buffer) ──
 
-        /// Re-run the per-edit queries: diagnostics for the buffer, live bytes
-        /// for the caret's line, and a card for the symbol under the caret.
-        fn refresh(&mut self) {
-            let Some(lang) = self.lang.as_ref() else {
-                self.status = "knowledge db not found — set WINKB_DB. Editing + highlighting only."
-                    .to_string();
-                return;
-            };
-
-            if let Some(Response::Check { diags, .. }) = lang.check_src(&self.doc.text()) {
-                self.diags = diags;
+        /// After a text edit: re-check the buffer and re-fetch the per-line bytes,
+        /// then update the caret-driven card.
+        fn after_edit(&mut self) {
+            if let Some(lang) = self.lang.as_ref() {
+                if let Some(Response::Check { diags, .. }) = lang.check_src(&self.doc.text()) {
+                    self.diags = diags;
+                }
             }
+            let mut rows = Vec::with_capacity(self.doc.line_count());
+            for r in 0..self.doc.line_count() {
+                let line = self.doc.line(r).to_string();
+                let listing = self
+                    .lang
+                    .as_ref()
+                    .and_then(|l| match l.listing(&line) {
+                        Some(Response::Listing { rows, .. }) => Some(rows),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                rows.push(listing);
+            }
+            self.line_listing = rows;
+            self.after_caret();
+        }
 
-            let line = self.doc.line(self.doc.caret.row).to_string();
-            self.line_bytes = match lang.line_bytes(&line) {
-                Some(Response::LineBytes { bytes, .. }) => bytes,
-                _ => Vec::new(),
-            };
+        /// After a caret move (no text change): just refresh the card.
+        fn after_caret(&mut self) {
+            if !self.search_active {
+                self.refresh_card(lang_word(&self.doc));
+            }
+        }
 
-            self.refresh_card(lang_word(&self.doc));
-            self.compose_status();
+        /// The lowered instruction rows for source `row` (empty for a blank line).
+        fn listing(&self, row: usize) -> &[(Vec<u8>, String)] {
+            self.line_listing.get(row).map(Vec::as_slice).unwrap_or(&[])
+        }
+
+        /// A source line is a "macro" worth expanding when it lowers to more than
+        /// one instruction (e.g. `invoke` → the whole Win64 call sequence).
+        fn is_macro(&self, row: usize) -> bool {
+            self.listing(row).len() > 1
         }
 
         /// Update the assistant card if the caret moved onto a different symbol.
@@ -236,37 +278,39 @@ main:
             }
         }
 
-        fn compose_status(&mut self) {
-            let hex = studio::bytes::hex(&self.line_bytes);
-            let bytes = if self.line_bytes.is_empty() {
-                "—".to_string()
-            } else {
-                format!("{hex}  ({} bytes)", self.line_bytes.len())
-            };
-            let issues = match self.diags.len() {
-                0 => "no issues".to_string(),
-                1 => "1 issue".to_string(),
-                n => format!("{n} issues"),
-            };
-            self.status = format!("bytes: {bytes}     {issues}     F5: build .exe");
+        /// Run the assistant search box: a free-form winkb query (the same
+        /// `ide::answer` the caret uses — exact match → card, else search results
+        /// with clickable `was:` links).
+        fn run_search(&mut self) {
+            let q = self.search.trim().to_string();
+            if q.is_empty() {
+                return;
+            }
+            if let Some(lang) = self.lang.as_ref() {
+                if let Some(Response::Card { markdown, .. }) = lang.card(&q) {
+                    self.card_word = q; // suppress the caret clobbering it
+                    self.card_md = markdown;
+                    self.card_layout = None;
+                    self.card_scroll = 0.0;
+                }
+            }
+            self.invalidate();
         }
 
         /// Assemble the whole buffer to a self-contained exe and report.
         fn build_exe(&mut self) {
             let Some(lang) = self.lang.as_ref() else { return };
-            match lang.assemble(&self.doc.text(), Emit::Exe) {
+            self.notice = match lang.assemble(&self.doc.text(), Emit::Exe) {
                 Some(Response::Assembled { bytes, info, .. }) => {
                     let out: PathBuf = std::env::temp_dir().join("studio_build.exe");
                     match std::fs::write(&out, &bytes) {
-                        Ok(()) => self.status = format!("built {} — {info}", out.display()),
-                        Err(e) => self.status = format!("build ok ({info}) but write failed: {e}"),
+                        Ok(()) => format!("built {} — {info}", out.display()),
+                        Err(e) => format!("build ok ({info}) but write failed: {e}"),
                     }
                 }
-                Some(Response::Error { message, .. }) => {
-                    self.status = format!("build error: {message}");
-                }
-                _ => {}
-            }
+                Some(Response::Error { message, .. }) => format!("build error: {message}"),
+                _ => return,
+            };
             self.invalidate();
         }
 
@@ -307,8 +351,10 @@ main:
             }
         }
 
-        /// (Re)lay out the assistant card for the current pane width.
-        fn relayout_card(&mut self, x_base: f32, width: f32) {
+        /// (Re)lay out the assistant card for the current pane width. The card
+        /// begins at `y0` (below the search band) so its baked coordinates line up
+        /// with where `draw_document` puts it.
+        fn relayout_card(&mut self, x_base: f32, width: f32, y0: f32) {
             let stale = self.card_layout.is_none() || (self.card_laid_w - width).abs() > 0.5;
             if stale {
                 let md = if self.card_md.trim().is_empty() {
@@ -318,7 +364,7 @@ main:
                 };
                 let blocks = parser::parse(&md);
                 self.card_layout =
-                    Some(dlayout::layout(&blocks, x_base, width, 0.0, render::measure_text));
+                    Some(dlayout::layout(&blocks, x_base, width, y0, render::measure_text));
                 self.card_laid_w = width;
             }
         }
@@ -349,13 +395,14 @@ main:
         /// [`snapshot`](App::snapshot); owns `BeginDraw`/`EndDraw`.
         unsafe fn render_frame(&mut self, target: &ID2D1RenderTarget, vw: f32, vh: f32) {
             let split = vw * SPLIT_FRAC;
-            let editor_h = vh - STATUS_H;
+            let editor_h = (vh - OUTPUT_H).max(0.0);
 
+            // Assistant card: laid out below the search band, right of the split.
             let card_x = split + theme::H_PAD;
             let card_w = (vw - card_x - theme::H_PAD).max(80.0);
-            self.relayout_card(card_x, card_w);
+            self.relayout_card(card_x, card_w, SEARCH_H + 4.0);
             let total = self.card_layout.as_ref().map(|l| l.total_h).unwrap_or(0.0);
-            self.card_max_scroll = (total - editor_h).max(0.0);
+            self.card_max_scroll = (total - vh).max(0.0);
             self.card_scroll = self.card_scroll.min(self.card_max_scroll);
 
             target.BeginDraw();
@@ -363,29 +410,15 @@ main:
             target.Clear(Some(std::ptr::addr_of!(bg)));
 
             self.draw_editor(target, split, editor_h);
+            self.draw_output(target, split, editor_h, vh);
 
             if let Some(c) = self.card_layout.as_ref() {
-                let _ = render::draw_document(target, c, self.card_scroll, editor_h);
+                let _ = render::draw_document(target, c, self.card_scroll, vh);
             }
+            self.draw_search(target, split, vw);
 
-            // Divider + status strip on top.
+            // Column divider on top of everything.
             render::fill_rect(target, split, 0.0, 1.5, vh, theme::BORDER);
-            render::fill_rect(target, 0.0, vh - STATUS_H, vw, STATUS_H, theme::SIDEBAR_BG);
-            render::fill_rect(target, 0.0, vh - STATUS_H, vw, 1.0, theme::BORDER);
-            render::draw_text(
-                target,
-                theme::H_PAD,
-                vh - STATUS_H + (STATUS_H - 16.0) * 0.5,
-                vw - 2.0 * theme::H_PAD,
-                16.0,
-                &self.status,
-                theme::BODY_FONT,
-                12.5,
-                false,
-                false,
-                theme::TEXT_DIM,
-                false,
-            );
 
             let _ = target.EndDraw(None, None);
         }
@@ -448,104 +481,237 @@ main:
             Ok(path)
         }
 
-        /// Draw the editor pane: gutter line numbers, colour-coded tokens, the
-        /// caret, and diagnostic squiggles.
-        fn draw_editor(&self, t: &ID2D1RenderTarget, split: f32, editor_h: f32) {
-            let text_x = GUTTER_W;
+        /// Per-source-row `(top, height)` in DIPs. A row is one text line tall,
+        /// plus one line per expanded instruction when it's a macro — so the
+        /// `invoke` source line is followed by its lowered ghost rows.
+        fn row_layout(&self) -> Vec<(f32, f32)> {
+            let mut out = Vec::with_capacity(self.doc.line_count());
+            let mut y = TOP_PAD;
+            for row in 0..self.doc.line_count() {
+                let extra = if self.is_macro(row) { self.listing(row).len() } else { 0 };
+                let h = (1 + extra) as f32 * LINE_H;
+                out.push((y, h));
+                y += h;
+            }
+            out
+        }
+
+        /// Draw the editor as an ASM listing: a gray byte margin on the left,
+        /// colour-coded source on the right, the macro expansion as gray ghost
+        /// rows beneath a macro line, the caret, and diagnostic squiggles.
+        unsafe fn draw_editor(&self, t: &ID2D1RenderTarget, split: f32, editor_h: f32) {
             let text_right = split - 6.0;
-            let rows = self.doc.line_count();
-            for row in 0..rows {
-                let y = TOP_PAD + row as f32 * LINE_H;
-                if y > editor_h {
+            render::fill_rect(t, 0.0, 0.0, SRC_X - 4.0, editor_h, 0x18_18_18); // margin bg
+            render::fill_rect(t, SRC_X - 4.0, 0.0, 1.0, editor_h, theme::BORDER); // rule
+
+            let rows = self.row_layout();
+            for (row, &(top, _h)) in rows.iter().enumerate() {
+                if top > editor_h {
                     break;
                 }
                 let line = self.doc.line(row);
+                let macro_row = self.is_macro(row);
 
-                // Gutter line number.
-                unsafe {
-                    render::draw_text(
-                        t,
-                        0.0,
-                        y,
-                        GUTTER_W - 10.0,
-                        LINE_H,
-                        &format!("{:>3}", row + 1),
-                        EDITOR_FONT,
-                        EDITOR_SIZE * 0.85,
-                        false,
-                        false,
-                        theme::TEXT_DIM,
-                        false,
-                    );
+                // Line number, top-aligned with the source.
+                render::draw_text(
+                    t, 2.0, top, LN_W - 6.0, LINE_H, &format!("{:>3}", row + 1),
+                    EDITOR_FONT, EDITOR_SIZE * 0.8, false, false, theme::TEXT_DIM, false,
+                );
+
+                // A non-macro line shows its bytes in the margin beside the source.
+                if !macro_row {
+                    if let Some((bytes, _)) = self.listing(row).first() {
+                        if !bytes.is_empty() {
+                            render::draw_text(
+                                t, LN_W + 6.0, top, BYTES_W - 10.0, LINE_H,
+                                &studio::bytes::hex(bytes), EDITOR_FONT, BYTE_SIZE, false, false,
+                                BYTE_COLOR, false,
+                            );
+                        }
+                    }
                 }
 
-                // Coloured tokens.
+                // Colour-coded source.
                 for tok in self.doc.tokens(row) {
-                    let x = text_x + measure(&line[..tok.start]);
+                    let x = SRC_X + measure(&line[..tok.start]);
                     if x > text_right {
                         continue;
                     }
-                    unsafe {
-                        render::draw_text(
-                            t,
-                            x,
-                            y,
-                            text_right - x,
-                            LINE_H,
-                            &line[tok.start..tok.end],
-                            EDITOR_FONT,
-                            EDITOR_SIZE,
-                            false,
-                            false,
-                            tok_color(tok.kind),
-                            false,
-                        );
-                    }
+                    render::draw_text(
+                        t, x, top, text_right - x, LINE_H, &line[tok.start..tok.end],
+                        EDITOR_FONT, EDITOR_SIZE, false, false, tok_color(tok.kind), false,
+                    );
                 }
 
                 // Squiggles for diagnostics on this row (1-based lines).
                 for d in self.diags.iter().filter(|d| d.line == row + 1) {
                     let (s, e) = diagnostics::underline(line, d.col);
-                    let ux = text_x + measure(&line[..s]);
+                    let ux = SRC_X + measure(&line[..s]);
                     let uw = (measure(&line[..e]) - measure(&line[..s])).max(3.0);
-                    unsafe {
-                        render::fill_rect(t, ux, y + LINE_H - 2.5, uw, 2.0, SQUIGGLE);
+                    render::fill_rect(t, ux, top + LINE_H - 2.5, uw, 2.0, SQUIGGLE);
+                }
+
+                // Macro expansion: gray ghost rows of `bytes : asm` beneath.
+                if macro_row {
+                    for (i, (bytes, asm)) in self.listing(row).iter().enumerate() {
+                        let gy = top + (i as f32 + 1.0) * LINE_H;
+                        if gy > editor_h {
+                            break;
+                        }
+                        render::draw_text(
+                            t, LN_W + 6.0, gy, BYTES_W - 10.0, LINE_H, &studio::bytes::hex(bytes),
+                            EDITOR_FONT, BYTE_SIZE, false, false, BYTE_COLOR, false,
+                        );
+                        render::draw_text(
+                            t, SRC_X + 14.0, gy, text_right - SRC_X - 14.0, LINE_H, asm,
+                            EDITOR_FONT, EDITOR_SIZE * 0.92, false, true, GHOST_COLOR, false,
+                        );
                     }
                 }
             }
 
-            // Caret.
+            // Caret (only ever on a source line, never a ghost row).
             let cr = self.doc.caret;
-            let cy = TOP_PAD + cr.row as f32 * LINE_H;
-            if cy <= editor_h {
-                let cx = text_x + measure(&self.doc.line(cr.row)[..cr.col]);
-                unsafe {
-                    render::fill_rect(t, cx, cy + 1.0, 1.8, LINE_H - 2.0, CARET_COLOR);
+            if let Some(&(top, _)) = rows.get(cr.row) {
+                if top <= editor_h {
+                    let cx = SRC_X + measure(&self.doc.line(cr.row)[..cr.col]);
+                    render::fill_rect(t, cx, top + 1.0, 1.8, LINE_H - 2.0, CARET_COLOR);
                 }
             }
+        }
+
+        /// Draw the output pane below the editor: totals, diagnostics, and the
+        /// last action's notice.
+        unsafe fn draw_output(&self, t: &ID2D1RenderTarget, w: f32, top: f32, vh: f32) {
+            render::fill_rect(t, 0.0, top, w, vh - top, theme::CODE_BG);
+            render::fill_rect(t, 0.0, top, w, 1.0, theme::BORDER);
+            let pad = 12.0;
+            let bytes: usize = self.line_listing.iter().flatten().map(|(b, _)| b.len()).sum();
+            let insns = self.line_listing.iter().flatten().filter(|(b, _)| !b.is_empty()).count();
+            render::draw_text(
+                t, pad, top + 8.0, w - 2.0 * pad, 16.0,
+                &format!("OUTPUT · {} lines · {insns} insns · {bytes} bytes", self.doc.line_count()),
+                theme::BODY_FONT, 11.0, true, false, theme::TEXT_DIM, false,
+            );
+
+            let mut y = top + 30.0;
+            if self.diags.is_empty() {
+                render::draw_text(
+                    t, pad, y, w - 2.0 * pad, 16.0, "no diagnostics",
+                    theme::BODY_FONT, 12.0, false, false, theme::BLOCKQUOTE, false,
+                );
+            } else {
+                for d in self.diags.iter().take(3) {
+                    let s = if d.line == 0 {
+                        format!("• {}", d.message)
+                    } else {
+                        format!("• {}:{}  {}", d.line, d.col, d.message)
+                    };
+                    render::draw_text(
+                        t, pad, y, w - 2.0 * pad, 16.0, &s,
+                        theme::BODY_FONT, 12.0, false, false, SQUIGGLE, false,
+                    );
+                    y += 18.0;
+                    if y > vh - 20.0 {
+                        break;
+                    }
+                }
+            }
+            if !self.notice.is_empty() {
+                render::draw_text(
+                    t, pad, vh - 22.0, w - 2.0 * pad, 16.0, &self.notice,
+                    theme::BODY_FONT, 11.5, false, false, theme::H1, false,
+                );
+            }
+        }
+
+        /// Draw the assistant search box in the band above the card.
+        unsafe fn draw_search(&self, t: &ID2D1RenderTarget, x0: f32, vw: f32) {
+            let w = vw - x0;
+            render::fill_rect(t, x0, 0.0, w, SEARCH_H, theme::BG); // cover any scrolled card
+            let pad = 8.0;
+            let (bx, by, bw, bh) = (x0 + pad, 6.0, w - 2.0 * pad, SEARCH_H - 12.0);
+            let bg = if self.search_active { theme::SIDEBAR_SEL } else { theme::SIDEBAR_BG };
+            let bd = if self.search_active { theme::LINK } else { theme::BORDER };
+            render::fill_rect(t, bx, by, bw, bh, bg);
+            render::fill_rect(t, bx, by, bw, 1.0, bd);
+            render::fill_rect(t, bx, by + bh - 1.0, bw, 1.0, bd);
+            render::fill_rect(t, bx, by, 1.0, bh, bd);
+            render::fill_rect(t, bx + bw - 1.0, by, 1.0, bh, bd);
+
+            let (tx, ty) = (bx + 8.0, by + (bh - 15.0) * 0.5);
+            if self.search.is_empty() && !self.search_active {
+                render::draw_text(
+                    t, tx, ty, bw - 16.0, 18.0, "Search the Windows API…  (Ctrl+F)",
+                    theme::BODY_FONT, 13.0, false, true, theme::TEXT_DIM, false,
+                );
+            } else {
+                render::draw_text(
+                    t, tx, ty, bw - 16.0, 18.0, &self.search,
+                    theme::BODY_FONT, 13.0, false, false, theme::TEXT, false,
+                );
+                if self.search_active {
+                    let cx = tx + render::measure_text(&self.search, theme::BODY_FONT, 13.0, false, false);
+                    render::fill_rect(t, cx + 1.0, ty, 1.5, 16.0, CARET_COLOR);
+                }
+            }
+            render::fill_rect(t, x0, SEARCH_H, w, 1.0, theme::BORDER);
         }
 
         // ── input ──────────────────────────────────────────────────────────
 
-        /// A printable character / editing key from WM_CHAR.
+        /// A printable / editing character from WM_CHAR — routed to the search box
+        /// when it has focus, otherwise to the editor.
         fn on_char(&mut self, ch: u32) {
+            if self.search_active {
+                match ch {
+                    0x08 => {
+                        self.search.pop();
+                    }
+                    0x0D => {
+                        self.run_search();
+                        return;
+                    }
+                    c if c >= 0x20 && c != 0x7f => {
+                        if let Some(c) = char::from_u32(c) {
+                            self.search.push(c);
+                        }
+                    }
+                    _ => return,
+                }
+                self.invalidate();
+                return;
+            }
             match ch {
-                0x08 => self.doc.backspace(),     // Backspace
-                0x0D => self.doc.insert("\n"),    // Enter
-                0x09 => self.doc.insert("  "),    // Tab → two spaces
+                0x08 => self.doc.backspace(),  // Backspace
+                0x0D => self.doc.insert("\n"), // Enter
+                0x09 => self.doc.insert("  "), // Tab → two spaces
                 c if c >= 0x20 && c != 0x7f => {
-                    if let Some(ch) = char::from_u32(c) {
-                        self.doc.insert(&ch.to_string());
+                    if let Some(c) = char::from_u32(c) {
+                        self.doc.insert(&c.to_string());
                     }
                 }
                 _ => return,
             }
-            self.refresh();
+            self.after_edit();
             self.invalidate();
         }
 
         /// A navigation / command key from WM_KEYDOWN. Returns true if handled.
-        fn on_key(&mut self, vk: VIRTUAL_KEY) -> bool {
+        fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool) -> bool {
+            // Search box focused: swallow keys (text comes via WM_CHAR); Esc exits.
+            if self.search_active {
+                if vk == VK_ESCAPE {
+                    self.search_active = false;
+                    self.invalidate();
+                }
+                return true;
+            }
+            if ctrl && vk == VK_F {
+                self.search_active = true;
+                self.invalidate();
+                return true;
+            }
             match vk {
                 VK_LEFT => self.doc.move_left(),
                 VK_RIGHT => self.doc.move_right(),
@@ -553,23 +719,23 @@ main:
                 VK_DOWN => self.doc.move_down(),
                 VK_HOME => self.doc.home(),
                 VK_END => self.doc.end(),
+                VK_BACK => return self.edit(|d| d.backspace()),
+                VK_RETURN => return self.edit(|d| d.insert("\n")),
+                VK_TAB => return self.edit(|d| d.insert("  ")),
                 VK_DELETE => {
-                    // Forward-delete = step right then delete-left, except at EOL.
                     let before = self.doc.caret;
                     self.doc.move_right();
                     if self.doc.caret != before {
-                        self.doc.backspace();
+                        return self.edit(|d| d.backspace());
                     }
+                    return true;
                 }
-                VK_BACK => self.doc.backspace(),
-                VK_RETURN => self.doc.insert("\n"),
-                VK_TAB => self.doc.insert("  "),
                 VK_F5 => {
                     self.build_exe();
                     return true;
                 }
                 VK_F12 => {
-                    self.status = match self.snapshot(Path::new(".")) {
+                    self.notice = match self.snapshot(Path::new(".")) {
                         Ok(p) => format!("saved snapshot {}", p.display()),
                         Err(e) => format!("snapshot failed: {e:#}"),
                     };
@@ -578,7 +744,16 @@ main:
                 }
                 _ => return false,
             }
-            self.refresh();
+            // Fell through here = a pure caret move: card only, no re-assemble.
+            self.after_caret();
+            self.invalidate();
+            true
+        }
+
+        /// Apply a text edit to the document, then re-check/re-assemble + repaint.
+        fn edit(&mut self, f: impl FnOnce(&mut Doc)) -> bool {
+            f(&mut self.doc);
+            self.after_edit();
             self.invalidate();
             true
         }
@@ -591,8 +766,55 @@ main:
             }
         }
 
-        /// Click in the assistant pane: follow a `was:` card link.
+        /// A click: position the editor caret, focus the search box, or follow a
+        /// card link — by which pane was hit.
         fn on_click(&mut self, x: f32, y: f32) {
+            let (vw, vh) = self.viewport();
+            let split = vw * SPLIT_FRAC;
+            let editor_h = (vh - OUTPUT_H).max(0.0);
+            if x >= split {
+                if y < SEARCH_H {
+                    self.search_active = true;
+                    self.invalidate();
+                } else {
+                    self.follow_card_link(x, y);
+                }
+            } else if y < editor_h {
+                self.search_active = false;
+                self.place_caret(x, y);
+            }
+        }
+
+        /// Place the editor caret nearest a click in the listing's source column.
+        fn place_caret(&mut self, x: f32, y: f32) {
+            let rows = self.row_layout();
+            let row = rows
+                .iter()
+                .position(|&(top, h)| y >= top && y < top + h)
+                .unwrap_or_else(|| self.doc.line_count().saturating_sub(1));
+            let line = self.doc.line(row).to_string();
+            let target = x - SRC_X;
+            // Walk char boundaries, keep the one whose x is nearest the click.
+            let (mut best, mut best_d) = (0usize, f32::MAX);
+            let mut idx = 0usize;
+            loop {
+                let d = (measure(&line[..idx]) - target).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = idx;
+                }
+                if idx >= line.len() {
+                    break;
+                }
+                idx += line[idx..].chars().next().unwrap().len_utf8();
+            }
+            self.doc.set_caret(row, best);
+            self.after_caret();
+            self.invalidate();
+        }
+
+        /// Follow a `was:` link in the card region.
+        fn follow_card_link(&mut self, x: f32, y: f32) {
             let Some(layout) = self.card_layout.as_ref() else { return };
             let dy = y + self.card_scroll;
             let href = layout
@@ -602,8 +824,7 @@ main:
                 .map(|h| h.href.clone());
             if let Some(href) = href {
                 if let Some(target) = studio::nav_target(&href) {
-                    // Navigate the card; force a fresh card even for the same word.
-                    self.card_word.clear();
+                    self.card_word.clear(); // force a fresh card even for the same word
                     self.refresh_card(Some(target.to_string()));
                     self.invalidate();
                 }
@@ -782,7 +1003,8 @@ main:
                 LRESULT(0)
             }
             WM_KEYDOWN => {
-                if app.on_key(VIRTUAL_KEY(wparam.0 as u16)) {
+                let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                if app.on_key(VIRTUAL_KEY(wparam.0 as u16), ctrl) {
                     LRESULT(0)
                 } else {
                     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
