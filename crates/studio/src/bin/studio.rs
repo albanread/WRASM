@@ -566,17 +566,24 @@ main:
             self.invalidate();
         }
 
+        /// Where the built exe goes: next to the saved source (so its name is
+        /// obvious and any files it writes land beside it), else a temp file.
+        fn output_exe_path(&self) -> PathBuf {
+            match &self.path {
+                Some(p) => p.with_extension("exe"),
+                None => std::env::temp_dir().join("studio_build.exe"),
+            }
+        }
+
         /// Assemble the whole buffer to a self-contained exe and report.
         fn build_exe(&mut self) {
             let Some(lang) = self.lang.as_ref() else { return };
+            let out = self.output_exe_path();
             self.notice = match lang.assemble(&self.doc.text(), Emit::Exe) {
-                Some(Response::Assembled { bytes, info, .. }) => {
-                    let out: PathBuf = std::env::temp_dir().join("studio_build.exe");
-                    match std::fs::write(&out, &bytes) {
-                        Ok(()) => format!("built {} — {info}", out.display()),
-                        Err(e) => format!("build ok ({info}) but write failed: {e}"),
-                    }
-                }
+                Some(Response::Assembled { bytes, info, .. }) => match std::fs::write(&out, &bytes) {
+                    Ok(()) => format!("built {} — {info}", out.display()),
+                    Err(e) => format!("build ok ({info}) but write failed: {e}"),
+                },
                 Some(Response::Error { message, .. }) => format!("build error: {message}"),
                 _ => return,
             };
@@ -1272,17 +1279,26 @@ main:
             out
         }
 
+        /// Build the buffer and launch it. A console program gets its own
+        /// console; a windowed one just opens. Run with the exe's own directory
+        /// as the working dir so files it writes (a .bmp, say) land beside it.
         fn run_exe(&mut self) {
             let Some(lang) = self.lang.as_ref() else { return };
-            let out = std::env::temp_dir().join("studio_run.exe");
+            let out = self.output_exe_path();
             self.notice = match lang.assemble(&self.doc.text(), Emit::Exe) {
-                Some(Response::Assembled { bytes, .. }) if std::fs::write(&out, &bytes).is_ok() => {
-                    // A new console window that stays open after the program exits.
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/C", "start", "", "cmd", "/K", &out.to_string_lossy()])
-                        .spawn();
-                    format!("running {}", out.display())
-                }
+                Some(Response::Assembled { bytes, .. }) => match std::fs::write(&out, &bytes) {
+                    Ok(()) => {
+                        let mut cmd = std::process::Command::new(&out);
+                        if let Some(dir) = out.parent() {
+                            cmd.current_dir(dir);
+                        }
+                        match cmd.spawn() {
+                            Ok(_) => format!("running {}", out.display()),
+                            Err(e) => format!("launch failed: {e}"),
+                        }
+                    }
+                    Err(e) => format!("write failed: {e}"),
+                },
                 Some(Response::Error { message, .. }) => format!("build error: {message}"),
                 _ => "build failed".to_string(),
             };
