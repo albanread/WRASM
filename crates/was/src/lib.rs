@@ -225,7 +225,7 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             block_ctr += 1;
             block_stack.push(Block::If { id, next: 1, else_seen: false });
             out.push_str(
-                &cond_test(cond, &format!("__if{id}_1"), kb, &labels)
+                &cond_jump(cond, &format!("__if{id}_1"), false, kb, &labels)
                     .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
             );
         } else if let Some(cond) = strip_keyword(t, ".elseif") {
@@ -240,7 +240,7 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             };
             out.push_str(&format!("  jmp __if{id}_end\n__if{id}_{cur}:\n"));
             out.push_str(
-                &cond_test(cond, &format!("__if{id}_{}", cur + 1), kb, &labels)
+                &cond_jump(cond, &format!("__if{id}_{}", cur + 1), false, kb, &labels)
                     .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
             );
         } else if t == ".else" {
@@ -270,7 +270,7 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             block_stack.push(Block::While { id });
             out.push_str(&format!("__while{id}_top:\n"));
             out.push_str(
-                &cond_test(cond, &format!("__while{id}_end"), kb, &labels)
+                &cond_jump(cond, &format!("__while{id}_end"), false, kb, &labels)
                     .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
             );
         } else if t == ".endw" {
@@ -291,22 +291,50 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
                 Some(Block::Repeat { id }) => {
                     out.push_str(&format!("__repeat{id}_test:\n"));
                     out.push_str(
-                        &cond_test(cond, &format!("__repeat{id}_top"), kb, &labels)
+                        &cond_jump(cond, &format!("__repeat{id}_top"), false, kb, &labels)
                             .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
                     );
                     out.push_str(&format!("__repeat{id}_end:\n"));
                 }
                 _ => bail!("line {src_line}: `.until` without an open `.repeat`"),
             }
-        } else if t == ".break" || t == ".continue" {
-            // Jump out of / back into the innermost enclosing loop.
-            let (cont, brk) = block_stack
-                .iter()
-                .rev()
-                .find_map(Block::loop_targets)
-                .ok_or_else(|| anyhow::anyhow!("line {src_line}: `{t}` outside a loop"))?;
-            let target = if t == ".break" { brk } else { cont };
-            out.push_str(&format!("  jmp {target}\n"));
+        } else if let Some(rest) = strip_keyword(t, ".for") {
+            // `.for reg = start to end` → init, top label, test, exit branch.
+            let (reg, range) = rest.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("line {src_line}: `.for` wants `reg = start to end`")
+            })?;
+            let (start, end) = range.split_once(" to ").ok_or_else(|| {
+                anyhow::anyhow!("line {src_line}: `.for` wants `start to end`")
+            })?;
+            let reg = resolve_operands(reg.trim(), kb, &labels)?;
+            let start = resolve_operands(start.trim(), kb, &labels)?;
+            let end = resolve_operands(end.trim(), kb, &labels)?;
+            let id = block_ctr;
+            block_ctr += 1;
+            out.push_str(&format!(
+                "  mov {reg}, {start}\n__for{id}_top:\n  cmp {reg}, {end}\n  ja __for{id}_end\n"
+            ));
+            block_stack.push(Block::For { id, reg });
+        } else if t == ".forever" {
+            // `.forever` … `.endfor` → an infinite loop; leave only via `.break`.
+            let id = block_ctr;
+            block_ctr += 1;
+            block_stack.push(Block::Forever { id });
+            out.push_str(&format!("__forever{id}_top:\n"));
+        } else if t == ".endfor" {
+            match block_stack.pop() {
+                Some(Block::For { id, reg }) => out.push_str(&format!(
+                    "__for{id}_cont:\n  inc {reg}\n  jmp __for{id}_top\n__for{id}_end:\n"
+                )),
+                Some(Block::Forever { id }) => {
+                    out.push_str(&format!("  jmp __forever{id}_top\n__forever{id}_end:\n"))
+                }
+                _ => bail!("line {src_line}: `.endfor` without an open `.for`/`.forever`"),
+            }
+        } else if let Some(rest) = strip_keyword(t, ".break") {
+            out.push_str(&loop_jump(rest, true, &block_stack, kb, &labels, src_line, raw)?);
+        } else if let Some(rest) = strip_keyword(t, ".continue") {
+            out.push_str(&loop_jump(rest, false, &block_stack, kb, &labels, src_line, raw)?);
         } else if t.starts_with('.') {
             // Directives pass through untouched.
             out.push_str(body);
@@ -335,39 +363,55 @@ enum Block {
     If { id: usize, next: usize, else_seen: bool },
     While { id: usize },
     Repeat { id: usize },
+    For { id: usize, reg: String },
+    Forever { id: usize },
 }
 
 impl Block {
     /// `(continue_target, break_target)` if this block is a loop. `.continue`
-    /// jumps to the test (re-evaluating it); `.break` jumps past the loop.
+    /// re-evaluates the test (a `.for` still runs its increment); `.break` jumps
+    /// past the loop.
     fn loop_targets(&self) -> Option<(String, String)> {
-        match self {
-            Block::While { id } => Some((format!("__while{id}_top"), format!("__while{id}_end"))),
-            Block::Repeat { id } => Some((format!("__repeat{id}_test"), format!("__repeat{id}_end"))),
-            Block::If { .. } => None,
-        }
+        Some(match self {
+            Block::While { id } => (format!("__while{id}_top"), format!("__while{id}_end")),
+            Block::Repeat { id } => (format!("__repeat{id}_test"), format!("__repeat{id}_end")),
+            Block::For { id, .. } => (format!("__for{id}_cont"), format!("__for{id}_end")),
+            Block::Forever { id } => (format!("__forever{id}_top"), format!("__forever{id}_end")),
+            Block::If { .. } => return None,
+        })
     }
 }
 
-/// The branch taken when a `reg <relop> val` condition is *false* — used to skip
-/// a clause (`.if`/`.elseif`), leave a loop (`.while`), or repeat one (`.until`).
-/// Unsigned (`ja`/`jb`/…), the right choice for the counters and characters these
-/// constructs iterate.
-fn cond_false_branch(relop: &str) -> Option<&'static str> {
-    Some(match relop {
-        "<=" => "ja",
-        "<" => "jae",
-        ">=" => "jb",
-        ">" => "jbe",
-        "==" => "jne",
-        "!=" => "je",
+/// The `jcc` taken when a `reg <relop> val` condition is `want` (true / false).
+/// Unsigned by default (`ja`/`jb`/…); an `s`-prefixed operator (`s<`, `s>=`, …)
+/// picks the signed branch (`jl`/`jge`/…). Equality is sign-agnostic.
+fn cond_branch(relop: &str, want: bool) -> Option<&'static str> {
+    #[rustfmt::skip]
+    let b = match (relop, want) {
+        ("<=", true) => "jbe", ("<=", false) => "ja",
+        ("<",  true) => "jb",  ("<",  false) => "jae",
+        (">=", true) => "jae", (">=", false) => "jb",
+        (">",  true) => "ja",  (">",  false) => "jbe",
+        ("s<=", true) => "jle", ("s<=", false) => "jg",
+        ("s<",  true) => "jl",  ("s<",  false) => "jge",
+        ("s>=", true) => "jge", ("s>=", false) => "jl",
+        ("s>",  true) => "jg",  ("s>",  false) => "jle",
+        ("==", true) => "je",  ("==", false) => "jne",
+        ("!=", true) => "jne", ("!=", false) => "je",
         _ => return None,
-    })
+    };
+    Some(b)
 }
 
-/// Split a condition into `(lhs, relop, rhs)`; two-char operators first.
+/// Split a condition into `(lhs, relop, rhs)`; longest operators first so `s<=`
+/// beats `s<` beats `<`.
 fn split_condition(cond: &str) -> Option<(&str, &str, &str)> {
-    for op in ["<=", ">=", "==", "!="] {
+    for op in ["s<=", "s>="] {
+        if let Some(p) = cond.find(op) {
+            return Some((&cond[..p], op, &cond[p + op.len()..]));
+        }
+    }
+    for op in ["<=", ">=", "==", "!=", "s<", "s>"] {
         if let Some(p) = cond.find(op) {
             return Some((&cond[..p], op, &cond[p + op.len()..]));
         }
@@ -380,17 +424,54 @@ fn split_condition(cond: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
-/// Lower `reg <relop> val` to `cmp reg, val` plus the false-branch to `target`.
-/// Shared by `.if`/`.elseif`, `.while`, and `.until`. Operands resolve like any
-/// instruction's, so a constant or `'z'` works as the bound.
-fn cond_test(cond: &str, target: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+/// Lower `reg <relop> val` to `cmp reg, val` plus the branch to `target`, taken
+/// when the condition is `want`. `want=false` skips a clause / leaves a loop
+/// (`.if`/`.while`/`.until`); `want=true` is the `.break if`/`.continue if` form.
+/// Operands resolve like any instruction's, so a constant or `'z'` works.
+fn cond_jump(
+    cond: &str,
+    target: &str,
+    want: bool,
+    kb: &Kb,
+    labels: &HashSet<String>,
+) -> Result<String> {
     let (lhs, relop, rhs) = split_condition(cond)
         .ok_or_else(|| anyhow::anyhow!("condition wants `reg <relop> value`, got `{cond}`"))?;
-    let branch = cond_false_branch(relop)
+    let branch = cond_branch(relop, want)
         .ok_or_else(|| anyhow::anyhow!("unknown relational operator `{relop}`"))?;
     let lhs = resolve_operands(lhs.trim(), kb, labels)?;
     let rhs = resolve_operands(rhs.trim(), kb, labels)?;
     Ok(format!("  cmp {lhs}, {rhs}\n  {branch} {target}\n"))
+}
+
+/// Lower `.break`/`.continue` (`brk` selects which) with an optional `if <cond>`
+/// suffix: unconditional → a `jmp` to the innermost loop's end/continue target;
+/// `if <cond>` → a `cmp` plus the branch taken when the condition holds.
+fn loop_jump(
+    rest: &str,
+    brk: bool,
+    stack: &[Block],
+    kb: &Kb,
+    labels: &HashSet<String>,
+    src_line: usize,
+    raw: &str,
+) -> Result<String> {
+    let word = if brk { "break" } else { "continue" };
+    let (cont, end) = stack
+        .iter()
+        .rev()
+        .find_map(Block::loop_targets)
+        .ok_or_else(|| anyhow::anyhow!("line {src_line}: `.{word}` outside a loop"))?;
+    let target = if brk { end } else { cont };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        Ok(format!("  jmp {target}\n"))
+    } else if let Some(cond) = strip_keyword(rest, "if") {
+        cond_jump(cond, &target, true, kb, labels)
+            .with_context(|| format!("line {src_line}: `{}`", raw.trim()))
+    } else {
+        bail!("line {src_line}: `.{word}` expects nothing or `if <cond>`")
+    }
 }
 
 /// Collect labels defined in this source so we never resolve them as constants.
@@ -756,11 +837,14 @@ mod tests {
     fn condition_parsing_and_branches() {
         assert_eq!(split_condition("al <= 'z'"), Some(("al ", "<=", " 'z'")));
         assert_eq!(split_condition("rcx < 26"), Some(("rcx ", "<", " 26")));
-        assert_eq!(split_condition("al != 0"), Some(("al ", "!=", " 0")));
+        assert_eq!(split_condition("eax s>= 0"), Some(("eax ", "s>=", " 0")));
+        assert_eq!(split_condition("eax s< 0"), Some(("eax ", "s<", " 0")));
         assert!(split_condition("al z").is_none());
-        assert_eq!(cond_false_branch("<="), Some("ja"));
-        assert_eq!(cond_false_branch(">"), Some("jbe"));
-        assert!(cond_false_branch("~~").is_none());
+        // The branch is taken when the condition is `want`; `s` picks signed.
+        assert_eq!(cond_branch("<=", false), Some("ja")); // unsigned exit
+        assert_eq!(cond_branch("s<", false), Some("jge")); // signed exit
+        assert_eq!(cond_branch("s<", true), Some("jl")); // signed, condition holds
+        assert!(cond_branch("~~", false).is_none());
     }
 
     #[test]
@@ -810,10 +894,54 @@ mod tests {
     }
 
     #[test]
+    fn for_loop_lowers_and_assembles() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  .for cl = 0 to 9\n    nop\n  .endfor\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        for want in [
+            "mov cl, 0", "__for0_top:", "cmp cl, 9", "ja __for0_end", "__for0_cont:", "inc cl",
+            "jmp __for0_top", "__for0_end:",
+        ] {
+            assert!(low.contains(want), "for-expansion missing {want:?}:\n{low}");
+        }
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn forever_with_break_if_lowers_and_assembles() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  xor al, al\n  .forever\n    inc al\n    .break if al == 5\n  .endfor\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        for want in ["__forever0_top:", "cmp al, 5", "je __forever0_end", "jmp __forever0_top", "__forever0_end:"] {
+            assert!(low.contains(want), "forever/break-if missing {want:?}:\n{low}");
+        }
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn continue_if_targets_the_loop_test() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  mov al, 'a'\n  .while al <= 'z'\n    inc al\n    .continue if al == 'm'\n    nop\n  .endw\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        assert!(low.contains("je __while0_top"), "continue if -> loop test:\n{low}");
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn signed_while_uses_a_signed_branch() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  mov eax, 3\n  .while eax s> 0\n    nop\n  .endw\n  ret\n";
+        let low = lower(src, &kb).expect("lower");
+        assert!(low.contains("jle __while0_end"), "signed `s>` exits with jle:\n{low}");
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
     fn mismatched_block_closers_error() {
         let Some(kb) = kb() else { return };
         assert!(lower("main:\n  .if al == 1\n  .endw\n", &kb).is_err(), ".endw must not close .if");
         assert!(lower("main:\n  .endif\n", &kb).is_err(), ".endif without .if");
+        assert!(lower("main:\n  .endfor\n", &kb).is_err(), ".endfor without .for/.forever");
         assert!(lower("main:\n  .break\n", &kb).is_err(), ".break outside a loop");
         assert!(lower("main:\n  .until al == 1\n", &kb).is_err(), ".until without .repeat");
     }
