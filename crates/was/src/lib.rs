@@ -111,9 +111,9 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
             continue;
         }
         if let Some(rest) = strip_keyword(t, "proc") {
-            let (name, uses, _, _) = parse_proc(rest);
-            let saved: Vec<&'static str> = uses.iter().filter_map(|u| nonvol_reg(u)).collect();
-            cur = Some((name, saved));
+            let h = parse_proc(rest);
+            let saved: Vec<&'static str> = h.uses.iter().filter_map(|u| nonvol_reg(u)).collect();
+            cur = Some((h.name, saved));
             continue;
         }
         if t == "endproc" {
@@ -1015,6 +1015,37 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     // instructive value (a raw string block) — map them to source line 0 so the
     // grey ghost view shows nothing for them.
     let mut ghost_suppress = false;
+    // Pre-pass: size each `frame` proc's reserved area (shadow + the largest
+    // outgoing-arg list in its body), keyed by the proc's 1-based line.
+    let mut proc_frame: HashMap<usize, usize> = HashMap::new();
+    {
+        let mut start = None;
+        let mut pushes = 0;
+        let mut framed = false;
+        let mut max_args = 0;
+        for (i, raw) in src.lines().enumerate() {
+            let t = strip_comment(raw).trim();
+            if let Some(rest) = strip_keyword(t, "proc") {
+                let h = parse_proc(rest);
+                start = Some(i + 1);
+                pushes = h.uses.len();
+                framed = h.frame;
+                max_args = 0;
+            } else if t == "endproc" {
+                if framed {
+                    if let Some(s) = start {
+                        proc_frame.insert(s, proc_frame_size(pushes, max_args));
+                    }
+                }
+                start = None;
+                framed = false;
+            } else if start.is_some() && framed {
+                if let Some(c) = call_arg_count(t) {
+                    max_args = max_args.max(c);
+                }
+            }
+        }
+    }
     for (i, raw) in src.lines().enumerate() {
         let src_line = i + 1;
         let start = out.len();
@@ -1059,12 +1090,12 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             pending_struct = Some(StructAccum { label, ty, fields: Vec::new() });
         } else if let Some(rest) = strip_keyword(t, "invoke") {
             // `invoke Func, args…`
-            let expanded = expand_invoke(rest, kb, &labels)
+            let expanded = expand_invoke(rest, kb, &labels, in_framed_proc(&block_stack))
                 .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
             out.push_str(&expanded);
         } else if let Some(rest) = strip_keyword(t, "comcall") {
             // `comcall obj, Interface, Method, args…` — COM vtable call (db-aware)
-            let expanded = expand_comcall(rest, kb, &labels)
+            let expanded = expand_comcall(rest, kb, &labels, in_framed_proc(&block_stack))
                 .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
             out.push_str(&expanded);
         } else if let Some(rest) = strip_keyword(t, "iid") {
@@ -1083,7 +1114,7 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             } else {
                 format!("[rip + {obj}], {iface}, {method}, {args}")
             };
-            let expanded = expand_comcall(&rest, kb, &labels)
+            let expanded = expand_comcall(&rest, kb, &labels, in_framed_proc(&block_stack))
                 .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
             out.push_str(&expanded);
         } else if let Some(cond) = strip_keyword(t, ".if") {
@@ -1209,26 +1240,34 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             if block_stack.iter().any(|b| matches!(b, Block::Proc { .. })) {
                 bail!("line {src_line}: `proc` inside a `proc` — close the first with `endproc`");
             }
-            let (name, uses, _ins, _outs) = parse_proc(rest);
-            if name.is_empty() {
+            let h = parse_proc(rest);
+            if h.name.is_empty() {
                 bail!("line {src_line}: `proc` needs a name");
             }
-            out.push_str(&format!("{name}:\n"));
-            for r in &uses {
+            let frame_size = proc_frame.get(&src_line).copied().unwrap_or(0);
+            out.push_str(&format!("{}:\n", h.name));
+            for r in &h.uses {
                 out.push_str(&format!("  push {r}\n"));
             }
-            block_stack.push(Block::Proc { uses });
+            if frame_size > 0 {
+                out.push_str(&format!("  sub rsp, {frame_size}\n"));
+            }
+            block_stack.push(Block::Proc { uses: h.uses, frame_size });
         } else if t == "endproc" {
             match block_stack.pop() {
-                Some(Block::Proc { uses }) => out.push_str(&proc_epilogue(&uses)),
+                Some(Block::Proc { uses, frame_size }) => {
+                    out.push_str(&proc_epilogue(&uses, frame_size))
+                }
                 _ => bail!("line {src_line}: `endproc` without an open `proc`"),
             }
         } else if t == ".ret" || t == "ret" {
-            // Inside a proc, a return restores the saved registers first. `.ret` is
-            // the explicit early-exit form; a bare `ret` is intercepted too so it
-            // can't skip the epilogue.
+            // Inside a proc, a return releases the frame and restores the saved
+            // registers first. `.ret` is the explicit early-exit form; a bare
+            // `ret` is intercepted too so it can't skip the epilogue.
             match block_stack.iter().rev().find(|b| matches!(b, Block::Proc { .. })) {
-                Some(Block::Proc { uses }) => out.push_str(&proc_epilogue(uses)),
+                Some(Block::Proc { uses, frame_size }) => {
+                    out.push_str(&proc_epilogue(uses, *frame_size))
+                }
                 _ if t == ".ret" => bail!("line {src_line}: `.ret` outside a `proc`"),
                 _ => out.push_str("  ret\n"),
             }
@@ -1275,42 +1314,99 @@ enum Block {
     Repeat { id: usize },
     For { id: usize, reg: String },
     Forever { id: usize },
-    /// `proc … endproc` — `uses` are the saved registers, popped in reverse.
-    /// No frame: an `invoke` inside aligns the stack and reserves its own shadow
-    /// space, and preserves these (callee-saved) registers across the call.
-    Proc { uses: Vec<String> },
+    /// `proc … endproc` — `uses` are the saved registers (popped in reverse).
+    /// `frame_size` > 0 for a `frame` proc: the bytes reserved once in the
+    /// prologue (shadow space + outgoing args) so the calls inside skip their
+    /// per-call alignment; the epilogue releases it. 0 for an unframed proc.
+    Proc { uses: Vec<String>, frame_size: usize },
 }
 
-/// `proc NAME [uses R…] [in R…] [out R…]` — the `uses`/`in`/`out` keywords
-/// delimit space/comma-separated register lists. Returns (name, uses, ins, outs).
-fn parse_proc(rest: &str) -> (String, Vec<String>, Vec<String>, Vec<String>) {
-    let mut name = String::new();
-    let (mut uses, mut ins, mut outs) = (Vec::new(), Vec::new(), Vec::new());
+/// A parsed `proc` header.
+struct ProcHdr {
+    name: String,
+    uses: Vec<String>,
+    ins: Vec<String>,
+    outs: Vec<String>,
+    /// `frame` was given: reserve the shadow space + outgoing-arg area once so the
+    /// calls inside skip their per-call alignment.
+    frame: bool,
+}
+
+/// `proc NAME [uses R…] [in R…] [out R…] [frame]` — the keywords delimit
+/// space/comma-separated register lists; `frame` is a bare flag.
+fn parse_proc(rest: &str) -> ProcHdr {
+    let mut h = ProcHdr {
+        name: String::new(),
+        uses: Vec::new(),
+        ins: Vec::new(),
+        outs: Vec::new(),
+        frame: false,
+    };
     let mut bucket = 0u8; // 0 = name, 1 = uses, 2 = in, 3 = out
     for tok in rest.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()) {
         match tok.to_ascii_lowercase().as_str() {
             "uses" => bucket = 1,
             "in" => bucket = 2,
             "out" => bucket = 3,
+            "frame" => h.frame = true,
             _ => match bucket {
-                0 => name = tok.to_string(),
-                1 => uses.push(tok.to_ascii_lowercase()),
-                2 => ins.push(tok.to_ascii_lowercase()),
-                _ => outs.push(tok.to_ascii_lowercase()),
+                0 => h.name = tok.to_string(),
+                1 => h.uses.push(tok.to_ascii_lowercase()),
+                2 => h.ins.push(tok.to_ascii_lowercase()),
+                _ => h.outs.push(tok.to_ascii_lowercase()),
             },
         }
     }
-    (name, uses, ins, outs)
+    h
 }
 
-/// The proc epilogue: restore the saved registers in reverse, then `ret`.
-fn proc_epilogue(uses: &[String]) -> String {
+/// The number of Win64 arguments a call line marshals (including the COM `this`),
+/// for sizing a framed proc's outgoing-argument area. `None` if not a call.
+fn call_arg_count(t: &str) -> Option<usize> {
+    if let Some(rest) = strip_keyword(t, "invoke") {
+        return Some(split_top_commas(rest).len().saturating_sub(1)); // minus the function
+    }
+    if let Some(rest) = strip_keyword(t, "comcall") {
+        return Some(1 + split_top_commas(rest).len().saturating_sub(3)); // this + method args
+    }
+    if is_method_call_shape(t) {
+        let inside = t
+            .split_once('(')
+            .and_then(|(_, r)| r.rsplit_once(')'))
+            .map(|(a, _)| a.trim())
+            .unwrap_or("");
+        let argc = if inside.is_empty() { 0 } else { split_top_commas(inside).len() };
+        return Some(1 + argc); // this + method args
+    }
+    None
+}
+
+/// The bytes a framed proc reserves: 32 (shadow) + the outgoing stack args, padded
+/// so that with `pushes` saved registers the stack is 16-aligned at every call.
+fn proc_frame_size(pushes: usize, max_args: usize) -> usize {
+    let base = 32 + max_args.saturating_sub(4) * 8;
+    let target = if pushes % 2 == 1 { 0 } else { 8 }; // (8 - 8*pushes) mod 16
+    if base % 16 == target { base } else { base + 8 }
+}
+
+/// The proc epilogue: release the frame, restore the saved registers in reverse,
+/// then `ret`.
+fn proc_epilogue(uses: &[String], frame_size: usize) -> String {
     let mut s = String::new();
+    if frame_size > 0 {
+        s.push_str(&format!("  add rsp, {frame_size}\n"));
+    }
     for r in uses.iter().rev() {
         s.push_str(&format!("  pop {r}\n"));
     }
     s.push_str("  ret\n");
     s
+}
+
+/// Is there an enclosing framed proc — i.e. should a call inside use the cheap
+/// form (no per-call alignment, reuse the proc's reserved frame)?
+fn in_framed_proc(stack: &[Block]) -> bool {
+    stack.iter().any(|b| matches!(b, Block::Proc { frame_size, .. } if *frame_size > 0))
 }
 
 impl Block {
@@ -1565,7 +1661,7 @@ fn resolve_token(tok: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String>
 }
 
 /// Expand `invoke Func, a0, a1, …` to the Win64 call sequence.
-fn expand_invoke(rest: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+fn expand_invoke(rest: &str, kb: &Kb, labels: &HashSet<String>, framed: bool) -> Result<String> {
     let parts = split_top_commas(rest);
     let func = parts.first().map(|s| s.trim()).unwrap_or("");
     if func.is_empty() {
@@ -1580,25 +1676,28 @@ fn expand_invoke(rest: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String
             return Ok(format!(
                 "  ; WARNING: {func} expects {} args, got {n}\n{}",
                 f.params.len(),
-                emit_call(func, &args, kb, labels)?
+                emit_call(func, &args, kb, labels, framed)?
             ));
         }
     }
-    emit_call(func, &args, kb, labels)
+    emit_call(func, &args, kb, labels, framed)
 }
 
-fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+/// Marshal the Win64 arguments then `call`. Without `framed`, the call sets up
+/// its own aligned frame (push rbx / and rsp,-16 / sub / restore). With `framed`,
+/// the enclosing proc has already aligned the stack and reserved the shadow +
+/// outgoing-arg area, so the call is just the arg moves and the `call` — the lean
+/// form your insight asks for.
+fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>, framed: bool) -> Result<String> {
     let n = args.len();
-    let stack_args = n.saturating_sub(4);
-    let stack_bytes = stack_args * 8;
-    let frame = 32 + ((stack_bytes + 15) & !15); // shadow space + aligned stack args
-
     let mut o = String::new();
     o.push_str(&format!("  ; invoke {func} ({n} args)\n"));
-    o.push_str("  push rbx\n  mov rbx, rsp\n  and rsp, -16\n");
-    o.push_str(&format!("  sub rsp, {frame}\n"));
-
-    // Stack args (index >= 4), high to low is irrelevant; place at [rsp+32+...].
+    if !framed {
+        let frame = 32 + ((n.saturating_sub(4) * 8 + 15) & !15);
+        o.push_str("  push rbx\n  mov rbx, rsp\n  and rsp, -16\n");
+        o.push_str(&format!("  sub rsp, {frame}\n"));
+    }
+    // Stack args (index >= 4) at [rsp+32+...] — the reserved outgoing-arg area.
     for (idx, arg) in args.iter().enumerate().skip(4) {
         let off = 32 + (idx - 4) * 8;
         o.push_str(&load_arg("rax", arg, kb, labels)?);
@@ -1609,7 +1708,9 @@ fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>) -> 
         o.push_str(&load_arg(ARG_REGS[idx], arg, kb, labels)?);
     }
     o.push_str(&format!("  call {func}\n"));
-    o.push_str("  mov rsp, rbx\n  pop rbx\n");
+    if !framed {
+        o.push_str("  mov rsp, rbx\n  pop rbx\n");
+    }
     Ok(o)
 }
 
@@ -1635,7 +1736,7 @@ fn vtable_index_of(kb: &Kb, iface: &str, method: &str) -> Result<Option<i64>> {
 /// is the interface pointer (the `this`, arg 0); the method's slot is looked up
 /// in the knowledge db. The expansion is plain, visible code — same Win64
 /// marshaling as `invoke`, but the call is indirect through the vtable.
-fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>, framed: bool) -> Result<String> {
     let parts = split_top_commas(rest);
     if parts.len() < 3 {
         bail!("comcall needs at least: object, interface, method");
@@ -1651,14 +1752,15 @@ fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>) -> Result<Strin
     all.extend(parts[3..].iter().map(|s| s.trim().to_string()));
 
     let n = all.len();
-    let stack_bytes = n.saturating_sub(4) * 8;
-    let frame = 32 + ((stack_bytes + 15) & !15);
     let disp = idx * 8;
 
     let mut o = String::new();
     o.push_str(&format!("  ; comcall {iface}::{method}  (vtbl[{idx}], this + {} arg(s))\n", n - 1));
-    o.push_str("  push rbx\n  mov rbx, rsp\n  and rsp, -16\n");
-    o.push_str(&format!("  sub rsp, {frame}\n"));
+    if !framed {
+        let frame = 32 + ((n.saturating_sub(4) * 8 + 15) & !15);
+        o.push_str("  push rbx\n  mov rbx, rsp\n  and rsp, -16\n");
+        o.push_str(&format!("  sub rsp, {frame}\n"));
+    }
     for (i, arg) in all.iter().enumerate().skip(4) {
         let off = 32 + (i - 4) * 8;
         o.push_str(&load_arg("rax", arg, kb, labels)?);
@@ -1669,7 +1771,9 @@ fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>) -> Result<Strin
     }
     o.push_str("  mov rax, [rcx]\n"); // vtable, from the `this` pointer in rcx
     o.push_str(&format!("  call qword ptr [rax + {disp}]\n"));
-    o.push_str("  mov rsp, rbx\n  pop rbx\n");
+    if !framed {
+        o.push_str("  mov rsp, rbx\n  pop rbx\n");
+    }
     Ok(o)
 }
 
@@ -1987,11 +2091,13 @@ mod tests {
 
     #[test]
     fn proc_parses_and_contract_checks() {
-        let (name, uses, ins, outs) = parse_proc("add3 uses rbx rsi in rcx rdx out rax");
-        assert_eq!(name, "add3");
-        assert_eq!(uses, ["rbx", "rsi"]);
-        assert_eq!(ins, ["rcx", "rdx"]);
-        assert_eq!(outs, ["rax"]);
+        let h = parse_proc("add3 uses rbx rsi in rcx rdx out rax");
+        assert_eq!(h.name, "add3");
+        assert_eq!(h.uses, ["rbx", "rsi"]);
+        assert_eq!(h.ins, ["rcx", "rdx"]);
+        assert_eq!(h.outs, ["rax"]);
+        assert!(!h.frame);
+        assert!(parse_proc("f uses rbx frame").frame);
 
         // modifies a callee-saved register it didn't declare
         let bad = ".code\nproc f uses rbx\n  mov rsi, rcx\nendproc\n";
@@ -2002,6 +2108,29 @@ mod tests {
         // declared → clean; volatile scratch (rcx/r10) is always free
         let ok = ".code\nproc f uses rbx rsi\n  mov rsi, rcx\n  mov rbx, rdx\n  mov rcx, 1\n  xor r10, r10\nendproc\n";
         assert!(proc_contract_diags(ok).is_empty(), "{:?}", proc_contract_diags(ok));
+    }
+
+    #[test]
+    fn framed_proc_sizing_and_lean_calls() {
+        // arg counts (incl. the COM `this`)
+        assert_eq!(call_arg_count("invoke Foo, a, b"), Some(2));
+        assert_eq!(call_arg_count("comcall obj, I, M, a, b"), Some(3));
+        assert_eq!(call_arg_count("p.Draw(3, 0)"), Some(3));
+        assert_eq!(call_arg_count("mov rax, 1"), None);
+        // frame size: 32 shadow + outgoing stack args, padded so rsp is 16-aligned
+        // at the call given the saved-register pushes.
+        assert_eq!(proc_frame_size(1, 2), 32); // 1 push → already aligned
+        assert_eq!(proc_frame_size(0, 0), 40); // 0 push → +8 pad
+        assert_eq!(proc_frame_size(1, 6), 48); // 2 stack args
+        assert_eq!(proc_frame_size(2, 0), 40); // 2 push → +8 pad
+
+        // A framed proc reserves once; the call inside drops its own ceremony.
+        let Some(kb) = kb() else { return };
+        let low = lower(".code\nproc w uses rbx frame\n  invoke Sleep, 0\nendproc\n", &kb).unwrap();
+        assert!(low.contains("sub rsp, 32") && low.contains("add rsp, 32"), "frame once:\n{low}");
+        let body = low.split("sub rsp, 32").nth(1).unwrap();
+        assert!(!body.contains("and rsp, -16"), "framed call must not re-align:\n{body}");
+        assert!(body.contains("call Sleep"));
     }
 
     #[test]
