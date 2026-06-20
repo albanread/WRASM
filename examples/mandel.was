@@ -1,0 +1,187 @@
+; mandel.was — a Mandelbrot set, computed in SSE double precision into a
+; software framebuffer, written to mandel.bmp, and shown live in a window.
+;
+;   was examples\mandel.was -o mandel.exe   &&   mandel.exe
+;
+; 640x480, view box x∈[-2.5,1.0]  y∈[-1.25,1.25], up to 256 iterations.
+; In-set pixels are black; escaped pixels fade to white by iteration count.
+
+.DATA
+; ---- view constants, as IEEE-754 double bit patterns ----
+four        QWORD  0x4010000000000000     ; 4.0  (escape radius squared)
+xmin        QWORD  0xC004000000000000     ; -2.5
+xspan       QWORD  0x400C000000000000     ;  3.5
+ymin        QWORD  0xBFF4000000000000     ; -1.25
+yspan       QWORD  0x4004000000000000     ;  2.5
+dwidth      QWORD  0x4084000000000000     ;  640.0
+dheight     QWORD  0x407E000000000000     ;  480.0
+
+className   WCHAR  "rasm_mandel", 0
+titleText   WCHAR  "RASM — Mandelbrot (SSE, software framebuffer)", 0
+fname       WCHAR  "mandel.bmp", 0
+
+wc          BYTE   80 dup(0)              ; WNDCLASSEXW
+bmi         BYTE   40 dup(0)              ; BITMAPINFOHEADER
+msg         BYTE   48 dup(0)              ; MSG
+ps          BYTE   72 dup(0)              ; PAINTSTRUCT
+; BITMAPFILEHEADER: "BM", bfSize=54+640*480*4, 0,0, bfOffBits=54
+filehdr     BYTE   0x42,0x4D, 0x36,0xC4,0x12,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+
+fb          QWORD  ?                       ; framebuffer pointer
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    ; framebuffer = VirtualAlloc(NULL, 640*480*4, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4
+    mov     [rip + fb], rax
+
+    ; ================= compute the Mandelbrot into the framebuffer =================
+    ; (no calls in this region, so the volatile registers are ours to use)
+    mov     rdi, rax                        ; pixel write pointer
+    xor     r8, r8                          ; py
+py_loop:
+    ; cy = ymin + (py / 480) * yspan
+    cvtsi2sd xmm3, r8
+    divsd   xmm3, [rip + dheight]
+    mulsd   xmm3, [rip + yspan]
+    addsd   xmm3, [rip + ymin]
+    xor     r9, r9                          ; px
+px_loop:
+    ; cx = xmin + (px / 640) * xspan
+    cvtsi2sd xmm2, r9
+    divsd   xmm2, [rip + dwidth]
+    mulsd   xmm2, [rip + xspan]
+    addsd   xmm2, [rip + xmin]
+
+    xorps   xmm0, xmm0                      ; zx = 0
+    xorps   xmm1, xmm1                      ; zy = 0
+    xor     r10, r10                        ; iter = 0
+it_loop:
+    movsd   xmm4, xmm0
+    mulsd   xmm4, xmm0                      ; zx2 = zx*zx
+    movsd   xmm5, xmm1
+    mulsd   xmm5, xmm1                      ; zy2 = zy*zy
+    movsd   xmm6, xmm4
+    addsd   xmm6, xmm5                      ; zx2 + zy2
+    ucomisd xmm6, [rip + four]
+    ja      it_done                         ; |z|^2 > 4 → escaped
+    ; zy = 2*zx*zy + cy
+    movsd   xmm6, xmm0
+    mulsd   xmm6, xmm1                      ; zx*zy
+    addsd   xmm6, xmm6                      ; 2*zx*zy
+    addsd   xmm6, xmm3                      ; + cy
+    ; zx = zx2 - zy2 + cx
+    subsd   xmm4, xmm5                      ; zx2 - zy2
+    addsd   xmm4, xmm2                      ; + cx
+    movsd   xmm1, xmm6                      ; zy'
+    movsd   xmm0, xmm4                      ; zx'
+    inc     r10
+    cmp     r10, 256
+    jb      it_loop
+it_done:
+    ; colour: in-set (iter==256) → black; else colourful bands from iter —
+    ; B=(iter*8), G=(iter*4), R=(iter*2), each wrapped to a byte.
+    mov     eax, r10d
+    cmp     eax, 256
+    jb      shade
+    xor     eax, eax
+    jmp     put
+shade:
+    mov     ecx, eax
+    shl     ecx, 3
+    and     ecx, 0xFF                       ; B
+    mov     edx, eax
+    shl     edx, 2
+    and     edx, 0xFF
+    shl     edx, 8
+    or      ecx, edx                        ; | G<<8
+    mov     edx, eax
+    shl     edx, 1
+    and     edx, 0xFF
+    shl     edx, 16
+    or      ecx, edx                        ; | R<<16
+    mov     eax, ecx
+put:
+    mov     [rdi], eax
+    add     rdi, 4
+    inc     r9
+    cmp     r9, 640
+    jb      px_loop
+    inc     r8
+    cmp     r8, 480
+    jb      py_loop
+
+    ; ================= BITMAPINFOHEADER (top-down 32bpp) =================
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    ; ================= save mandel.bmp =================
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0   ; GENERIC_WRITE, CREATE_ALWAYS
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 1228800, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; ================= show it in a window =================
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax                        ; hInstance
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                         ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                          ; WM_DESTROY
+    je      wp_destroy
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
