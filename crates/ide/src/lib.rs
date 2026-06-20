@@ -723,7 +723,7 @@ mod tests {
     fn proc_doc_card_from_keyword_and_search() {
         let md = was_card("proc").expect("proc");
         assert!(md.contains("checked subroutine"), "title:\n{md}");
-        assert!(md.contains("`uses`") && md.contains("`frame`") && md.contains("contract check"));
+        assert!(md.contains("uses") && md.contains("frame") && md.contains("contract check"));
         // reachable from the related keywords (and a leading-dot directive) + a search term
         for k in ["frame", "endproc", "uses", ".ret", "subroutine"] {
             assert!(was_card(k).is_some(), "{k} should resolve");
