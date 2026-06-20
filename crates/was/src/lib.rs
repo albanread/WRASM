@@ -42,6 +42,102 @@ fn clobber_reg(s: &str) -> Option<&'static str> {
 
 const CLOBBER_REGS: [&str; 6] = ["rcx", "rdx", "r8", "r9", "r10", "r11"];
 
+/// The callee-saved general registers — the ones a subroutine must preserve for
+/// its caller (rsp is excluded; it's the stack pointer, managed separately).
+fn nonvol_reg(s: &str) -> Option<&'static str> {
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => "rbx",
+        "rbp" | "ebp" | "bp" | "bpl" => "rbp",
+        "rsi" | "esi" | "si" | "sil" => "rsi",
+        "rdi" | "edi" | "di" | "dil" => "rdi",
+        "r12" | "r12d" | "r12w" | "r12b" => "r12",
+        "r13" | "r13d" | "r13w" | "r13b" => "r13",
+        "r14" | "r14d" | "r14w" | "r14b" => "r14",
+        "r15" | "r15d" | "r15w" | "r15b" => "r15",
+        _ => return None,
+    })
+}
+
+/// The callee-saved register an instruction writes via its destination operand
+/// (operand 0), if any. Read-only forms (cmp/test/push/branches/mul/div) and
+/// memory destinations write no register.
+fn nonvol_writes(t: &str) -> Vec<&'static str> {
+    let (mn, rest) = match t.find(char::is_whitespace) {
+        Some(p) => (t[..p].to_ascii_lowercase(), t[p..].trim()),
+        None => (t.to_ascii_lowercase(), ""),
+    };
+    let read_only = mn.starts_with('j')
+        || matches!(
+            mn.as_str(),
+            "cmp" | "test" | "push" | "mul" | "div" | "idiv" | "call" | "ret" | "nop"
+                | "cdq" | "cqo" | "cwd"
+        );
+    if read_only {
+        return Vec::new();
+    }
+    let ops: Vec<String> = if rest.is_empty() { Vec::new() } else { split_top_commas(rest) };
+    ops.first()
+        .filter(|o| !o.contains('['))
+        .and_then(|o| nonvol_reg(o))
+        .into_iter()
+        .collect()
+}
+
+/// Enforce the `proc … endproc` contract: the body may not modify a callee-saved
+/// register that isn't in the proc's `uses` list (and so wasn't saved by the
+/// prologue) — otherwise the caller's value is silently destroyed. The dual of
+/// the caller-side clobber check.
+pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
+    let mut diags = Vec::new();
+    let mut cur: Option<(String, Vec<&'static str>)> = None;
+    let mut in_code = true;
+    for (i, raw) in src.lines().enumerate() {
+        let t = strip_comment(raw).trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.to_ascii_lowercase().as_str() {
+            ".data" => {
+                in_code = false;
+                continue;
+            }
+            ".code" | ".text" => {
+                in_code = true;
+                continue;
+            }
+            _ => {}
+        }
+        if !in_code {
+            continue;
+        }
+        if let Some(rest) = strip_keyword(t, "proc") {
+            let (name, uses, _, _) = parse_proc(rest);
+            let saved: Vec<&'static str> = uses.iter().filter_map(|u| nonvol_reg(u)).collect();
+            cur = Some((name, saved));
+            continue;
+        }
+        if t == "endproc" {
+            cur = None;
+            continue;
+        }
+        if let Some((name, saved)) = &cur {
+            for w in nonvol_writes(t) {
+                if !saved.contains(&w) {
+                    let col = raw.len() - raw.trim_start().len() + 1;
+                    diags.push(Diag {
+                        line: i + 1,
+                        col,
+                        message: format!(
+                            "proc `{name}` modifies `{w}` (callee-saved) without saving it — add `{w}` to its `uses` list, or the caller's value is lost"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    diags
+}
+
 /// Registers named inside a `[ … ]` memory operand (all reads — they form the
 /// address).
 fn mem_regs(op: &str) -> Vec<&'static str> {
@@ -295,6 +391,11 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
         if in_macro {
             continue;
         }
+        // `proc`/`endproc` are handled by their own contract pass below; skip the
+        // ident scan so the register lists aren't read as unknown constants.
+        if strip_keyword(t, "proc").is_some() || t == "endproc" {
+            continue;
+        }
         // invoke arg-count check
         if let Some(rest) = strip_keyword(t, "invoke") {
             let parts = split_top_commas(rest);
@@ -419,6 +520,8 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
     }
     // Caller-saved register clobbered across a call — a hint, appended last.
     diags.extend(clobber_diags(src));
+    // Callee side: a `proc` modifying a callee-saved register it didn't declare.
+    diags.extend(proc_contract_diags(src));
     diags
 }
 
@@ -1099,6 +1202,36 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             out.push_str(&loop_jump(rest, true, &block_stack, kb, &labels, src_line, raw)?);
         } else if let Some(rest) = strip_keyword(t, ".continue") {
             out.push_str(&loop_jump(rest, false, &block_stack, kb, &labels, src_line, raw)?);
+        } else if let Some(rest) = strip_keyword(t, "proc") {
+            // `proc NAME uses R…` → the label + a visible prologue (push each saved
+            // register, in order); `endproc`/`ret` pop them in reverse. No frame —
+            // each `invoke` inside aligns and shadow-spaces itself.
+            if block_stack.iter().any(|b| matches!(b, Block::Proc { .. })) {
+                bail!("line {src_line}: `proc` inside a `proc` — close the first with `endproc`");
+            }
+            let (name, uses, _ins, _outs) = parse_proc(rest);
+            if name.is_empty() {
+                bail!("line {src_line}: `proc` needs a name");
+            }
+            out.push_str(&format!("{name}:\n"));
+            for r in &uses {
+                out.push_str(&format!("  push {r}\n"));
+            }
+            block_stack.push(Block::Proc { uses });
+        } else if t == "endproc" {
+            match block_stack.pop() {
+                Some(Block::Proc { uses }) => out.push_str(&proc_epilogue(&uses)),
+                _ => bail!("line {src_line}: `endproc` without an open `proc`"),
+            }
+        } else if t == ".ret" || t == "ret" {
+            // Inside a proc, a return restores the saved registers first. `.ret` is
+            // the explicit early-exit form; a bare `ret` is intercepted too so it
+            // can't skip the epilogue.
+            match block_stack.iter().rev().find(|b| matches!(b, Block::Proc { .. })) {
+                Some(Block::Proc { uses }) => out.push_str(&proc_epilogue(uses)),
+                _ if t == ".ret" => bail!("line {src_line}: `.ret` outside a `proc`"),
+                _ => out.push_str("  ret\n"),
+            }
         } else if t.starts_with('.') {
             // GAS directives (our high-level ones are handled above) pass through.
             out.push_str(body);
@@ -1142,6 +1275,42 @@ enum Block {
     Repeat { id: usize },
     For { id: usize, reg: String },
     Forever { id: usize },
+    /// `proc … endproc` — `uses` are the saved registers, popped in reverse.
+    /// No frame: an `invoke` inside aligns the stack and reserves its own shadow
+    /// space, and preserves these (callee-saved) registers across the call.
+    Proc { uses: Vec<String> },
+}
+
+/// `proc NAME [uses R…] [in R…] [out R…]` — the `uses`/`in`/`out` keywords
+/// delimit space/comma-separated register lists. Returns (name, uses, ins, outs).
+fn parse_proc(rest: &str) -> (String, Vec<String>, Vec<String>, Vec<String>) {
+    let mut name = String::new();
+    let (mut uses, mut ins, mut outs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut bucket = 0u8; // 0 = name, 1 = uses, 2 = in, 3 = out
+    for tok in rest.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()) {
+        match tok.to_ascii_lowercase().as_str() {
+            "uses" => bucket = 1,
+            "in" => bucket = 2,
+            "out" => bucket = 3,
+            _ => match bucket {
+                0 => name = tok.to_string(),
+                1 => uses.push(tok.to_ascii_lowercase()),
+                2 => ins.push(tok.to_ascii_lowercase()),
+                _ => outs.push(tok.to_ascii_lowercase()),
+            },
+        }
+    }
+    (name, uses, ins, outs)
+}
+
+/// The proc epilogue: restore the saved registers in reverse, then `ret`.
+fn proc_epilogue(uses: &[String]) -> String {
+    let mut s = String::new();
+    for r in uses.iter().rev() {
+        s.push_str(&format!("  pop {r}\n"));
+    }
+    s.push_str("  ret\n");
+    s
 }
 
 impl Block {
@@ -1154,7 +1323,7 @@ impl Block {
             Block::Repeat { id } => (format!("__repeat{id}_test"), format!("__repeat{id}_end")),
             Block::For { id, .. } => (format!("__for{id}_cont"), format!("__for{id}_end")),
             Block::Forever { id } => (format!("__forever{id}_top"), format!("__forever{id}_end")),
-            Block::If { .. } => return None,
+            Block::If { .. } | Block::Proc { .. } => return None,
         })
     }
 }
@@ -1814,6 +1983,25 @@ mod tests {
     fn split_commas_respects_brackets() {
         let p = split_top_commas("Func, [rsp + 8], 0x10, msg");
         assert_eq!(p, vec!["Func", " [rsp + 8]", " 0x10", " msg"]);
+    }
+
+    #[test]
+    fn proc_parses_and_contract_checks() {
+        let (name, uses, ins, outs) = parse_proc("add3 uses rbx rsi in rcx rdx out rax");
+        assert_eq!(name, "add3");
+        assert_eq!(uses, ["rbx", "rsi"]);
+        assert_eq!(ins, ["rcx", "rdx"]);
+        assert_eq!(outs, ["rax"]);
+
+        // modifies a callee-saved register it didn't declare
+        let bad = ".code\nproc f uses rbx\n  mov rsi, rcx\nendproc\n";
+        let d = proc_contract_diags(bad);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("rsi") && d[0].line == 3, "{d:?}");
+
+        // declared → clean; volatile scratch (rcx/r10) is always free
+        let ok = ".code\nproc f uses rbx rsi\n  mov rsi, rcx\n  mov rbx, rdx\n  mov rcx, 1\n  xor r10, r10\nendproc\n";
+        assert!(proc_contract_diags(ok).is_empty(), "{:?}", proc_contract_diags(ok));
     }
 
     #[test]
