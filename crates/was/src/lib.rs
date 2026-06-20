@@ -69,6 +69,39 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                 }
             }
         }
+        // comcall: the interface and method must exist (db-aware COM call).
+        if let Some(rest) = strip_keyword(t, "comcall") {
+            let parts = split_top_commas(rest);
+            if parts.len() >= 3 {
+                let iface = parts[1].trim();
+                let method = parts[2].trim();
+                match kb.interface(iface) {
+                    Ok(None) => {
+                        let col = body.find(iface).map(|c| c + 1).unwrap_or(1);
+                        diags.push(Diag { line, col, message: format!("unknown interface '{iface}'") });
+                    }
+                    Ok(Some(_)) if matches!(vtable_index_of(kb, iface, method), Ok(None)) => {
+                        let col = body.rfind(method).map(|c| c + 1).unwrap_or(1);
+                        diags.push(Diag {
+                            line,
+                            col,
+                            message: format!("{iface} has no method '{method}'"),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            continue; // names here are interfaces/methods, not constants
+        }
+        // iid: the interface must exist.
+        if let Some(rest) = strip_keyword(t, "iid") {
+            let iface = rest.trim();
+            if matches!(kb.interface(iface), Ok(None)) {
+                let col = body.find(iface).map(|c| c + 1).unwrap_or(1);
+                diags.push(Diag { line, col, message: format!("unknown interface '{iface}'") });
+            }
+            continue;
+        }
         // MASM data: validate each field value fits its size, then skip the ident
         // scan (the type keyword would otherwise look like an unknown constant).
         if let Some((_, type_kw, values)) = parse_data_line(t) {
@@ -618,6 +651,16 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             let expanded = expand_invoke(rest, kb, &labels)
                 .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
             out.push_str(&expanded);
+        } else if let Some(rest) = strip_keyword(t, "comcall") {
+            // `comcall obj, Interface, Method, args…` — COM vtable call (db-aware)
+            let expanded = expand_comcall(rest, kb, &labels)
+                .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
+            out.push_str(&expanded);
+        } else if let Some(rest) = strip_keyword(t, "iid") {
+            // `iid Interface` — emit that interface's IID as 16 GUID bytes
+            let expanded =
+                emit_iid(rest, kb).with_context(|| format!("line {src_line}: `{}`", raw.trim()))?;
+            out.push_str(&expanded);
         } else if let Some(cond) = strip_keyword(t, ".if") {
             // `.if c` → test c; on false skip to the next clause.
             let id = block_ctr;
@@ -1073,6 +1116,104 @@ fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>) -> 
     Ok(o)
 }
 
+/// Find a COM method's absolute vtable index, walking the base-interface chain
+/// (so inherited `IUnknown`/parent methods like `Release` resolve too).
+fn vtable_index_of(kb: &Kb, iface: &str, method: &str) -> Result<Option<i64>> {
+    let mut name = iface.to_string();
+    for _ in 0..32 {
+        let Some(i) = kb.interface(&name)? else { return Ok(None) };
+        if let Some(m) = i.methods.iter().find(|m| m.name == method) {
+            return Ok(Some(m.vtable_index));
+        }
+        match i.base {
+            // The base is a fully-qualified name; the lookup wants the simple name.
+            Some(b) => name = b.rsplit('.').next().unwrap_or(&b).to_string(),
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// Expand `comcall obj, Interface, Method[, args…]` to a COM vtable call. `obj`
+/// is the interface pointer (the `this`, arg 0); the method's slot is looked up
+/// in the knowledge db. The expansion is plain, visible code — same Win64
+/// marshaling as `invoke`, but the call is indirect through the vtable.
+fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+    let parts = split_top_commas(rest);
+    if parts.len() < 3 {
+        bail!("comcall needs at least: object, interface, method");
+    }
+    let iface = parts[1].trim();
+    let method = parts[2].trim();
+    let idx = vtable_index_of(kb, iface, method)?
+        .ok_or_else(|| anyhow::anyhow!("comcall: interface '{iface}' has no method '{method}'"))?;
+
+    // The object is the `this` pointer (arg 0); the rest are the method's args.
+    let mut all: Vec<String> = Vec::with_capacity(parts.len() - 1);
+    all.push(parts[0].trim().to_string());
+    all.extend(parts[3..].iter().map(|s| s.trim().to_string()));
+
+    let n = all.len();
+    let stack_bytes = n.saturating_sub(4) * 8;
+    let frame = 32 + ((stack_bytes + 15) & !15);
+    let disp = idx * 8;
+
+    let mut o = String::new();
+    o.push_str(&format!("  ; comcall {iface}::{method}  (vtbl[{idx}], this + {} arg(s))\n", n - 1));
+    o.push_str("  push rbx\n  mov rbx, rsp\n  and rsp, -16\n");
+    o.push_str(&format!("  sub rsp, {frame}\n"));
+    for (i, arg) in all.iter().enumerate().skip(4) {
+        let off = 32 + (i - 4) * 8;
+        o.push_str(&load_arg("rax", arg, kb, labels)?);
+        o.push_str(&format!("  mov [rsp + {off}], rax\n"));
+    }
+    for (i, arg) in all.iter().enumerate().take(4) {
+        o.push_str(&load_arg(ARG_REGS[i], arg, kb, labels)?);
+    }
+    o.push_str("  mov rax, [rcx]\n"); // vtable, from the `this` pointer in rcx
+    o.push_str(&format!("  call qword ptr [rax + {disp}]\n"));
+    o.push_str("  mov rsp, rbx\n  pop rbx\n");
+    Ok(o)
+}
+
+/// The 16 bytes of a COM GUID, in the on-the-wire mixed-endian layout
+/// (Data1 u32 LE, Data2 u16 LE, Data3 u16 LE, Data4 8 bytes as written).
+fn guid_to_bytes(g: &str) -> Result<[u8; 16]> {
+    let hex: String = g.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 32 {
+        bail!("malformed GUID '{g}' (need 32 hex digits)");
+    }
+    let b = |i: usize| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+    Ok([
+        b(3), b(2), b(1), b(0), // Data1 (u32 LE)
+        b(5), b(4), // Data2 (u16 LE)
+        b(7), b(6), // Data3 (u16 LE)
+        b(8), b(9), b(10), b(11), b(12), b(13), b(14), b(15), // Data4 (as written)
+    ])
+}
+
+/// Expand `iid Interface` to the 16 GUID bytes of that interface's IID, ready to
+/// point `CoCreateInstance`/`QueryInterface` at.
+fn emit_iid(rest: &str, kb: &Kb) -> Result<String> {
+    let name = rest.trim();
+    let i = kb
+        .interface(name)?
+        .ok_or_else(|| anyhow::anyhow!("iid: unknown interface '{name}'"))?;
+    let guid = i.iid.ok_or_else(|| anyhow::anyhow!("iid: {name} has no IID"))?;
+    let b = guid_to_bytes(&guid)?;
+    // Emit the GUID struct: Data1 (u32), Data2/Data3 (u16), Data4 (8 bytes). rasm's
+    // .long/.word are little-endian, which is exactly the COM in-memory layout.
+    let d1 = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let d2 = u16::from_le_bytes([b[4], b[5]]);
+    let d3 = u16::from_le_bytes([b[6], b[7]]);
+    let mut o = format!("  ; IID of {name} = {{{guid}}}\n");
+    o.push_str(&format!("  .long 0x{d1:08x}\n  .word 0x{d2:04x}\n  .word 0x{d3:04x}\n"));
+    for byte in &b[8..16] {
+        o.push_str(&format!("  .byte 0x{byte:02x}\n"));
+    }
+    Ok(o)
+}
+
 /// Emit the instruction(s) to load `arg` into `reg`. A bare label/symbol becomes
 /// its address (`lea`); a number/register/memory becomes a `mov`.
 fn load_arg(reg: &str, arg: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
@@ -1181,6 +1322,22 @@ mod tests {
     fn split_commas_respects_brackets() {
         let p = split_top_commas("Func, [rsp + 8], 0x10, msg");
         assert_eq!(p, vec!["Func", " [rsp + 8]", " 0x10", " msg"]);
+    }
+
+    #[test]
+    fn guid_to_bytes_is_mixed_endian() {
+        // IDXGISwapChain's IID: Data1/2/3 little-endian, Data4 as written.
+        let b = guid_to_bytes("310d36a0-d2e7-4c0a-aa04-6a9d23b8886a").unwrap();
+        assert_eq!(
+            b,
+            [
+                0xa0, 0x36, 0x0d, 0x31, // Data1 LE
+                0xe7, 0xd2, // Data2 LE
+                0x0a, 0x4c, // Data3 LE
+                0xaa, 0x04, 0x6a, 0x9d, 0x23, 0xb8, 0x88, 0x6a, // Data4
+            ]
+        );
+        assert!(guid_to_bytes("not-a-guid").is_err());
     }
 
     #[test]
