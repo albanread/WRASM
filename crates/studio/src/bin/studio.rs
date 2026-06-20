@@ -112,11 +112,11 @@ mod gui {
     const STARTER: &str = "\
 .globl main
 
-.macro APPEND chr           ; a user macro — generates no code until used
+APPEND MACRO chr            ; a user macro (MASM-style) — no code until used
   mov al, chr
   mov [rdi + rcx], al
   inc rcx
-.endmacro
+ENDM
 
 main:
   sub rsp, 64               ; a buffer + scratch on the stack
