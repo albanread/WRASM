@@ -69,6 +69,26 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                 }
             }
         }
+        // MASM data: validate each field value fits its size, then skip the ident
+        // scan (the type keyword would otherwise look like an unknown constant).
+        if let Some((_, type_kw, values)) = parse_data_line(t) {
+            if let Some((_, width, _)) = data_type(type_kw) {
+                for val in split_top_commas(values) {
+                    let v = val.trim();
+                    if let Some(n) = data_value_i64(v) {
+                        if !fits_width(n, width) {
+                            let col = body.find(v).map(|c| c + 1).unwrap_or(1);
+                            diags.push(Diag {
+                                line,
+                                col,
+                                message: format!("{n} doesn't fit a {width}-byte {type_kw} field"),
+                            });
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if !t.starts_with('.') {
             check_idents(body, line, kb, &labels, &mut diags);
         }
@@ -392,6 +412,167 @@ fn macro_names(src: &str) -> Vec<String> {
         .collect()
 }
 
+// ── data declarations (MASM-style) ────────────────────────────────────────────
+
+/// Map a MASM data-type keyword to `(encoder directive, width bytes, wide)`.
+/// `WCHAR` is a 2-byte field whose strings encode as UTF-16LE. Case-insensitive;
+/// `S`-prefixed (signed) and `Dx` aliases included.
+fn data_type(kw: &str) -> Option<(&'static str, usize, bool)> {
+    Some(match kw.to_ascii_uppercase().as_str() {
+        "BYTE" | "SBYTE" | "DB" => ("byte", 1, false),
+        "WORD" | "SWORD" | "DW" => ("word", 2, false),
+        "WCHAR" => ("word", 2, true),
+        "DWORD" | "SDWORD" | "DD" => ("long", 4, false),
+        "QWORD" | "SQWORD" | "DQ" => ("quad", 8, false),
+        _ => return None,
+    })
+}
+
+/// Split off the first whitespace-delimited word; the rest is left-trimmed.
+fn split_first(s: &str) -> (&str, &str) {
+    match s.split_once(char::is_whitespace) {
+        Some((a, b)) => (a, b.trim_start()),
+        None => (s, ""),
+    }
+}
+
+/// `[ … ]` or `PTR …` — a size-prefixed memory operand, not a data value.
+fn value_is_operand(v: &str) -> bool {
+    let v = v.trim_start();
+    v.starts_with('[') || v.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("ptr"))
+}
+
+/// Detect a data definition `[label] TYPE value, …`. The value part must not
+/// begin with `[` or `PTR`, so an instruction's size prefix (`mov BYTE PTR
+/// [rax], 1`) is never mistaken for data. Returns `(label, type_kw, values)`.
+fn parse_data_line(t: &str) -> Option<(Option<&str>, &str, &str)> {
+    let (w0, rest0) = split_first(t);
+    if data_type(w0).is_some() && !rest0.is_empty() && !value_is_operand(rest0) {
+        return Some((None, w0, rest0));
+    }
+    let (w1, rest1) = split_first(rest0);
+    if data_type(w1).is_some()
+        && !w0.is_empty()
+        && w0.chars().all(is_ident_char)
+        && !rest1.is_empty()
+        && !value_is_operand(rest1)
+    {
+        return Some((Some(w0), w1, rest1));
+    }
+    None
+}
+
+/// `N dup(value)` → `(count, value)`.
+fn parse_dup(v: &str) -> Option<(usize, &str)> {
+    let pos = v.to_ascii_lowercase().find("dup(")?;
+    let count: usize = v[..pos].trim().parse().ok()?;
+    let inner = &v[pos + 4..];
+    let close = inner.rfind(')')?;
+    Some((count, inner[..close].trim()))
+}
+
+/// The content of a `"…"` string with basic escapes processed (for wide strings;
+/// narrow strings go through the encoder's `.ascii`, which handles its own).
+fn string_content(quoted: &str) -> String {
+    let inner = quoted.trim().trim_start_matches('"').trim_end_matches('"');
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Lower a MASM data definition to encoder directives under its label. Strings
+/// in a `BYTE` field become `.ascii`; in a `WCHAR` field, UTF-16LE `.word`s.
+fn lower_data(
+    label: Option<&str>,
+    type_kw: &str,
+    values: &str,
+    kb: &Kb,
+    labels: &HashSet<String>,
+) -> Result<String> {
+    let (dir, width, wide) = data_type(type_kw).expect("caller checked the type");
+    let mut out = String::new();
+    if let Some(l) = label {
+        out.push_str(&format!("{l}:\n"));
+    }
+    for val in split_top_commas(values) {
+        let v = val.trim();
+        if v.is_empty() {
+            continue;
+        }
+        if v == "?" {
+            out.push_str(&format!("  .zero {width}\n"));
+        } else if v.starts_with('"') {
+            if wide {
+                let units: Vec<String> =
+                    string_content(v).encode_utf16().map(|u| u.to_string()).collect();
+                if !units.is_empty() {
+                    out.push_str(&format!("  .word {}\n", units.join(", ")));
+                }
+            } else if width == 1 {
+                out.push_str(&format!("  .ascii {v}\n"));
+            } else {
+                bail!("a string needs a BYTE or WCHAR field, not {type_kw}");
+            }
+        } else if let Some((count, inner)) = parse_dup(v) {
+            if inner == "0" {
+                out.push_str(&format!("  .zero {}\n", count * width));
+            } else {
+                let r = resolve_operands(inner, kb, labels)?;
+                for _ in 0..count {
+                    out.push_str(&format!("  .{dir} {r}\n"));
+                }
+            }
+        } else {
+            let r = resolve_operands(v, kb, labels)?;
+            out.push_str(&format!("  .{dir} {r}\n"));
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a literal data value to `i64` for range-checking; `None` for a string,
+/// constant, or expression (assumed to fit).
+fn data_value_i64(v: &str) -> Option<i64> {
+    let v = v.trim();
+    if v.starts_with('\'') && v.ends_with('\'') && v.chars().count() >= 3 {
+        return v[1..].chars().next().map(|c| c as i64);
+    }
+    let (neg, body) = v.strip_prefix('-').map_or((false, v), |b| (true, b));
+    let body = body.replace('_', "");
+    let n = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i64::from_str_radix(h, 16).ok()?
+    } else if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) {
+        body.parse().ok()?
+    } else {
+        return None;
+    };
+    Some(if neg { -n } else { n })
+}
+
+/// Does `v` fit in a `width`-byte field, as either a signed or unsigned value?
+fn fits_width(v: i64, width: usize) -> bool {
+    if width >= 8 {
+        return true;
+    }
+    let bits = (width * 8) as u32;
+    let v = v as i128;
+    v >= -(1i128 << (bits - 1)) && v < (1i128 << bits)
+}
+
 /// Lower `src` to rasm-ready Intel-syntax text.
 pub fn lower(src: &str, kb: &Kb) -> Result<String> {
     Ok(lower_mapped(src, kb)?.0)
@@ -554,9 +735,15 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
         } else if let Some(rest) = strip_keyword(t, ".continue") {
             out.push_str(&loop_jump(rest, false, &block_stack, kb, &labels, src_line, raw)?);
         } else if t.starts_with('.') {
-            // Directives pass through untouched.
+            // GAS directives (our high-level ones are handled above) pass through.
             out.push_str(body);
             out.push('\n');
+        } else if let Some((label, type_kw, values)) = parse_data_line(t) {
+            // MASM data: `[label] BYTE/WORD/DWORD/QWORD/WCHAR values`.
+            out.push_str(
+                &lower_data(label, type_kw, values, kb, &labels)
+                    .with_context(|| format!("line {src_line}: `{}`", raw.trim()))?,
+            );
         } else {
             // Instruction (possibly with a leading `label:`): resolve operands.
             let line = rewrite_line(body, kb, &labels)
@@ -703,6 +890,10 @@ fn collect_labels(src: &str) -> HashSet<String> {
         // `name:` (optionally followed by an instruction on the same line)
         if let Some(name) = leading_label(&t) {
             labels.insert(name.to_string());
+        }
+        // A MASM data label (`msg BYTE …`) has no colon — collect it too.
+        if let Some((Some(label), _, _)) = parse_data_line(&t) {
+            labels.insert(label.to_string());
         }
     }
     labels
@@ -1203,6 +1394,55 @@ mod tests {
         let Some(kb) = kb() else { return };
         let err = lower("M MACRO a, b\n  nop\nENDM\nmain:\n  M 1\n", &kb).unwrap_err();
         assert!(format!("{err:#}").contains("expects 2"), "{err:#}");
+    }
+
+    #[test]
+    fn data_line_detection() {
+        assert_eq!(parse_data_line("msg BYTE \"Hi\", 0"), Some((Some("msg"), "BYTE", "\"Hi\", 0")));
+        assert_eq!(parse_data_line("count DWORD 0"), Some((Some("count"), "DWORD", "0")));
+        assert_eq!(parse_data_line("WORD 1, 2"), Some((None, "WORD", "1, 2")));
+        // A size-prefixed memory operand must NOT be read as data.
+        assert_eq!(parse_data_line("mov BYTE PTR [rax], 1"), None);
+        assert_eq!(parse_data_line("mov rax, rbx"), None);
+    }
+
+    #[test]
+    fn data_lowers_and_assembles() {
+        let Some(kb) = kb() else { return };
+        let src = ".globl main\nmain:\n  lea rax, [rip + msg]\n  ret\nmsg BYTE \"Hi\", 0\ncount DWORD 7\ntable QWORD 1, 2\n";
+        let low = lower(src, &kb).expect("lower");
+        assert!(low.contains("msg:") && low.contains(".ascii \"Hi\"") && low.contains(".byte 0"), "{low}");
+        assert!(low.contains("count:") && low.contains(".long 7"), "{low}");
+        assert!(low.contains("table:") && low.contains(".quad 1") && low.contains(".quad 2"), "{low}");
+        assert!(rasm::assemble(&low).is_ok(), "assembles:\n{low}");
+    }
+
+    #[test]
+    fn wide_string_encodes_utf16() {
+        let Some(kb) = kb() else { return };
+        let low = lower("wmsg WCHAR \"Hi\", 0\n", &kb).expect("lower");
+        assert!(low.contains(".word 72, 105"), "utf-16 code units:\n{low}");
+        let m = rasm::assemble(&low).expect("assemble");
+        // H(48 00) i(69 00) then the 00 00 terminator.
+        assert_eq!(&m.code[..6], &[0x48, 0x00, 0x69, 0x00, 0x00, 0x00], "{:02x?}", m.code);
+    }
+
+    #[test]
+    fn data_dup_and_uninitialized() {
+        let Some(kb) = kb() else { return };
+        let low = lower("buf BYTE 8 dup(0)\npad WORD ?\n", &kb).expect("lower");
+        assert!(low.contains(".zero 8"), "dup(0) -> zero: {low}");
+        assert!(low.contains(".zero 2"), "? -> zero of the field width: {low}");
+        assert!(rasm::assemble(&low).is_ok(), "{low}");
+    }
+
+    #[test]
+    fn data_size_validation_flags_overflow() {
+        let Some(kb) = kb() else { return };
+        let diags = check("x BYTE 256\ny WORD 70000\nz DWORD 0xFF\n", &kb);
+        assert!(diags.iter().any(|d| d.line == 1 && d.message.contains("BYTE")), "{diags:?}");
+        assert!(diags.iter().any(|d| d.line == 2 && d.message.contains("WORD")), "{diags:?}");
+        assert!(!diags.iter().any(|d| d.line == 3), "0xFF fits a DWORD: {diags:?}");
     }
 
     #[test]

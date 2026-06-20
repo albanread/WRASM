@@ -66,6 +66,10 @@ pub enum Directive {
     /// `.quad a, b, ...` — one or more 8-byte little-endian values. LET's
     /// SSE masks emit two (`.quad 0x8000..., 0x0000...`).
     Quad(Vec<i64>),
+    /// `.long a, b, ...` (a.k.a. `.int`/`.dword`) — 4-byte little-endian values.
+    Long(Vec<i64>),
+    /// `.word a, b, ...` — 2-byte little-endian values.
+    Word(Vec<i64>),
     Byte(u8),
     Zero(usize),
     /// `.align`/`.balign N` (byte alignment).
@@ -165,6 +169,12 @@ fn parse_directive(d: &str) -> Result<Line> {
         "text" => Directive::Text,
         "globl" | "global" => Directive::Globl(arg.to_string()),
         "quad" => Directive::Quad(
+            arg.split(',').map(|v| parse_int(v.trim())).collect::<Result<Vec<_>>>()?,
+        ),
+        "long" | "int" | "dword" => Directive::Long(
+            arg.split(',').map(|v| parse_int(v.trim())).collect::<Result<Vec<_>>>()?,
+        ),
+        "word" => Directive::Word(
             arg.split(',').map(|v| parse_int(v.trim())).collect::<Result<Vec<_>>>()?,
         ),
         "byte" => Directive::Byte(parse_int(arg)? as u8),

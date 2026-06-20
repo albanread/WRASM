@@ -324,6 +324,14 @@ fn push_directive(items: &mut Vec<Item>, d: Directive) -> Result<()> {
             bytes: vs.iter().flat_map(|v| v.to_le_bytes()).collect(),
             riprel: vec![],
         }),
+        Directive::Long(vs) => items.push(Item::Code {
+            bytes: vs.iter().flat_map(|v| (*v as u32).to_le_bytes()).collect(),
+            riprel: vec![],
+        }),
+        Directive::Word(vs) => items.push(Item::Code {
+            bytes: vs.iter().flat_map(|v| (*v as u16).to_le_bytes()).collect(),
+            riprel: vec![],
+        }),
         Directive::Byte(b) => items.push(Item::Code { bytes: vec![b], riprel: vec![] }),
         Directive::Zero(n) => items.push(Item::Code { bytes: vec![0u8; n], riprel: vec![] }),
         Directive::Ascii(bytes, nul) => {

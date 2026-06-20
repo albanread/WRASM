@@ -117,6 +117,8 @@ APPEND MACRO chr            ; a user macro (MASM-style) — no code until used
   inc rcx
 ENDM
 
+banner BYTE \"WRASM: \", 0   ; global data — a string, shown with its bytes
+
 main:
   sub rsp, 64               ; a buffer + scratch on the stack
   lea rdi, [rsp + 32]       ; rdi = &buffer
@@ -134,7 +136,8 @@ main:
   invoke GetStdHandle, -11  ; STD_OUTPUT_HANDLE -> rax
   mov rsi, rax              ; rsi = stdout
   lea r12, [rsp + 24]       ; r12 = &bytesWritten
-  invoke WriteFile, rsi, rdi, r13, r12, 0
+  invoke WriteFile, rsi, banner, 7, r12, 0  ; the global string
+  invoke WriteFile, rsi, rdi, r13, r12, 0   ; the built buffer
   invoke ExitProcess, 0
 ";
 
