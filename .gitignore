@@ -1,1 +1,5 @@
 /target
+
+# studio --shot / F12 offscreen review captures, and F5 build output
+studio_shot_*.png
+studio_build.exe

@@ -12,6 +12,11 @@ path = "src/lib.rs"
 name = "studio-repl"
 path = "src/bin/studio_repl.rs"
 
+# The windowed IDE: a Direct2D editor + assistant over the same language thread.
+[[bin]]
+name = "studio"
+path = "src/bin/studio.rs"
+
 [dependencies]
 anyhow = "1"
 ide = { path = "../ide" }
@@ -22,3 +27,26 @@ rasm = { path = "../.." }
 # render is Direct2D. We path-dep rather than vendor so there's one source of
 # truth while the IDE takes shape.
 docpane = { path = "../../../WF66/crates/docpane" }
+# Timestamp for the offscreen PNG snapshots (also already in the docpane tree).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Win32 + Direct2D, only for the windowed `studio` binary. The render core is
+# docpane's; here we just own the window, the message loop, and the editor pane.
+# WIC + COM back the offscreen PNG snapshot (a render target over a WIC bitmap).
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+]
