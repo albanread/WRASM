@@ -17,19 +17,21 @@
 .DATA
 ; ---- shader source (compiled at runtime by D3DCompile) ----
 shaderSrc:
-    BYTE "cbuffer CB:register(b0){float4 c0;float4 c1;float4 c2;};", 10
-    BYTE "struct VO{float4 p:SV_Position;};", 10
-    BYTE "VO VS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);return o;}", 10
-    BYTE "float4 PS(float4 p:SV_Position):SV_Target{", 10
-    BYTE "float cx=c0.x+(p.x/c1.x-0.5)*c0.z;", 10
-    BYTE "float cy=c0.y+(p.y/c1.y-0.5)*c0.z*c0.w;", 10
-    BYTE "float2 z=float2(0,0);int mi=(int)c1.w;int it;", 10
-    BYTE "for(it=0;it<mi;it++){float a=z.x*z.x;float b=z.y*z.y;if(a+b>4.0)break;z=float2(a-b+cx,2.0*z.x*z.y+cy);}", 10
-    BYTE "float3 col;", 10
-    BYTE "if(it>=mi){col=float3(0,0,0);}else{float t=(float)it/mi;col=0.5+0.5*cos(6.2831*(t+float3(0.0,0.33,0.67)));}", 10
-    BYTE "if(c1.z>0.5){float2 lo=min(c2.xy,c2.zw);float2 hi=max(c2.xy,c2.zw);", 10
-    BYTE "if(p.x>=lo.x&&p.x<=hi.x&&p.y>=lo.y&&p.y<=hi.y&&(abs(p.x-lo.x)<1.5||abs(p.x-hi.x)<1.5||abs(p.y-lo.y)<1.5||abs(p.y-hi.y)<1.5)){col=float3(1,1,1);}}", 10
-    BYTE "return float4(col,1);}", 10
+.ASCIISTRING
+cbuffer CB:register(b0){float4 c0;float4 c1;float4 c2;};
+struct VO{float4 p:SV_Position;};
+VO VS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);return o;}
+float4 PS(float4 p:SV_Position):SV_Target{
+float cx=c0.x+(p.x/c1.x-0.5)*c0.z;
+float cy=c0.y+(p.y/c1.y-0.5)*c0.z*c0.w;
+float2 z=float2(0,0);int mi=(int)c1.w;int it;
+for(it=0;it<mi;it++){float a=z.x*z.x;float b=z.y*z.y;if(a+b>4.0)break;z=float2(a-b+cx,2.0*z.x*z.y+cy);}
+float3 col;
+if(it>=mi){col=float3(0,0,0);}else{float t=(float)it/mi;col=0.5+0.5*cos(6.2831*(t+float3(0.0,0.33,0.67)));}
+if(c1.z>0.5){float2 lo=min(c2.xy,c2.zw);float2 hi=max(c2.xy,c2.zw);
+if(p.x>=lo.x&&p.x<=hi.x&&p.y>=lo.y&&p.y<=hi.y&&(abs(p.x-lo.x)<1.5||abs(p.x-hi.x)<1.5||abs(p.y-lo.y)<1.5||abs(p.y-hi.y)<1.5)){col=float3(1,1,1);}}
+return float4(col,1);}
+.ENDASCIISTRING
 shaderEnd:
     BYTE 0
 
@@ -386,6 +388,7 @@ wp_ldown:
     mov     [rip + dy0], eax
     mov     [rip + dy1], eax
     mov     dword ptr [rip + dragging], 1
+    call    render
     xor     eax, eax
     ret
 wp_move:
@@ -397,6 +400,7 @@ wp_move:
     mov     eax, r9d
     shr     eax, 16
     mov     [rip + dy1], eax
+    call    render                           ; live rubber band (the timer is starved mid-drag)
 wp_move_done:
     xor     eax, eax
     ret
@@ -415,9 +419,11 @@ wp_lup:
     jl      wp_lup_done
     call    zoom_in
 wp_lup_done:
+    call    render                           ; show the zoom + clear the rubber band
     xor     eax, eax
     ret
 wp_rdown:
     call    zoom_out
+    call    render
     xor     eax, eax
     ret
