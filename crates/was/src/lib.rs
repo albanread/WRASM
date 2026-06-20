@@ -35,10 +35,26 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
     labels.extend(com_objs.keys().cloned());
     let mut diags = Vec::new();
     let mut in_macro = false;
+    let mut string_block_end: Option<&str> = None;
     for (i, raw) in src.lines().enumerate() {
         let line = i + 1;
         let body = strip_comment(raw);
         let t = body.trim();
+        // Raw string block: its interior is arbitrary text, not code — skip it.
+        if let Some(end_kw) = string_block_end {
+            if raw.trim().eq_ignore_ascii_case(end_kw) {
+                string_block_end = None;
+            }
+            continue;
+        }
+        if t.eq_ignore_ascii_case(".asciistring") {
+            string_block_end = Some(".endasciistring");
+            continue;
+        }
+        if t.eq_ignore_ascii_case(".widestring") {
+            string_block_end = Some(".endwidestring");
+            continue;
+        }
         if t.is_empty() {
             continue;
         }
@@ -665,12 +681,31 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     let mut block_ctr = 0usize;
     let mut block_stack: Vec<Block> = Vec::new();
     let mut pending_struct: Option<StructAccum> = None;
+    let mut pending_string: Option<StringAccum> = None;
+    // When set, the lowered lines this source line produced are pure data with no
+    // instructive value (a raw string block) — map them to source line 0 so the
+    // grey ghost view shows nothing for them.
+    let mut ghost_suppress = false;
     for (i, raw) in src.lines().enumerate() {
         let src_line = i + 1;
         let start = out.len();
         let body = strip_comment(raw);
         let t = body.trim();
-        if pending_struct.is_some() {
+        if let Some(acc) = pending_string.as_mut() {
+            // Inside a raw string block: capture every line verbatim (comments and
+            // all) until the matching `.end…`, which flushes it to data.
+            if raw.trim().eq_ignore_ascii_case(acc.end_kw) {
+                let acc = pending_string.take().unwrap();
+                out.push_str(&emit_string_block(&acc));
+                ghost_suppress = true;
+            } else {
+                acc.lines.push(raw.to_string());
+            }
+        } else if t.eq_ignore_ascii_case(".asciistring") {
+            pending_string = Some(StringAccum { lines: Vec::new(), wide: false, end_kw: ".endasciistring" });
+        } else if t.eq_ignore_ascii_case(".widestring") {
+            pending_string = Some(StringAccum { lines: Vec::new(), wide: true, end_kw: ".endwidestring" });
+        } else if pending_struct.is_some() {
             // Inside a `LABEL struct TYPE … ends` data block: collect each
             // `field = value`, then lay the whole thing out on `ends`.
             if t == "ends" || t == "endstruct" {
@@ -859,10 +894,14 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
         // newlines just added is exactly how many lowered lines this source line
         // produced. (`rasm::assemble` enumerates the same lines() the same way.)
         let added = out[start..].bytes().filter(|&b| b == b'\n').count();
-        map.resize(map.len() + added, src_line);
+        map.resize(map.len() + added, if ghost_suppress { 0 } else { src_line });
+        ghost_suppress = false;
     }
     if let Some(acc) = pending_struct {
         bail!("struct {} is missing its `ends`", acc.label);
+    }
+    if let Some(acc) = pending_string {
+        bail!("string block is missing its `{}`", acc.end_kw);
     }
     Ok((out, map))
 }
@@ -1284,6 +1323,33 @@ struct StructAccum {
     fields: Vec<(String, String)>, // (field path, value)
 }
 
+/// A `.ASCIISTRING … .ENDASCIISTRING` (or `.WIDESTRING … .ENDWIDESTRING`) raw
+/// text block: every line between the directives, captured verbatim.
+struct StringAccum {
+    lines: Vec<String>,
+    wide: bool,
+    end_kw: &'static str,
+}
+
+/// Lower a raw text block to data directives. Each captured line becomes its
+/// bytes plus the line-ending newline (so the block is the text *as written*,
+/// including the line breaks). ASCII → one `.ascii "…\n"` per line (rasm decodes
+/// the `\n`, `\"`, `\\` escapes); wide → UTF-16LE code units via `.word`.
+fn emit_string_block(acc: &StringAccum) -> String {
+    let mut out = String::new();
+    for line in &acc.lines {
+        if acc.wide {
+            let mut units: Vec<String> = line.encode_utf16().map(|u| u.to_string()).collect();
+            units.push("10".to_string()); // the line-ending newline
+            out.push_str(&format!("  .word {}\n", units.join(", ")));
+        } else {
+            let esc = line.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("  .ascii \"{esc}\\n\"\n"));
+        }
+    }
+    out
+}
+
 /// `LABEL struct TYPE` — the opener of a struct-instance data block.
 fn parse_struct_open(t: &str) -> Option<(String, String)> {
     let toks: Vec<&str> = t.split_whitespace().collect();
@@ -1538,6 +1604,41 @@ mod tests {
             ]
         );
         assert!(guid_to_bytes("not-a-guid").is_err());
+    }
+
+    #[test]
+    fn ascii_string_block_is_verbatim_text_plus_newlines() {
+        let acc = StringAccum {
+            lines: vec!["float4 c0;".to_string(), "return c0;".to_string()],
+            wide: false,
+            end_kw: ".endasciistring",
+        };
+        assert_eq!(
+            emit_string_block(&acc),
+            "  .ascii \"float4 c0;\\n\"\n  .ascii \"return c0;\\n\"\n"
+        );
+    }
+
+    #[test]
+    fn ascii_string_block_escapes_quotes_and_backslashes() {
+        // raw line  a"b\c  →  a \" b \\ c  inside the rasm `.ascii` literal.
+        let acc = StringAccum {
+            lines: vec!["a\"b\\c".to_string()],
+            wide: false,
+            end_kw: ".endasciistring",
+        };
+        assert_eq!(emit_string_block(&acc), "  .ascii \"a\\\"b\\\\c\\n\"\n");
+    }
+
+    #[test]
+    fn wide_string_block_emits_utf16le_words() {
+        let acc = StringAccum {
+            lines: vec!["Hi".to_string()],
+            wide: true,
+            end_kw: ".endwidestring",
+        };
+        // 'H'=72, 'i'=105, then the line-ending newline 10.
+        assert_eq!(emit_string_block(&acc), "  .word 72, 105, 10\n");
     }
 
     #[test]
