@@ -20,7 +20,8 @@
 //!   * Sync style (tests / a REPL): [`Lang::card`] etc. post and block for the
 //!     matching reply, with the WF66-standard 5-second guard.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
@@ -119,6 +120,13 @@ pub struct Lang {
     rx: Receiver<Response>,
     join: Option<JoinHandle<()>>,
     next_id: AtomicU64,
+    /// Replies a blocking [`call`](Lang::call) pulled off `rx` while waiting for a
+    /// *different* id — buffered here instead of dropped, so an async reply that
+    /// happens to land mid-`call` is still delivered by a later [`poll`](Lang::poll)
+    /// / [`recv_timeout`](Lang::recv_timeout). This is what lets the sync and async
+    /// styles share one `Lang` without losing messages. Single-thread interior
+    /// mutability: `Lang` lives on (and is only touched from) the GUI thread.
+    pending: RefCell<VecDeque<Response>>,
 }
 
 impl Lang {
@@ -138,6 +146,7 @@ impl Lang {
                 rx: rx_resp,
                 join: Some(join),
                 next_id: AtomicU64::new(1),
+                pending: RefCell::new(VecDeque::new()),
             }),
             Ok(Err(e)) => {
                 let _ = join.join();
@@ -188,13 +197,20 @@ impl Lang {
         id
     }
 
-    /// Non-blocking drain — the GUI calls this each message-loop pass.
+    /// Non-blocking drain — the GUI calls this each message-loop pass. Replies a
+    /// prior [`call`](Lang::call) buffered come out first, in arrival order.
     pub fn poll(&self) -> Option<Response> {
+        if let Some(r) = self.pending.borrow_mut().pop_front() {
+            return Some(r);
+        }
         self.rx.try_recv().ok()
     }
 
-    /// Block for the next reply up to `ms` milliseconds.
+    /// Block for the next reply up to `ms` milliseconds (buffered replies first).
     pub fn recv_timeout(&self, ms: u64) -> Option<Response> {
+        if let Some(r) = self.pending.borrow_mut().pop_front() {
+            return Some(r);
+        }
         self.rx.recv_timeout(Duration::from_millis(ms)).ok()
     }
 
@@ -202,13 +218,18 @@ impl Lang {
 
     /// Post a request and block for *its* reply (matching id), with the
     /// WF66-standard 5-second guard. Returns `None` on timeout or a dead worker.
+    ///
+    /// Replies for *other* (async) ids that arrive while we wait are buffered for
+    /// the next [`poll`](Lang::poll)/[`recv_timeout`](Lang::recv_timeout) rather
+    /// than discarded — so interleaving a sync `call` with async `post_*` never
+    /// loses a reply.
     pub fn call(&self, make: impl FnOnce(u64) -> Request) -> Option<Response> {
         let id = self.alloc();
         self.tx.send(make(id)).ok()?;
         loop {
             match self.rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(r) if r.id() == id => return Some(r),
-                Ok(_) => continue, // a stale async reply; keep waiting for ours
+                Ok(r) => self.pending.borrow_mut().push_back(r), // keep it for poll()
                 Err(_) => return None,
             }
         }
@@ -279,62 +300,127 @@ fn worker(
         }
     };
 
-    while let Ok(req) = rx.recv() {
-        let resp = match req {
-            Request::Shutdown => break,
-            Request::Card { id, query } => match ide::answer(&kb, &query) {
-                Ok(markdown) => Response::Card { id, markdown },
-                Err(e) => Response::Error { id, message: format!("{e:#}") },
-            },
-            Request::Frame { id, func } => match ide::insert_frame(&kb, &func) {
-                Ok(line) => Response::Frame { id, line },
-                Err(e) => Response::Error { id, message: format!("{e:#}") },
-            },
-            Request::Check { id, src } => {
-                let diags = was::check(&src, &kb)
-                    .into_iter()
-                    .map(|d| Diag { line: d.line, col: d.col, message: d.message })
-                    .collect();
-                Response::Check { id, diags }
-            }
-            Request::Assemble { id, src, emit } => match assemble_bytes(&kb, &src, emit) {
-                Ok((bytes, info)) => Response::Assembled { id, emit, bytes, info },
-                Err(e) => Response::Error { id, message: format!("{e:#}") },
-            },
-            Request::Suggest { id, name } => match kb.suggest(&name, 5) {
-                Ok(names) => Response::Suggest { id, names },
-                Err(e) => Response::Error { id, message: format!("{e:#}") },
-            },
-            Request::Complete { id, line, cursor } => {
-                let ctx = complete::context(&line, cursor);
-                Response::Completions {
-                    id,
-                    items: complete_items(&kb, &ctx),
-                    replace_start: ctx.start,
+    // Process requests in bursts: drain everything already queued, drop the
+    // per-keystroke "live read" requests a newer same-kind request supersedes,
+    // then answer the survivors in order. A `Shutdown` anywhere in the burst ends
+    // the loop. Sync `call`s are unaffected — they post one request and block, so
+    // their burst is a singleton and nothing coalesces.
+    while let Ok(first) = rx.recv() {
+        if matches!(first, Request::Shutdown) {
+            break;
+        }
+        let mut batch = vec![first];
+        let mut shutdown = false;
+        loop {
+            match rx.try_recv() {
+                Ok(Request::Shutdown) => {
+                    shutdown = true;
+                    break;
                 }
+                Ok(more) => batch.push(more),
+                Err(_) => break,
             }
-            Request::Hover { id, line, cursor } => {
-                let markdown = crate::hover::token_at(&line, cursor)
-                    .and_then(|t| hover_markdown(&kb, &line[t.start..t.end]));
-                Response::Tip { id, markdown }
+        }
+        for req in coalesce_superseded(batch) {
+            if tx.send(handle(&kb, req)).is_err() {
+                return; // the GUI handle was dropped; nothing left to answer
             }
-            Request::Signature { id, line, cursor } => {
-                let markdown = crate::sig::active_param(&line, cursor)
-                    .and_then(|(func, active)| signature_markdown(&kb, &func, active));
-                Response::Tip { id, markdown }
+        }
+        if shutdown {
+            break;
+        }
+    }
+}
+
+/// A coarse tag for the per-keystroke "live read" requests that newer input
+/// supersedes — only the latest of each in a burst is worth doing. Explicit
+/// actions (`Card`/`Frame`/`Assemble`/`Suggest`) and `Shutdown` return `None` and
+/// are never coalesced away.
+fn coalesce_tag(req: &Request) -> Option<u8> {
+    match req {
+        Request::Check { .. } => Some(0),
+        Request::Complete { .. } => Some(1),
+        Request::Hover { .. } => Some(2),
+        Request::Signature { .. } => Some(3),
+        Request::LineBytes { .. } => Some(4),
+        _ => None,
+    }
+}
+
+/// Drop every coalescable request that a *later* request of the same kind in the
+/// burst supersedes, preserving order and all non-coalescable requests. The last
+/// `Complete` of a typing burst survives; the stale ones before it never run.
+fn coalesce_superseded(batch: Vec<Request>) -> Vec<Request> {
+    let keep: Vec<bool> = batch
+        .iter()
+        .enumerate()
+        .map(|(i, req)| match coalesce_tag(req) {
+            Some(t) => !batch[i + 1..].iter().any(|r| coalesce_tag(r) == Some(t)),
+            None => true,
+        })
+        .collect();
+    batch
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(req, k)| k.then_some(req))
+        .collect()
+}
+
+/// Answer one request. Never panics on a backend error — every failure becomes a
+/// [`Response::Error`] so the worker loop stays alive. `Shutdown` is handled by
+/// the loop and never reaches here.
+fn handle(kb: &Kb, req: Request) -> Response {
+    match req {
+        Request::Shutdown => unreachable!("Shutdown is handled by the worker loop"),
+        Request::Card { id, query } => match ide::answer(kb, &query) {
+            Ok(markdown) => Response::Card { id, markdown },
+            Err(e) => Response::Error { id, message: format!("{e:#}") },
+        },
+        Request::Frame { id, func } => match ide::insert_frame(kb, &func) {
+            Ok(line) => Response::Frame { id, line },
+            Err(e) => Response::Error { id, message: format!("{e:#}") },
+        },
+        Request::Check { id, src } => {
+            let diags = was::check(&src, kb)
+                .into_iter()
+                .map(|d| Diag { line: d.line, col: d.col, message: d.message })
+                .collect();
+            Response::Check { id, diags }
+        }
+        Request::Assemble { id, src, emit } => match assemble_bytes(kb, &src, emit) {
+            Ok((bytes, info)) => Response::Assembled { id, emit, bytes, info },
+            Err(e) => Response::Error { id, message: format!("{e:#}") },
+        },
+        Request::Suggest { id, name } => match kb.suggest(&name, 5) {
+            Ok(names) => Response::Suggest { id, names },
+            Err(e) => Response::Error { id, message: format!("{e:#}") },
+        },
+        Request::Complete { id, line, cursor } => {
+            let ctx = complete::context(&line, cursor);
+            Response::Completions {
+                id,
+                items: complete_items(kb, &ctx),
+                replace_start: ctx.start,
             }
-            Request::LineBytes { id, line } => {
-                // A line that can't stand alone (label-only, or referencing an
-                // undefined label) just shows no bytes — not an error popup.
-                let bytes = was::lower(&line, &kb)
-                    .and_then(|asm| rasm::assemble(&asm))
-                    .map(|m| m.code)
-                    .unwrap_or_default();
-                Response::LineBytes { id, bytes }
-            }
-        };
-        if tx.send(resp).is_err() {
-            break; // the GUI handle was dropped; nothing left to answer
+        }
+        Request::Hover { id, line, cursor } => {
+            let markdown = crate::hover::token_at(&line, cursor)
+                .and_then(|t| hover_markdown(kb, &line[t.start..t.end]));
+            Response::Tip { id, markdown }
+        }
+        Request::Signature { id, line, cursor } => {
+            let markdown = crate::sig::active_param(&line, cursor)
+                .and_then(|(func, active)| signature_markdown(kb, &func, active));
+            Response::Tip { id, markdown }
+        }
+        Request::LineBytes { id, line } => {
+            // A line that can't stand alone (label-only, or referencing an
+            // undefined label) just shows no bytes — not an error popup.
+            let bytes = was::lower(&line, kb)
+                .and_then(|asm| rasm::assemble(&asm))
+                .map(|m| m.code)
+                .unwrap_or_default();
+            Response::LineBytes { id, bytes }
         }
     }
 }
@@ -709,5 +795,75 @@ mod tests {
     fn shutdown_joins_cleanly() {
         let Some(l) = lang() else { return };
         l.shutdown();
+    }
+
+    /// A blocking `call` that pulls an async reply off the channel while waiting
+    /// for its own must not drop it — it stays available for a later drain.
+    #[test]
+    fn sync_call_preserves_a_pending_async_reply() {
+        let Some(l) = lang() else { return };
+        let async_id = l.post_card("RECT"); // fire-and-forget
+        // A sync call whose worker reply may arrive after the async one.
+        assert!(matches!(l.suggest("OPEN_EXISTNG"), Some(Response::Suggest { .. })));
+        // The async reply must still be retrievable (buffered or still on rx).
+        let mut found = false;
+        for _ in 0..3 {
+            if let Some(r) = l.recv_timeout(5000) {
+                if r.id() == async_id {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "async card reply id {async_id} was lost across a sync call()");
+    }
+
+    fn req_id(r: &Request) -> u64 {
+        match r {
+            Request::Card { id, .. }
+            | Request::Frame { id, .. }
+            | Request::Check { id, .. }
+            | Request::Assemble { id, .. }
+            | Request::Suggest { id, .. }
+            | Request::Complete { id, .. }
+            | Request::Hover { id, .. }
+            | Request::Signature { id, .. }
+            | Request::LineBytes { id, .. } => *id,
+            Request::Shutdown => 0,
+        }
+    }
+
+    #[test]
+    fn coalesce_keeps_last_live_read_drops_earlier() {
+        let batch = vec![
+            Request::Complete { id: 1, line: "a".into(), cursor: 1 },
+            Request::Card { id: 2, query: "RECT".into() },
+            Request::Complete { id: 3, line: "ab".into(), cursor: 2 },
+            Request::Hover { id: 4, line: "x".into(), cursor: 0 },
+        ];
+        let ids: Vec<u64> = coalesce_superseded(batch).iter().map(req_id).collect();
+        // Complete#1 superseded by #3; Card and the lone Hover survive; order kept.
+        assert_eq!(ids, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn coalesce_never_drops_explicit_actions() {
+        let batch = vec![
+            Request::Card { id: 1, query: "A".into() },
+            Request::Card { id: 2, query: "B".into() },
+            Request::Assemble { id: 3, src: String::new(), emit: Emit::Obj },
+        ];
+        let ids: Vec<u64> = coalesce_superseded(batch).iter().map(req_id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "explicit actions are never coalesced");
+    }
+
+    #[test]
+    fn coalesce_collapses_a_typing_burst_to_the_latest() {
+        let batch: Vec<Request> = (0..5)
+            .map(|i| Request::Complete { id: i, line: "x".repeat(i as usize + 1), cursor: 1 })
+            .collect();
+        let kept = coalesce_superseded(batch);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(req_id(&kept[0]), 4, "only the newest keystroke survives");
     }
 }
