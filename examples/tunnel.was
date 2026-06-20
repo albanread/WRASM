@@ -1,0 +1,295 @@
+; tunnel.was — the classic demoscene "tunnel", animated.
+;
+;   was examples\tunnel.was -o tunnel.exe   &&   tunnel.exe
+;
+; A tunnel is a TEXTURE LOOKUP through two precomputed per-pixel tables:
+;   * an ANGLE table  — where a pixel sits going around the tunnel (0..255), and
+;   * a DEPTH table   — how far down the tunnel it is (scale / distance).
+; Scroll a checkerboard texture through (angle + time, depth + time) and the
+; whole thing appears to rotate and rush toward you. A third SHADE table
+; (brightness from distance) darkens the far end for a sense of depth.
+;
+; The tables are built once at startup. Distance uses sqrtsd; the angle uses the
+; cheap "diamond angle" (a monotonic stand-in for atan2 — just abs/add/divide,
+; no trig). The animation loop then only reads tables and writes pixels.
+;
+; The first frame is saved to tunnel.bmp.
+
+.DATA
+one         QWORD  0x3FF0000000000000   ; 1.0
+two         QWORD  0x4000000000000000   ; 2.0
+three       QWORD  0x4008000000000000   ; 3.0
+c64         QWORD  0x4050000000000000   ; 64.0  (diamond angle 0..4 -> 0..256)
+depthscale  QWORD  0x40C0000000000000   ; 8192.0
+
+utab        QWORD  ?                     ; angle table  (640*480 bytes)
+vtab        QWORD  ?                     ; depth table
+shadetab    QWORD  ?                     ; brightness table
+ta          DWORD  0                     ; angle scroll (rotation)
+td          DWORD  0                     ; depth scroll (forward motion)
+
+className   WCHAR  "rasm_tunnel", 0
+titleText   WCHAR  "RASM — tunnel (precomputed angle/depth tables)", 0
+fname       WCHAR  "tunnel.bmp", 0
+wc          BYTE   80 dup(0)
+bmi         BYTE   40 dup(0)
+msg         BYTE   48 dup(0)
+ps          BYTE   72 dup(0)
+filehdr     BYTE   0x42,0x4D, 0x36,0xC4,0x12,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+fb          QWORD  ?
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4     ; framebuffer
+    mov     [rip + fb], rax
+    invoke  VirtualAlloc, 0, 307200, 0x3000, 4      ; angle table
+    mov     [rip + utab], rax
+    invoke  VirtualAlloc, 0, 307200, 0x3000, 4      ; depth table
+    mov     [rip + vtab], rax
+    invoke  VirtualAlloc, 0, 307200, 0x3000, 4      ; shade table
+    mov     [rip + shadetab], rax
+
+    call    fill_tables
+    call    render                                  ; first frame
+
+    ; BITMAPINFOHEADER (top-down 32bpp)
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 1228800, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; window
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- build the angle / depth / shade tables (once) ----
+;   rsi=&utab  rdi=&vtab  rbx=&shadetab   r9=index   r10=y   r11=x
+fill_tables:
+    push    rbx
+    push    rsi
+    push    rdi
+    mov     rsi, [rip + utab]
+    mov     rdi, [rip + vtab]
+    mov     rbx, [rip + shadetab]
+    xor     r9, r9
+    xor     r10, r10                    ; y
+ft_y:
+    xor     r11, r11                    ; x
+ft_x:
+    ; dist^2 = (x-320)^2 + (y-240)^2   (integer)
+    mov     eax, r11d
+    sub     eax, 320
+    imul    eax, eax
+    mov     ecx, r10d
+    sub     ecx, 240
+    imul    ecx, ecx
+    add     eax, ecx
+    cvtsi2sd xmm0, eax
+    sqrtsd  xmm0, xmm0                  ; dist
+    maxsd   xmm0, [rip + one]           ; never below 1 (avoid /0 at the centre)
+    ; depth = depthscale / dist  -> low byte is the wrapping texture coord
+    movsd   xmm1, [rip + depthscale]
+    divsd   xmm1, xmm0
+    cvttsd2si eax, xmm1
+    mov     [rdi + r9], al              ; vtab[i]
+    ; shade = min(255, dist)   (centre dark = far away, edges bright = near)
+    cvttsd2si eax, xmm0
+    cmp     eax, 255
+    jle     ft_sh
+    mov     eax, 255
+ft_sh:
+    mov     [rbx + r9], al              ; shade[i]
+    ; angle = diamond(dx, dy) -> 0..255
+    mov     eax, r11d
+    sub     eax, 320
+    cvtsi2sd xmm0, eax                  ; dx
+    mov     eax, r10d
+    sub     eax, 240
+    cvtsi2sd xmm1, eax                  ; dy
+    call    diamond
+    mov     [rsi + r9], al              ; utab[i]
+    inc     r9
+    inc     r11d
+    cmp     r11d, 640
+    jb      ft_x
+    inc     r10d
+    cmp     r10d, 480
+    jb      ft_y
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ---- diamond angle: a cheap monotonic stand-in for atan2 ----
+; in: xmm0 = dx, xmm1 = dy.  out: eax = round(da * 64) & 255, da in [0,4).
+; Clobbers xmm0-xmm5 and eax only (so callers keep their GPRs and xmm6+).
+diamond:
+    xorpd   xmm4, xmm4                  ; 0.0
+    movsd   xmm2, xmm4
+    subsd   xmm2, xmm0
+    maxsd   xmm2, xmm0                  ; adx = |dx|
+    movsd   xmm3, xmm4
+    subsd   xmm3, xmm1
+    maxsd   xmm3, xmm1                  ; ady = |dy|
+    ucomisd xmm1, xmm4
+    jb      d_yneg                      ; dy < 0
+    ucomisd xmm0, xmm4
+    jb      d_yp_xn                     ; dy>=0, dx<0
+    ; dy>=0, dx>=0:  da = dy / (dx + dy)
+    movsd   xmm5, xmm0
+    addsd   xmm5, xmm1
+    movsd   xmm0, xmm1
+    divsd   xmm0, xmm5
+    jmp     d_done
+d_yp_xn:
+    ; dy>=0, dx<0:   da = 1 - dx / (adx + dy)
+    movsd   xmm5, xmm2
+    addsd   xmm5, xmm1
+    divsd   xmm0, xmm5
+    movsd   xmm5, [rip + one]
+    subsd   xmm5, xmm0
+    movsd   xmm0, xmm5
+    jmp     d_done
+d_yneg:
+    ucomisd xmm0, xmm4
+    jb      d_yn_xn                     ; dy<0, dx<0
+    ; dy<0, dx>=0:   da = 3 + dx / (dx + ady)
+    movsd   xmm5, xmm0
+    addsd   xmm5, xmm3
+    divsd   xmm0, xmm5
+    addsd   xmm0, [rip + three]
+    jmp     d_done
+d_yn_xn:
+    ; dy<0, dx<0:    da = 2 - dy / (adx + ady)
+    movsd   xmm5, xmm2
+    addsd   xmm5, xmm3
+    movsd   xmm0, xmm1
+    divsd   xmm0, xmm5
+    movsd   xmm5, [rip + two]
+    subsd   xmm5, xmm0
+    movsd   xmm0, xmm5
+d_done:
+    mulsd   xmm0, [rip + c64]
+    cvttsd2si eax, xmm0
+    and     eax, 255
+    ret
+
+; ---- render one frame: scroll the texture through the tables ----
+;   rsi=&utab  rdi=&vtab  rbx=&shadetab   r8=fb pointer   r9=ta   r10=td   rcx=i
+render:
+    push    rbx
+    push    rsi
+    push    rdi
+    mov     rsi, [rip + utab]
+    mov     rdi, [rip + vtab]
+    mov     rbx, [rip + shadetab]
+    mov     r8, [rip + fb]
+    mov     r9d, [rip + ta]
+    mov     r10d, [rip + td]
+    xor     rcx, rcx
+tr:
+    movzx   eax, byte ptr [rsi + rcx]   ; angle
+    add     eax, r9d
+    and     eax, 255                    ; tu = (angle + ta) & 255
+    shr     eax, 5
+    mov     edx, eax                    ; tu >> 5  (which 32-wide band)
+    movzx   eax, byte ptr [rdi + rcx]   ; depth
+    add     eax, r10d
+    and     eax, 255                    ; tv = (depth + td) & 255
+    shr     eax, 5
+    xor     edx, eax                    ; checkerboard = (tu>>5) ^ (tv>>5)
+    and     edx, 1
+    movzx   eax, byte ptr [rbx + rcx]   ; shade
+    test    edx, edx
+    jnz     tr_lit
+    shr     eax, 2                      ; dark squares at quarter brightness
+tr_lit:
+    mov     r11d, eax                   ; s
+    shl     eax, 16                     ; R
+    mov     edx, r11d
+    shl     edx, 8                      ; G
+    or      eax, edx
+    or      eax, r11d                   ; B  ->  eax = grey(s)
+    mov     [r8], eax
+    add     r8, 4
+    inc     rcx
+    cmp     rcx, 307200
+    jb      tr
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                     ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                      ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                    ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    add     dword ptr [rip + ta], 1     ; rotate
+    add     dword ptr [rip + td], 3     ; move forward
+    call    render
+    invoke  InvalidateRect, [rip + hwndSave], 0, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
