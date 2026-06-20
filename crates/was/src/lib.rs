@@ -1841,14 +1841,16 @@ fn emit_call(func: &str, args: &[String], kb: &Kb, labels: &HashSet<String>, fra
         o.push_str(&format!("  sub rsp, {frame}\n"));
     }
     // Stack args (index >= 4) at [rsp+32+...] — the reserved outgoing-arg area.
+    // A float there goes as its raw bits, so just strip the annotation.
     for (idx, arg) in args.iter().enumerate().skip(4) {
         let off = 32 + (idx - 4) * 8;
-        o.push_str(&load_arg("rax", arg, kb, labels)?);
+        let v = float_arg(arg).map(|(_, v)| v).unwrap_or(arg);
+        o.push_str(&load_arg("rax", v, kb, labels)?);
         o.push_str(&format!("  mov [rsp + {off}], rax\n"));
     }
-    // Register args (0..=3).
+    // Register args (0..=3): integers → rcx/rdx/r8/r9, floats → xmm0–3.
     for (idx, arg) in args.iter().enumerate().take(4) {
-        o.push_str(&load_arg(ARG_REGS[idx], arg, kb, labels)?);
+        o.push_str(&marshal_reg_arg(idx, arg, kb, labels)?);
     }
     o.push_str(&format!("  call {func}\n"));
     if !framed {
@@ -1906,11 +1908,12 @@ fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>, framed: bool) -
     }
     for (i, arg) in all.iter().enumerate().skip(4) {
         let off = 32 + (i - 4) * 8;
-        o.push_str(&load_arg("rax", arg, kb, labels)?);
+        let v = float_arg(arg).map(|(_, v)| v).unwrap_or(arg);
+        o.push_str(&load_arg("rax", v, kb, labels)?);
         o.push_str(&format!("  mov [rsp + {off}], rax\n"));
     }
     for (i, arg) in all.iter().enumerate().take(4) {
-        o.push_str(&load_arg(ARG_REGS[i], arg, kb, labels)?);
+        o.push_str(&marshal_reg_arg(i, arg, kb, labels)?);
     }
     o.push_str("  mov rax, [rcx]\n"); // vtable, from the `this` pointer in rcx
     o.push_str(&format!("  call qword ptr [rax + {disp}]\n"));
@@ -2132,6 +2135,32 @@ fn load_arg(reg: &str, arg: &str, kb: &Kb, labels: &HashSet<String>) -> Result<S
     Ok(format!("  mov {reg}, {r}\n"))
 }
 
+/// A float argument annotated `real4 X` / `f32 X` (or `real8`/`f64`): the value
+/// goes in an xmm register, not an integer one. Returns (is-double, the value).
+/// (winkb has no COM param types, so floats are marked explicitly — and visibly.)
+fn float_arg(arg: &str) -> Option<(bool, &str)> {
+    let a = arg.trim();
+    for (kw, wide) in [("real4", false), ("f32", false), ("real8", true), ("f64", true)] {
+        if let Some(rest) = a.strip_prefix(kw) {
+            if rest.starts_with(char::is_whitespace) {
+                return Some((wide, rest.trim_start()));
+            }
+        }
+    }
+    None
+}
+
+/// Marshal argument `idx` (0..3) into its slot: a `real4`/`real8` arg → movss/
+/// movsd into xmm{idx}; otherwise its integer register via `load_arg`.
+fn marshal_reg_arg(idx: usize, arg: &str, kb: &Kb, labels: &HashSet<String>) -> Result<String> {
+    if let Some((wide, v)) = float_arg(arg) {
+        let ins = if wide { "movsd" } else { "movss" };
+        let rv = resolve_operands(v, kb, labels)?;
+        return Ok(format!("  {ins} xmm{idx}, {}\n", rv.trim()));
+    }
+    load_arg(ARG_REGS[idx], arg, kb, labels)
+}
+
 // ── small helpers ────────────────────────────────────────────────────────────
 
 fn is_ident_char(c: char) -> bool {
@@ -2297,6 +2326,17 @@ mod tests {
         let body = low.split("sub rsp, 32").nth(1).unwrap();
         assert!(!body.contains("and rsp, -16"), "the lean call must not re-align:\n{body}");
         assert!(body.contains("call Sleep"));
+    }
+
+    #[test]
+    fn float_args_marshal_to_xmm() {
+        assert_eq!(float_arg("real4 [rip + x]"), Some((false, "[rip + x]")));
+        assert_eq!(float_arg("f64 rax"), Some((true, "rax")));
+        assert_eq!(float_arg("[rip + x]"), None);
+        let Some(kb) = kb() else { return };
+        // a real4 register-position arg → movss into that position's xmm
+        let low = lower(".data\nf DWORD 0\n.code\n.globl m\nm:\n  invoke Sleep, real4 [rip + f]\n", &kb).unwrap();
+        assert!(low.contains("movss xmm0, [rip + f]"), "float → xmm0:\n{low}");
     }
 
     #[test]
