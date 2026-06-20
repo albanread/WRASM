@@ -1,0 +1,121 @@
+; fbwin.was — a software framebuffer window (the "start simple" graphics demo).
+;
+; Allocates a 640x480 BGRA pixel buffer, fills it with a classic XOR texture,
+; and blits it to the window with one GDI StretchDIBits call from WM_PAINT.
+; No COM — just a window, a byte buffer (now that .data is read/write), and a blit.
+;
+;   was examples\fbwin.was -o fbwin.exe   &&   fbwin.exe
+
+.DATA
+className   WCHAR  "rasm_fbwin", 0
+titleText   WCHAR  "RASM — software framebuffer (XOR)", 0
+wc          BYTE   80 dup(0)            ; WNDCLASSEXW
+bmi         BYTE   40 dup(0)            ; BITMAPINFOHEADER
+msg         BYTE   48 dup(0)            ; MSG
+ps          BYTE   72 dup(0)            ; PAINTSTRUCT
+fb          QWORD  ?                    ; framebuffer pointer (from VirtualAlloc)
+hwndSave    QWORD  ?                    ; the window handle
+hdcSave     QWORD  ?                    ; device context during paint
+
+.CODE
+.globl main
+main:
+    ; framebuffer = VirtualAlloc(NULL, 640*480*4, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4
+    mov     [rip + fb], rax
+
+    ; ---- fill the buffer: pixel = (x^y) | (x<<8) | (y<<16)  (B,G,R) ----
+    mov     rdi, rax                    ; dst
+    xor     rcx, rcx                    ; y
+fill_y:
+    xor     rdx, rdx                    ; x
+fill_x:
+    mov     r8d, edx
+    xor     r8d, ecx                    ; x ^ y  -> blue
+    and     r8d, 0xFF
+    mov     r9d, edx
+    and     r9d, 0xFF
+    shl     r9d, 8                      ; x -> green
+    or      r8d, r9d
+    mov     r9d, ecx
+    and     r9d, 0xFF
+    shl     r9d, 16                     ; y -> red
+    or      r8d, r9d
+    mov     [rdi], r8d
+    add     rdi, 4
+    inc     rdx
+    cmp     rdx, 640
+    jb      fill_x
+    inc     rcx
+    cmp     rcx, 480
+    jb      fill_y
+
+    ; ---- BITMAPINFOHEADER (top-down 32bpp) ----
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480   ; negative -> top-down
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0  ; BI_RGB
+
+    ; ---- hInstance ----
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax                    ; hInstance (survives invoke calls)
+
+    ; ---- WNDCLASSEXW ----
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3               ; CS_HREDRAW|CS_VREDRAW
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512                                ; IDC_ARROW
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+
+    ; ---- CreateWindowExW(0, class, title, WS_OVERLAPPEDWINDOW|WS_VISIBLE,
+    ;        CW_USEDEFAULT, CW_USEDEFAULT, 660, 520, 0, 0, hInst, 0) ----
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+
+    ; ---- message loop ----
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                     ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                      ; WM_DESTROY
+    je      wp_destroy
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    ; StretchDIBits(hdc, 0,0,640,480, 0,0,640,480, fb, &bmi, DIB_RGB_COLORS, SRCCOPY)
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
