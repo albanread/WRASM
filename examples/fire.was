@@ -1,0 +1,242 @@
+; fire.was — the classic Doom-style fire effect.
+;
+;   was examples\fire.was -o fire.exe   &&   fire.exe
+;
+; A single 640x480 HEAT buffer (1 byte/cell, 0 = cold, 255 = white-hot). The
+; bottom row is held white-hot. Every frame each cell pushes its heat UP one row
+; — but jittered left/right by a random amount and cooled by a random bit. That
+; tiny per-cell randomness is the whole effect: it turns a solid hot row into
+; flickering flames. A 256-colour palette (black -> red -> orange -> yellow ->
+; white) maps heat to colour.
+;
+; This is the in-place algorithm John Carmack used (PSX Doom): one buffer, walk
+; upward, write each cell into the row above. The first warmed-up frame is saved
+; to fire.bmp.
+
+.DATA
+; ---- fire palette: heat 0..255 -> 0x00RRGGBB ----
+palette DWORD 0x000000, 0x030000, 0x060000, 0x090000, 0x0C0000, 0x0F0000, 0x120000, 0x150000
+        DWORD 0x180000, 0x1B0000, 0x1E0000, 0x210000, 0x240000, 0x270000, 0x2A0000, 0x2D0000
+        DWORD 0x300000, 0x330000, 0x360000, 0x390000, 0x3C0000, 0x3F0000, 0x420000, 0x450000
+        DWORD 0x480000, 0x4B0000, 0x4E0000, 0x510000, 0x540000, 0x570000, 0x5A0000, 0x5D0000
+        DWORD 0x600000, 0x630000, 0x660000, 0x690000, 0x6C0000, 0x6F0000, 0x720000, 0x750000
+        DWORD 0x780000, 0x7B0000, 0x7E0000, 0x810000, 0x840000, 0x870000, 0x8A0000, 0x8D0000
+        DWORD 0x900000, 0x930000, 0x960000, 0x990000, 0x9C0000, 0x9F0000, 0xA20000, 0xA50000
+        DWORD 0xA80000, 0xAB0000, 0xAE0000, 0xB10000, 0xB40000, 0xB70000, 0xBA0000, 0xBD0000
+        DWORD 0xC00000, 0xC30000, 0xC60000, 0xC90000, 0xCC0000, 0xCF0000, 0xD20000, 0xD50000
+        DWORD 0xD80000, 0xDB0000, 0xDE0000, 0xE10000, 0xE40000, 0xE70000, 0xEA0000, 0xED0000
+        DWORD 0xF00000, 0xF30000, 0xF60000, 0xF90000, 0xFC0000, 0xFF0000, 0xFF0300, 0xFF0600
+        DWORD 0xFF0900, 0xFF0C00, 0xFF0F00, 0xFF1200, 0xFF1500, 0xFF1800, 0xFF1B00, 0xFF1E00
+        DWORD 0xFF2100, 0xFF2400, 0xFF2700, 0xFF2A00, 0xFF2D00, 0xFF3000, 0xFF3300, 0xFF3600
+        DWORD 0xFF3900, 0xFF3C00, 0xFF3F00, 0xFF4200, 0xFF4500, 0xFF4800, 0xFF4B00, 0xFF4E00
+        DWORD 0xFF5100, 0xFF5400, 0xFF5700, 0xFF5A00, 0xFF5D00, 0xFF6000, 0xFF6300, 0xFF6600
+        DWORD 0xFF6900, 0xFF6C00, 0xFF6F00, 0xFF7200, 0xFF7500, 0xFF7800, 0xFF7B00, 0xFF7E00
+        DWORD 0xFF8100, 0xFF8400, 0xFF8700, 0xFF8A00, 0xFF8D00, 0xFF9000, 0xFF9300, 0xFF9600
+        DWORD 0xFF9900, 0xFF9C00, 0xFF9F00, 0xFFA200, 0xFFA500, 0xFFA800, 0xFFAB00, 0xFFAE00
+        DWORD 0xFFB100, 0xFFB400, 0xFFB700, 0xFFBA00, 0xFFBD00, 0xFFC000, 0xFFC300, 0xFFC600
+        DWORD 0xFFC900, 0xFFCC00, 0xFFCF00, 0xFFD200, 0xFFD500, 0xFFD800, 0xFFDB00, 0xFFDE00
+        DWORD 0xFFE100, 0xFFE400, 0xFFE700, 0xFFEA00, 0xFFED00, 0xFFF000, 0xFFF300, 0xFFF600
+        DWORD 0xFFF900, 0xFFFC00, 0xFFFF00, 0xFFFF03, 0xFFFF06, 0xFFFF09, 0xFFFF0C, 0xFFFF0F
+        DWORD 0xFFFF12, 0xFFFF15, 0xFFFF18, 0xFFFF1B, 0xFFFF1E, 0xFFFF21, 0xFFFF24, 0xFFFF27
+        DWORD 0xFFFF2A, 0xFFFF2D, 0xFFFF30, 0xFFFF33, 0xFFFF36, 0xFFFF39, 0xFFFF3C, 0xFFFF3F
+        DWORD 0xFFFF42, 0xFFFF45, 0xFFFF48, 0xFFFF4B, 0xFFFF4E, 0xFFFF51, 0xFFFF54, 0xFFFF57
+        DWORD 0xFFFF5A, 0xFFFF5D, 0xFFFF60, 0xFFFF63, 0xFFFF66, 0xFFFF69, 0xFFFF6C, 0xFFFF6F
+        DWORD 0xFFFF72, 0xFFFF75, 0xFFFF78, 0xFFFF7B, 0xFFFF7E, 0xFFFF81, 0xFFFF84, 0xFFFF87
+        DWORD 0xFFFF8A, 0xFFFF8D, 0xFFFF90, 0xFFFF93, 0xFFFF96, 0xFFFF99, 0xFFFF9C, 0xFFFF9F
+        DWORD 0xFFFFA2, 0xFFFFA5, 0xFFFFA8, 0xFFFFAB, 0xFFFFAE, 0xFFFFB1, 0xFFFFB4, 0xFFFFB7
+        DWORD 0xFFFFBA, 0xFFFFBD, 0xFFFFC0, 0xFFFFC3, 0xFFFFC6, 0xFFFFC9, 0xFFFFCC, 0xFFFFCF
+        DWORD 0xFFFFD2, 0xFFFFD5, 0xFFFFD8, 0xFFFFDB, 0xFFFFDE, 0xFFFFE1, 0xFFFFE4, 0xFFFFE7
+        DWORD 0xFFFFEA, 0xFFFFED, 0xFFFFF0, 0xFFFFF3, 0xFFFFF6, 0xFFFFF9, 0xFFFFFC, 0xFFFFFF
+
+heat        QWORD  ?                  ; the heat buffer (640*480 bytes)
+seed        DWORD  ?
+className   WCHAR  "rasm_fire", 0
+titleText   WCHAR  "RASM — Doom fire", 0
+fname       WCHAR  "fire.bmp", 0
+wc          BYTE   80 dup(0)
+bmi         BYTE   40 dup(0)
+msg         BYTE   48 dup(0)
+ps          BYTE   72 dup(0)
+filehdr     BYTE   0x42,0x4D, 0x36,0xC4,0x12,0x00, 0x00,0x00, 0x00,0x00, 0x36,0x00,0x00,0x00
+fb          QWORD  ?
+hwndSave    QWORD  ?
+hdcSave     QWORD  ?
+hfile       QWORD  ?
+written     DWORD  ?
+
+.CODE
+.globl main
+main:
+    invoke  VirtualAlloc, 0, 1228800, 0x3000, 4     ; framebuffer
+    mov     [rip + fb], rax
+    invoke  VirtualAlloc, 0, 307200, 0x3000, 4      ; heat buffer (zeroed)
+    mov     [rip + heat], rax
+
+    invoke  GetTickCount                            ; seed the PRNG
+    xor     eax, 0x1234567
+    or      eax, 1
+    mov     [rip + seed], eax
+
+    ; light the bottom row white-hot (row 479 = offset 479*640 = 306560)
+    mov     r8, [rip + heat]
+    mov     ecx, 306560
+light:
+    mov     byte ptr [r8 + rcx], 255
+    inc     ecx
+    cmp     ecx, 307200
+    jb      light
+
+    ; warm up so the saved frame already shows a tall flame
+    mov     ebx, 280
+warm:
+    call    step
+    dec     ebx
+    jnz     warm
+    call    render
+
+    ; BITMAPINFOHEADER (top-down 32bpp)
+    lea     rdi, [rip + bmi]
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biSize], 40
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biWidth], 640
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biHeight], -480
+    mov     word ptr [rdi + BITMAPINFOHEADER.biPlanes], 1
+    mov     word ptr [rdi + BITMAPINFOHEADER.biBitCount], 32
+    mov     dword ptr [rdi + BITMAPINFOHEADER.biCompression], 0
+
+    invoke  CreateFileW, fname, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + hfile], rax
+    invoke  WriteFile, [rip + hfile], filehdr, 14, written, 0
+    invoke  WriteFile, [rip + hfile], bmi, 40, written, 0
+    invoke  WriteFile, [rip + hfile], [rip + fb], 1228800, written, 0
+    invoke  CloseHandle, [rip + hfile]
+
+    ; window
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, 660, 520, 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail:
+    invoke  ExitProcess, 1
+
+; ---- propagate the fire up one row (in place) ----
+;   r8 = &heat   r9 = prng seed   r10 = x   r11 = y
+;   rcx = src index   rdx = random   rbx = dest index   rax = heat value
+; x runs 2..637 so the random horizontal shift can never leave the buffer.
+step:
+    push    rbx
+    mov     r8, [rip + heat]
+    mov     r9d, [rip + seed]
+    mov     r11d, 1                     ; y (row 1 .. 479; reads row y, writes row y-1)
+st_y:
+    mov     eax, r11d
+    imul    eax, eax, 640
+    add     eax, 2                      ; src = y*640 + 2
+    mov     ecx, eax
+    mov     r10d, 2                     ; x
+st_x:
+    movzx   eax, byte ptr [r8 + rcx]    ; heat at this cell
+    test    eax, eax
+    jnz     st_hot
+    mov     byte ptr [r8 + rcx - 640], 0   ; cold stays cold one row up
+    jmp     st_next
+st_hot:
+    mov     edx, r9d                    ; xorshift32 -> random
+    shl     edx, 13
+    xor     r9d, edx
+    mov     edx, r9d
+    shr     edx, 17
+    xor     r9d, edx
+    mov     edx, r9d
+    shl     edx, 5
+    xor     r9d, edx
+    mov     edx, r9d                    ; take the random bits from the new state
+    and     edx, 3                      ; rnd in 0..3
+    lea     ebx, [rcx - 639]            ; dest = src - 640 + 1 ...
+    sub     ebx, edx                    ;        ... - rnd   (one row up, jittered)
+    and     edx, 1                      ; cool by 0 or 1
+    sub     eax, edx
+    mov     byte ptr [r8 + rbx], al     ; deposit the (cooled) heat above
+st_next:
+    inc     ecx
+    inc     r10d
+    cmp     r10d, 638
+    jb      st_x
+    inc     r11d
+    cmp     r11d, 480
+    jb      st_y
+    mov     [rip + seed], r9d
+    pop     rbx
+    ret
+
+; ---- map the heat buffer through the palette into the framebuffer ----
+render:
+    push    rdi
+    mov     r8, [rip + heat]
+    lea     r9, [rip + palette]
+    mov     rdi, [rip + fb]
+    xor     rcx, rcx
+rn:
+    movzx   eax, byte ptr [r8 + rcx]    ; heat 0..255
+    shl     eax, 2                      ; *4 (dword palette entries)
+    mov     eax, [r9 + rax]             ; palette colour
+    mov     [rdi], eax
+    add     rdi, 4
+    inc     rcx
+    cmp     rcx, 307200
+    jb      rn
+    pop     rdi
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 15                     ; WM_PAINT
+    je      wp_paint
+    cmp     edx, 2                      ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                    ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    step
+    call    render
+    invoke  InvalidateRect, [rip + hwndSave], 0, 0
+    xor     eax, eax
+    ret
+wp_paint:
+    mov     [rip + hwndSave], rcx
+    invoke  BeginPaint, [rip + hwndSave], ps
+    mov     [rip + hdcSave], rax
+    invoke  StretchDIBits, [rip + hdcSave], 0, 0, 640, 480, 0, 0, 640, 480, [rip + fb], bmi, 0, 0xCC0020
+    invoke  EndPaint, [rip + hwndSave], ps
+    xor     eax, eax
+    ret
