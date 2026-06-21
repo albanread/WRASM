@@ -107,6 +107,7 @@ dsp_lut:
     lea     rdx, [r15 + 64]           ; frame0 = dataPtr + 64 (after the LUT)
     mov     r8d, ebx                  ; width
     mov     r9d, r14d                 ; stride
+    mov     r10d, r13d                ; height
     call    pack_frame
     mov     rax, r15                  ; advance pool: dataPtr + 64 + stride*h
     add     rax, 64
@@ -120,11 +121,12 @@ endproc
 ; ---- pack_frame(rcx=text, rdx=framePtr, r8d=width, r9d=stride): parse text rows
 ; into 4-bit packed pixels (even col = high nibble, odd = low; clips col >= width;
 ; '/' = next row). Shared by DefineSprite + AddFrame. ----
-proc pack_frame uses rbx rsi rdi in rcx rdx r8 r9
+proc pack_frame uses rbx rsi rdi in rcx rdx r8 r9 r10
     mov     rsi, rcx                  ; text
     mov     rdi, rdx                  ; frame ptr
     mov     ebx, r8d                  ; width
     mov     r11d, r9d                 ; stride
+    ; r10d = height — extra rows are clipped (pf_have)
     xor     r8d, r8d                  ; row
     xor     r9d, r9d                  ; col
 pf_p:
@@ -158,6 +160,8 @@ pf_dig:
 pf_zero:
     xor     al, al                    ; '.', space, etc → 0 (transparent)
 pf_have:
+    cmp     r8d, r10d                 ; row within height? (clip a too-tall text)
+    jae     pf_done
     cmp     r9d, ebx                  ; col within width? (clip ragged rows)
     jae     pf_adv
     mov     edx, r8d                  ; offset = row*stride + col/2
@@ -196,18 +200,29 @@ proc AddFrame uses rbx rsi rdi r12 r13 r14 frame in rcx rdx
     mov     r13d, [rsi + 12]          ; h
     mov     r14d, [rsi + 16]          ; frameStride
     mov     r12d, [rsi + 20]          ; frameCount
-    mov     rdi, [rip + spritePoolNext]   ; new frame ptr (the pool's contiguous top)
-    mov     eax, r14d                 ; pool guard: rdi + stride*h must fit
+    ; frame ptr = dataPtr + 64 + frameCount*stride*h — DERIVED from the sprite, then
+    ; verified == the pool top, so an intervening allocation is a safe no-op (not
+    ; silent corruption).
+    mov     eax, r14d
+    imul    eax, r13d                 ; frameBytes = stride*h
+    imul    eax, r12d                 ; frameCount * frameBytes
+    mov     rdi, [rsi]                ; dataPtr
+    add     rdi, 64
+    add     rdi, rax                  ; expected frame ptr
+    cmp     rdi, [rip + spritePoolNext]
+    jne     af_end                    ; not the contiguous top → ignore
+    mov     eax, r14d                 ; pool-overflow guard: rdi + frameBytes <= end
     imul    eax, r13d
     lea     r8, [rdi + rax]
     lea     r9, [rip + spritePool]
     add     r9, 262144
     cmp     r8, r9
     ja      af_end
-    mov     rcx, rdx                  ; pack the new frame
+    mov     rcx, rdx                  ; pack the new frame (clipped to the sprite's h)
     mov     rdx, rdi
     mov     r8d, ebx
     mov     r9d, r14d
+    mov     r10d, r13d                ; height
     call    pack_frame
     mov     eax, r14d                 ; advance pool by stride*h
     imul    eax, r13d
