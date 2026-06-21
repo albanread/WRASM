@@ -112,13 +112,28 @@ behind the hills (½) behind the tower blocks (1×), all sliding at different sp
 the player moves — depth from three byte-grids. Transparent cells (tile 0) let the
 layers behind show through.
 
-CPU realization: `DrawLayer(map, mapW, mapH, tileset, scrollX, scrollY)` blits the
-visible window's tiles into `fb` keyed on 0 (reusing the blit engine); the host calls
-it once per layer with that layer's `camera × rate`, far layer first. `present` then
-resolves `fb` through the line/global LUTs as usual — so tiles get the per-line
-gradient sky for free behind them. The overscan world above is the optimisation
-(draw once, move the present window); the per-frame `DrawLayer` is the simple start.
-⬜ next.
+**The scroll is two-level — the real art.** The *smooth* part is the sub-tile pixel
+offset (0…tileSize−1), done by moving the **present's start position** over a buffer
+that holds display + one tile of margin — no redraw, every frame, nearly free. When
+that offset crosses a tile boundary you **bump**: advance the **tile origin** one step
+into the (potentially massive) map, wrap the smooth offset back, and **redraw the tile
+window** (now one column/row further along). So tiles are repainted only *once per tile
+crossed*, never the whole world, and you only ever hold a display-plus-one-tile slice
+of an arbitrarily large level. Smooth pixels + occasional tile bumps = endless smooth
+scroll for almost no work.
+
+CPU realization, two pieces:
+- **`DrawTiles(layer)`** — paint the visible tile window (+1 margin tile) into the
+  layer's buffer at its tile origin, keyed on 0 (reusing the blit engine). Called
+  only on a bump.
+- the **overscan present** reads that buffer at the smooth `(scrollX, scrollY)` offset
+  each frame (the start-position window) and resolves through the line/global LUTs —
+  so tiles inherit the per-line sky for free.
+
+Each parallax layer has its own `{tile origin, smooth offset}` advanced by
+`camera × rate`, so the layers bump at different times; composite far→near (tile 0
+transparent). A per-frame `DrawTiles` into one `fb` is the simple first cut; the
+smooth-scroll + bump model above is the proper one. ⬜ next.
 
 ## Double buffering (design)
 
