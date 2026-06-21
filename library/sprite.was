@@ -65,10 +65,24 @@ dsp_hn:
     inc     edi
     jmp     dsp_h
 dsp_hd:
+    test    edi, edi                  ; a trailing '/' over-counts height by one
+    jz      dsp_stride
+    cmp     byte ptr [rsi + rdi - 1], 47
+    jne     dsp_stride
+    dec     r13d
+dsp_stride:
     mov     r14d, ebx                 ; frameStride = (w+1)/2 bytes (4-bit packed)
     inc     r14d
     shr     r14d, 1
     mov     r15, [rip + spritePoolNext]   ; dataPtr for this sprite
+    mov     eax, r14d                 ; pool-overflow guard: 64 + stride*h must fit
+    imul    eax, r13d
+    add     eax, 64
+    lea     rcx, [r15 + rax]          ; end of this sprite's data
+    lea     rdx, [rip + spritePool]
+    add     rdx, 262144               ; the 256 KB pool's end
+    cmp     rcx, rdx
+    ja      dsp_end                   ; would overflow → ignore (id stays undefined)
     lea     rax, [rip + spriteTab]     ; record slot[id]
     mov     ecx, r12d
     shl     ecx, 5                    ; id*32
@@ -154,11 +168,15 @@ endproc
 proc SpriteColour in rcx rdx r8
     cmp     ecx, 64
     jae     sc_end
+    cmp     edx, 16                   ; only the sprite's own 16 LUT entries
+    jae     sc_end
     lea     rax, [rip + spriteTab]
     mov     r9d, ecx
     shl     r9d, 5
     add     rax, r9
     mov     rax, [rax]                ; dataPtr = LUT base
+    test    rax, rax                  ; undefined sprite → no-op (no NULL store)
+    jz      sc_end
     mov     [rax + rdx*4], r8d        ; LUT[index] = rgb
 sc_end:
 endproc
