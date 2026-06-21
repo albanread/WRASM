@@ -125,6 +125,11 @@ tile). A 64×64 level is 4 KB; scrolling is just changing a start position, no p
 copy. Index **0 is transparent**, exactly like sprites — that's what makes layering
 work.
 
+And like a sprite, a tile is a **shape + a LUT**: the same shape reused with different
+LUTs gives many colours, so a few "brick" shapes become red / grey / gold bricks for
+almost no data. (The LUT maps the shape's 4-bit indices into the global 240, so tiles
+still composite in `fb` with the per-line gradient sky behind them.)
+
 A **layer** = `{ map, mapW, mapH, tileset, scrollRate }`. Draw several **back to
 front** at `camera × scrollRate` and you get **parallax**: the clouds (rate ¼) drift
 behind the hills (½) behind the tower blocks (1×), all sliding at different speeds as
