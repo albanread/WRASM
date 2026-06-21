@@ -9,10 +9,19 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// The knowledge base: a read-only connection to `windows_api.db`.
 pub struct Kb {
     conn: Connection,
+    /// Memoizes [`resolve`](Kb::resolve) — the assembler calls it for *every*
+    /// identifier token it lowers (mnemonics included), and a miss scans the
+    /// unindexed `enum_members.member_name` (~68k rows, ~4 ms). Most tokens repeat
+    /// (`mov`, a constant used many times), so one cache turns a per-line DB scan
+    /// into a hash hit — the difference between seconds and milliseconds on a big
+    /// single-file program. Single-threaded use only (the DB is opened NO_MUTEX).
+    resolve_cache: RefCell<HashMap<String, Vec<Value>>>,
 }
 
 /// A search result row.
@@ -78,7 +87,7 @@ impl Kb {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("open {path} read-only"))?;
-        Ok(Kb { conn })
+        Ok(Kb { conn, resolve_cache: RefCell::new(HashMap::new()) })
     }
 
     /// ① Search functions / constants / enum members / types by name substring.
@@ -160,6 +169,9 @@ impl Kb {
     /// ③ Resolve a bare name to its value(s), unifying constants and enum members.
     /// Returns every match (usually one); the caller disambiguates on collision.
     pub fn resolve(&self, name: &str) -> Result<Vec<Value>> {
+        if let Some(hit) = self.resolve_cache.borrow().get(name) {
+            return Ok(hit.clone());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT 'const' AS src, value_i64, value_u64, namespace_name
                FROM constants WHERE constant_name = ?1
@@ -178,7 +190,11 @@ impl Kb {
                 namespace: r.get(3)?,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let values = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Cache hits *and* misses (the empty vec) — a mnemonic like `mov` misses
+        // on every line, and not re-scanning for it is the whole point.
+        self.resolve_cache.borrow_mut().insert(name.to_string(), values.clone());
+        Ok(values)
     }
 
     /// ② A function's signature plus, per enum-typed parameter, the constants it
