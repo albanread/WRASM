@@ -17,9 +17,13 @@ but written against *our* primitives, conventions, and roadmap. Companion:
 | `Rect` (outline) | ✅ | |
 | `Text` (5×7 font) | ✅ | `library/gc_font.inc` |
 | Palette cycling | ✅ | `CyclePalette` |
+| **Per-line palette LUT** (0..15 per scanline) | ✅ | `resolve_present`, `SetLineColour` |
+| Global "regular 240" (indices 16..255) | ✅ | `palette` |
 | **Inter/intra-buffer blit** | ✅ | `library/blit.was` |
-| **Double buffering** | ⬜ design below (built on blit) | |
-| Sprites (text-authored + keyed blit) | ⬜ (built on blit) | |
+| Sprites (text-authored + keyed blit) | ✅ | `library/sprite.was` |
+| **Per-sprite palette** (own CLUT, composited) | ⬜ next | |
+| **Overscan world + smooth scroll** | ⬜ next | |
+| **Double buffering** | ⬜ (built on blit) | |
 | Introspection (timestamped snapshot) | ✅ | `library/introspect.was` |
 | Input (keyboard/mouse state) | ⬜ | |
 | GPU profile (D3D11) | ⬜ | builds on `examples/mandel_gpu.was` |
@@ -51,6 +55,45 @@ Integer args in `ecx, edx, r8d, r9d` then `r10b`, matching the demo:
 | `Text` | `ecx`=x `edx`=y `r8b`=index `r9`=asciiz |
 
 All clip to the framebuffer (negative coords rejected via unsigned compare).
+
+## Palette architecture — lots of colour on a low-depth display
+
+The whole point of an indexed display: **layered palette LUTs** let a 4-bit-feeling
+surface show hundreds of colours at once (the copper/raster trick). Grounded in the
+M2 reference (`GameView`/`GameViewGpu`):
+
+- **The regular 240** — indices **16..255** resolve through the single global
+  `palette` (0x00RRGGBB). The fixed, shared colours.
+- **Per-line LUT** — indices **0..15** of the background resolve through a
+  **per-scanline** palette: each display row owns its own 16 colours
+  (`linePal[row][0..15]`). So one index can be a different colour on every line —
+  a 200-line gradient from a single index, raster bars, split palettes.
+  `SeedLinePalette` defaults every line to the global 0..15; `SetLineColour(y,i,rgb)`
+  tweaks one. **Implemented** (`resolve_present`).
+- **Per-sprite LUT** — each sprite owns its own 16 colours; index **0 =
+  transparent**. To keep a sprite's palette independent of the line it sits on, the
+  sprite must be **composited** (resolved through its own LUT at present), not just
+  blitted as raw indices. ⬜ next phase (see below).
+
+`present` resolves the background per scanline (0..15 → line LUT, 16..255 → global)
+into `pbuf`, then upscales/blits. `resolve_present` is the single source of truth so
+the on-screen image and introspect's snapshot can't diverge.
+
+Status of sprites vs this model: CPU sprites today are **blitted** into `fb`, so they
+share the background's line/global palette (M2's CPU profile does the same). A
+**per-sprite-palette compositing** path (`BlitMap`-style remap, or a sprite layer
+resolved at present) is the next step — that's what makes a sprite carry its own
+colours and palette-swap.
+
+## Overscan & smooth scrolling (design)
+
+The index buffer is **larger than the display** (e.g. an overscan world up to
+640×400, or a wide 1280-class world) and the display shows a **window** into it at a
+start position `(scrollX, scrollY)`. Smooth scrolling = move the start position; no
+pixels are copied. `present` reads `fb[(scrollY+sy)*worldW + (scrollX+sx)]` for each
+display pixel, and the per-line LUT is indexed by the display row. Display modes:
+320×200 and 640×400, integer-upscaled to the window. ⬜ next-phase work (today the
+buffer == the 320×200 display).
 
 ## Double buffering (design)
 
