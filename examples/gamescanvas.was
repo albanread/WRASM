@@ -57,19 +57,28 @@ main:
     invoke  CreateWindowExW, 0, className, titleW, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
     mov     [rip + hwndSave], rax      ; the library's present reads this
 
-    xor     ecx, ecx                   ; define the text-authored sprites once
+    xor     ecx, ecx                   ; define sprites + their OWN LUTs
     lea     rdx, [rip + spriteHeart]
-    call    DefineSprite
+    call    DefineSprite               ; id 0: heart, default LUT (12 → global red)
+    mov     ecx, 2
+    lea     rdx, [rip + spriteHeart]
+    call    DefineSprite               ; id 2: same heart bitmap …
+    mov     ecx, 2
+    mov     edx, 12
+    mov     r8d, 0x0055FF55            ; … recoloured GREEN via its own LUT entry 12
+    call    SpriteColour
     mov     ecx, 1
     lea     rdx, [rip + spriteDiamond]
-    call    DefineSprite
+    call    DefineSprite               ; id 1: diamond (default LUT, 11 → global cyan)
 
     call    SeedLinePalette            ; lines 0..15 default to the global palette
     xor     ecx, ecx
     call    set_sky                    ; initial per-line gradient sky on index 1
 
-    call    draw_scene                ; draw once; the timer animates the sky
-    call    Snapshot                  ; introspect: a timestamped snap of what we drew
+    call    draw_scene                 ; the static world into fb (drawn once)
+    call    resolve_present            ; build one full frame for the startup snap:
+    call    draw_sprites               ;   background (fb→pbuf) then sprites composited
+    call    Snapshot
     invoke  SetTimer, [rip + hwndSave], 1, 60, 0
 msgloop:
     invoke  GetMessageW, msg, 0, 0, 0
@@ -145,31 +154,6 @@ ds_swatch:
     mov     r10d, 100                 ; dstX
     mov     r11d, 150                 ; dstY
     call    BlitKey
-    ; keyed sprites — the transparent holes let the background show through
-    xor     ecx, ecx                  ; hearts at the corners
-    mov     edx, 36
-    mov     r8d, 28
-    call    DrawSprite
-    xor     ecx, ecx
-    mov     edx, 276
-    mov     r8d, 28
-    call    DrawSprite
-    xor     ecx, ecx
-    mov     edx, 36
-    mov     r8d, 165
-    call    DrawSprite
-    xor     ecx, ecx
-    mov     edx, 276
-    mov     r8d, 165
-    call    DrawSprite
-    mov     ecx, 1                    ; diamonds on the sides
-    mov     edx, 16
-    mov     r8d, 96
-    call    DrawSprite
-    mov     ecx, 1
-    mov     edx, 298
-    mov     r8d, 96
-    call    DrawSprite
     ret
 
 .globl WndProc
@@ -188,8 +172,41 @@ wp_timer:
     inc     dword ptr [rip + skyPhase] ; animate the per-line gradient sky (LUT trick)
     mov     ecx, [rip + skyPhase]
     call    set_sky
-    call    present
+    call    resolve_present            ; background (fb → pbuf) via the per-line LUTs
+    call    draw_sprites               ; composite sprites over pbuf via their own LUTs
+    call    blit_present               ; pbuf → screen
     xor     eax, eax
+    ret
+
+; ---- draw_sprites: composite the scene's sprites into pbuf each frame ----
+;   red hearts (id 0) up top, GREEN hearts (id 2 — same bitmap, own LUT) below,
+;   diamonds (id 1) on the sides. Their colours come from their own LUTs, so they
+;   are identical top vs bottom regardless of the per-line sky behind them.
+draw_sprites:
+    xor     ecx, ecx
+    mov     edx, 36
+    mov     r8d, 24
+    call    DrawSprite
+    xor     ecx, ecx
+    mov     edx, 276
+    mov     r8d, 24
+    call    DrawSprite
+    mov     ecx, 2
+    mov     edx, 36
+    mov     r8d, 168
+    call    DrawSprite
+    mov     ecx, 2
+    mov     edx, 276
+    mov     r8d, 168
+    call    DrawSprite
+    mov     ecx, 1
+    mov     edx, 16
+    mov     r8d, 96
+    call    DrawSprite
+    mov     ecx, 1
+    mov     edx, 298
+    mov     r8d, 96
+    call    DrawSprite
     ret
 
 ; ---- set_sky(ecx=phase): a scrolling vertical gradient on background index 1,

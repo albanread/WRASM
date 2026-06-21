@@ -1,35 +1,38 @@
 ; ============================================================================
-; sprite.was — text-authored sprites on top of the blit engine
+; sprite.was — sprites with their own RGB LUT, composited over the background
 ; ============================================================================
-; Reuse:  .include "../library/sprite.was"   (after canvas.was AND blit.was)
+; Reuse:  .include "../library/sprite.was"   (after canvas.was)
 ;
-; A sprite is authored as TEXT: rows of palette-index characters separated by '/'.
-;   '0'-'9' → index 0..9,  'A'-'F'/'a'-'f' → 10..15,  anything else → transparent.
-; All rows must be the same width. DefineSprite parses the text once into an index
-; bitmap (transparent = 255); DrawSprite stamps it with a keyed blit, so the
-; "holes" let the background show through.
+; A sprite is its own little palette + bitmap, exactly as the hardware model:
+;   [ LUT: 16 × u32  (0x00RRGGBB, entry 0 = transparent) ][ frame0 ][ frame1 ]…
+; Pixel data is 4-bit (2 per byte, row-major); all frames share the one LUT. A
+; sprite pixel is `4-bit index → that sprite's LUT → RGB`, composited straight
+; into the 32-bit present buffer `pbuf` over the resolved background — so its
+; colours are its OWN, independent of the line/global palettes. Index 0 is 100%
+; transparent (the background shows through).
 ;
-;   DefineSprite(rcx=id, rdx=asciiz text)   parse + store sprite `id` (0..63)
-;   DrawSprite(rcx=id, edx=x, r8d=y)         keyed-blit it to the current dest
+;   DefineSprite(rcx=id, rdx=asciiz)         parse text rows → 4-bit frame0; LUT
+;                                            defaults to the global palette 0..15
+;   SpriteColour(rcx=id, edx=index, r8d=rgb) set one of the sprite's 16 colours
+;   DrawSprite(rcx=id, edx=x, r8d=y)         composite frame0 into pbuf at (x,y)
 ;
-; Example (a 8x7 heart, C = bright red = 12):
-;   heart BYTE ".CC.CC../CCCCCCC./CCCCCCC./CCCCCCC./.CCCCC../..CCC.../...C....", 0
-;   ... DefineSprite(0, heart) ... DrawSprite(0, 50, 80) ...
+; Text rows are separated by '/'. '1'-'9'/'A'-'F'/'a'-'f' = colour index 1..15;
+; '0', '.', space, anything else = 0 (transparent). All rows the same width.
 ;
-; The destination is whatever blit.was points at — call DestFramebuffer (or
-; SetDest) first. DrawSprite always keys on 255 (the transparent index).
-; Depends on: blit.was (BlitKey, blitKey).
+; The frame loop: rebuild fb (the world) → resolve_present (fb→pbuf) → DrawSprite
+; each sprite → blit_present. (Sprites composite every frame over the fresh pbuf.)
+; Depends on: canvas.was (pbuf, palette).
 ; ============================================================================
 
 .DATA
-spriteTab      BYTE 1024 dup(0)       ; 64 slots × {base QWORD, w DWORD, h DWORD}
-spritePool     BYTE 65536 dup(0)      ; pixel storage (bump-allocated)
+spriteTab      BYTE 2048 dup(0)       ; 64 slots × {dataPtr Q@0, w@8, h@12, stride@16, frames@20}
+spritePool     BYTE 262144 dup(0)     ; LUT(64) + 4-bit frame data, bump-allocated
 spritePoolNext QWORD ?                 ; next free byte (lazy-init to spritePool)
 
 .CODE
-; ---- DefineSprite(rcx=id, rdx=asciiz): parse text rows → an index bitmap ----
+; ---- DefineSprite(rcx=id, rdx=asciiz): LUT (default = global 0..15) + 4-bit frame0 --
 proc DefineSprite uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx
-    cmp     ecx, 64                   ; ignore an out-of-range id (no OOB slot write)
+    cmp     ecx, 64                   ; ignore an out-of-range id
     jae     dsp_end
     mov     r12d, ecx                 ; id
     mov     rsi, rdx                  ; text base
@@ -39,8 +42,7 @@ proc DefineSprite uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx
     lea     rax, [rip + spritePool]
     mov     [rip + spritePoolNext], rax
 dsp_pool:
-    ; pass 1a: width = chars before the first '/' (or end)
-    xor     ebx, ebx
+    xor     ebx, ebx                  ; width = chars before the first '/'
 dsp_w:
     movzx   eax, byte ptr [rsi + rbx]
     test    al, al
@@ -50,8 +52,7 @@ dsp_w:
     inc     ebx
     jmp     dsp_w
 dsp_wd:
-    ; pass 1b: height = ('/' count) + 1
-    mov     r13d, 1
+    mov     r13d, 1                   ; height = '/' count + 1
     xor     edi, edi
 dsp_h:
     movzx   eax, byte ptr [rsi + rdi]
@@ -64,73 +65,161 @@ dsp_hn:
     inc     edi
     jmp     dsp_h
 dsp_hd:
-    ; record slot[id] = { base = pool next, w, h }
-    mov     r14, [rip + spritePoolNext]
-    lea     r15, [rip + spriteTab]
-    mov     eax, r12d
-    shl     eax, 4                    ; id * 16
-    add     r15, rax
-    mov     [r15], r14                ; base
-    mov     [r15 + 8], ebx            ; w
-    mov     [r15 + 12], r13d          ; h
-    ; pass 2: map each char → index, store row-major (skip '/')
-    mov     rdi, r14                  ; write pointer
+    mov     r14d, ebx                 ; frameStride = (w+1)/2 bytes (4-bit packed)
+    inc     r14d
+    shr     r14d, 1
+    mov     r15, [rip + spritePoolNext]   ; dataPtr for this sprite
+    lea     rax, [rip + spriteTab]     ; record slot[id]
+    mov     ecx, r12d
+    shl     ecx, 5                    ; id*32
+    add     rax, rcx
+    mov     [rax], r15                ; dataPtr
+    mov     [rax + 8], ebx            ; w
+    mov     [rax + 12], r13d          ; h
+    mov     [rax + 16], r14d          ; frameStride
+    mov     dword ptr [rax + 20], 1   ; frameCount
+    lea     rcx, [rip + palette]      ; default LUT = global palette 0..15
+    mov     rdx, r15
+    mov     r10d, 16
+dsp_lut:
+    mov     r8d, [rcx]
+    mov     [rdx], r8d
+    add     rcx, 4
+    add     rdx, 4
+    dec     r10d
+    jnz     dsp_lut
+    lea     rdi, [r15 + 64]           ; frame0 = dataPtr + 64 (after the LUT)
+    xor     r8d, r8d                  ; row
+    xor     r9d, r9d                  ; col
 dsp_p:
     movzx   eax, byte ptr [rsi]
     test    al, al
     jz      dsp_pd
-    cmp     al, 47                    ; '/' → row break, don't store
-    je      dsp_skip
-    cmp     al, 48                    ; '0'
-    jb      dsp_trans
-    cmp     al, 57                    ; '9'
+    cmp     al, 47                    ; '/' → next row
+    jne     dsp_pchar
+    inc     r8d
+    xor     r9d, r9d
+    inc     rsi
+    jmp     dsp_p
+dsp_pchar:
+    cmp     al, 48                    ; map char → 4-bit index in al
+    jb      dsp_zero
+    cmp     al, 57
     jbe     dsp_dig
-    cmp     al, 97                    ; 'a' → fold to upper
+    cmp     al, 97
     jb      dsp_up
     sub     al, 32
 dsp_up:
-    cmp     al, 65                    ; 'A'
-    jb      dsp_trans
-    cmp     al, 70                    ; 'F'
-    ja      dsp_trans
+    cmp     al, 65
+    jb      dsp_zero
+    cmp     al, 70
+    ja      dsp_zero
     sub     al, 55                    ; 'A'..'F' → 10..15
-    jmp     dsp_store
+    jmp     dsp_have
 dsp_dig:
     sub     al, 48                    ; '0'..'9' → 0..9
-    jmp     dsp_store
-dsp_trans:
-    mov     al, 255                   ; transparent
-dsp_store:
-    mov     [rdi], al
-    inc     rdi
-dsp_skip:
+    jmp     dsp_have
+dsp_zero:
+    xor     al, al                    ; '.', space, etc → 0 (transparent)
+dsp_have:
+    cmp     r9d, ebx                  ; col within width? (clip ragged rows)
+    jae     dsp_padv
+    mov     edx, r8d                  ; offset = row*stride + col/2
+    imul    edx, r14d
+    mov     ecx, r9d
+    shr     ecx, 1
+    add     edx, ecx
+    test    r9d, 1                    ; even col → high nibble, odd → low
+    jnz     dsp_lo
+    shl     al, 4
+    mov     [rdi + rdx], al
+    jmp     dsp_padv
+dsp_lo:
+    or      [rdi + rdx], al
+dsp_padv:
+    inc     r9d
     inc     rsi
     jmp     dsp_p
 dsp_pd:
-    mov     eax, ebx                  ; advance the pool by w*h
-    imul    eax, r13d
-    add     r14, rax
-    mov     [rip + spritePoolNext], r14
+    mov     rax, r15                  ; advance pool: dataPtr + 64 + stride*h
+    add     rax, 64
+    mov     ecx, r14d
+    imul    ecx, r13d
+    add     rax, rcx
+    mov     [rip + spritePoolNext], rax
 dsp_end:
 endproc
 
-; ---- DrawSprite(rcx=id, edx=x, r8d=y): keyed-blit sprite `id` ----
-proc DrawSprite uses rsi rdi frame in rcx rdx r8
-    cmp     ecx, 64                   ; ignore an out-of-range id (no OOB slot read)
-    jae     dsr_end
-    mov     esi, edx                  ; x
-    mov     edi, r8d                  ; y
+; ---- SpriteColour(rcx=id, edx=index, r8d=rgb): set one of the sprite's 16 colours ----
+proc SpriteColour in rcx rdx r8
+    cmp     ecx, 64
+    jae     sc_end
     lea     rax, [rip + spriteTab]
-    mov     edx, ecx
-    shl     edx, 4                    ; id * 16
-    add     rax, rdx                  ; &slot[id]
-    mov     rcx, [rax]                ; src base
-    mov     r8d, [rax + 8]            ; w
-    mov     edx, r8d                  ; srcStride = w
-    mov     r9d, [rax + 12]           ; h
-    mov     r10d, esi                 ; dstX
-    mov     r11d, edi                 ; dstY
-    mov     dword ptr [rip + blitKey], 255   ; sprites are keyed on 255
-    call    BlitKey
-dsr_end:
+    mov     r9d, ecx
+    shl     r9d, 5
+    add     rax, r9
+    mov     rax, [rax]                ; dataPtr = LUT base
+    mov     [rax + rdx*4], r8d        ; LUT[index] = rgb
+sc_end:
+endproc
+
+; ---- DrawSprite(rcx=id, edx=x, r8d=y): composite frame0 into pbuf via its LUT ----
+proc DrawSprite uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx r8
+    cmp     ecx, 64
+    jae     ds_done
+    lea     rax, [rip + spriteTab]
+    mov     r9d, ecx
+    shl     r9d, 5
+    add     rax, r9
+    mov     rsi, [rax]                ; LUT base (= dataPtr)
+    mov     ebx, [rax + 8]            ; w
+    mov     r12d, [rax + 12]          ; h
+    mov     r13d, [rax + 16]          ; frameStride
+    lea     rdi, [rsi + 64]           ; frame0 base
+    mov     r14d, edx                 ; x
+    mov     r15d, r8d                 ; y
+    xor     r8d, r8d                  ; sy
+ds_row:
+    cmp     r8d, r12d
+    jge     ds_done
+    mov     r9d, r15d
+    add     r9d, r8d                  ; py = y + sy
+    cmp     r9d, 200
+    jae     ds_nextrow                ; row off-screen (unsigned: neg → huge)
+    mov     eax, r8d                  ; frame row = frame0 + sy*stride
+    imul    eax, r13d
+    lea     r10, [rdi + rax]
+    mov     eax, r9d                  ; pbuf row = pbuf + py*1280
+    imul    eax, eax, 1280
+    lea     r11, [rip + pbuf]
+    add     r11, rax
+    xor     edx, edx                  ; sx
+ds_col:
+    cmp     edx, ebx
+    jge     ds_nextrow
+    mov     ecx, r14d
+    add     ecx, edx                  ; px = x + sx
+    cmp     ecx, 320
+    jae     ds_skip                   ; col off-screen
+    mov     eax, edx                  ; unpack 4-bit index at sx
+    shr     eax, 1
+    movzx   eax, byte ptr [r10 + rax]
+    test    edx, 1
+    jnz     ds_lo
+    shr     eax, 4                    ; even col → high nibble
+    jmp     ds_idx
+ds_lo:
+    and     eax, 0x0F                 ; odd col → low nibble
+ds_idx:
+    test    eax, eax
+    jz      ds_skip                   ; index 0 → transparent
+    mov     r9d, [rsi + rax*4]        ; colour = sprite LUT[index]
+    mov     [r11 + rcx*4], r9d        ; pbuf[px] = colour
+ds_skip:
+    inc     edx
+    jmp     ds_col
+ds_nextrow:
+    inc     r8d
+    jmp     ds_row
+ds_done:
 endproc

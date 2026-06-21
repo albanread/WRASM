@@ -535,12 +535,18 @@ rp_put:
     jl      rp_row
 endproc
 
-; ---- present: resolve (per-line + global), then blit upscaled (3x) ----
-proc present frame
-    call    resolve_present
+; ---- blit_present: upscale + blit the current pbuf to the window (3x) ----
+proc blit_present frame
     invoke  GetDC, [rip + hwndSave]
     mov     [rip + hdcTmp], rax
     invoke  SetStretchBltMode, [rip + hdcTmp], 3
     invoke  StretchDIBits, [rip + hdcTmp], 0, 0, 960, 600, 0, 0, 320, 200, pbuf, bmi, 0, 0x00CC0020
     invoke  ReleaseDC, [rip + hwndSave], [rip + hdcTmp]
+endproc
+
+; ---- present: resolve the background then blit (no sprites — see DrawSprite for
+; the composite flow: resolve_present → DrawSprite… → blit_present) ----
+proc present frame
+    call    resolve_present
+    call    blit_present
 endproc

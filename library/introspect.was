@@ -49,7 +49,8 @@ sn_put:
     add     rdi, 2
     dec     ecx
     jnz     sn_hex
-    call    resolve_present           ; same resolve present uses → snap matches screen
+    ; dumps the CURRENT pbuf (the last rendered frame) — call after a present or a
+    ; resolve_present + DrawSprite… composite, so the snap matches the screen.
     ; write the BMP: header then the 256000-byte pixel block
     invoke  CreateFileW, snapName, 0x40000000, 0, 0, 2, 0x80, 0
     mov     rbx, rax
