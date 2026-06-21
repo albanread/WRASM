@@ -217,10 +217,12 @@ update/render"* because the machine was written for game #1.
 
 Ordered by the "20 games" test — most-needed, most-boilerplate first:
 
-1. **Harness** — `GameRun(init, update, render)`: own the window, message pump,
-   fixed-step timing, input, and the resolve→composite→blit present. *Biggest cut in
-   per-game boilerplate.*
-2. **Input** — key-state + edge + mouse (filled by the harness).
+1. ✅ **Harness** — `GameStart`/`GameLoop`/`GameRun(init, step, sprites)` + the
+   headless `GameSelfTest`: owns the window, message pump, fixed-step timer, input,
+   and the resolve→composite→blit present (`library/harness.was`). A whole game is
+   now `main` + three procs.
+2. ✅ **Input** — keyboard + joystick + 8 predefined actions + edges, filled by the
+   harness; simulatable for headless play (`library/input.was`).
 3. **Sprite animation** — `AddFrame` + a frame index/timer; then flip/scale + AABB.
 4. **Tilemap** — a tileset + map → scrolling background (with overscan + scroll).
 5. **LUT-effect helpers** — fade/flash/cycle/gradient; RNG + trig tables.

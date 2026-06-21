@@ -1,0 +1,164 @@
+; ============================================================================
+; harness.was — the game machine: window + loop + input + present, your 3 procs
+; ============================================================================
+; Reuse:  .include "../library/harness.was"   (after canvas/blit/sprite/input)
+;
+; Owns everything identical across games — the window, the WndProc (which fills
+; input), the fixed-step timer, and the resolve→composite→blit present — and calls
+; back into YOUR three procs:
+;     init()      once at startup: load sprites/palettes/sounds, build the scene
+;     step()      each frame: read input (Action/KeyDown), update state, draw the
+;                 world into fb (and any per-line LUT changes)
+;     sprites()   each frame: composite your sprites into pbuf (DrawSprite …)
+; The QUIT action (Esc / stick) closes the window automatically.
+;
+;   GameStart(rcx=titleW, rdx=init, r8=step, r9=sprites)  set up + call init
+;   GameLoop()                       run interactively (window + timer)
+;   GameRun(... same as GameStart)   = GameStart + GameLoop (the usual entry)
+;   GameSelfTest(rcx=frames, edx=every)  HEADLESS: step `frames` frames, Snapshot
+;                 every `every` — film a run with nobody at the keyboard
+;
+; A whole game becomes:  main → GameRun(title, Init, Step, Sprites)  + those procs.
+; Depends on: canvas (resolve_present/blit_present/hwndSave), input (InputPoll/
+; ActionHit/InputKey), introspect (Snapshot, for GameSelfTest).
+; ============================================================================
+
+.DATA
+gInit     QWORD ?                     ; the author's callbacks
+gStep     QWORD ?
+gSprites  QWORD ?
+hClassName WCHAR "rasm_game", 0
+hWc       BYTE  80 dup(0)
+hMsg      BYTE  48 dup(0)
+hRect     BYTE  16 dup(0)
+hWinW     DWORD ?
+hWinH     DWORD ?
+
+.CODE
+; ---- GameStart(rcx=titleW, rdx=init, r8=step, r9=sprites): window + init ----
+proc GameStart uses rsi rdi r12 frame in rcx rdx r8 r9
+    mov     [rip + gInit], rdx
+    mov     [rip + gStep], r8
+    mov     [rip + gSprites], r9
+    mov     r12, rcx                  ; title
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + hWc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + HWndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + hClassName]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + hWc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, hWc
+    lea     rdi, [rip + hRect]        ; client area 960x600 (320x200 @ 3x)
+    mov     dword ptr [rdi + 8], 960
+    mov     dword ptr [rdi + 12], 600
+    invoke  AdjustWindowRect, hRect, 0x10CF0000, 0
+    lea     rdi, [rip + hRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + hWinW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + hWinH], eax
+    invoke  CreateWindowExW, 0, hClassName, r12, 0x10CF0000, 0x80000000, 0x80000000, [rip + hWinW], [rip + hWinH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    mov     rax, [rip + gInit]        ; the author's init()
+    call    rax
+endproc
+
+; ---- GameFrame: one frame — input, your step + sprite composite, into pbuf ----
+proc GameFrame frame
+    call    InputPoll
+    mov     rax, [rip + gStep]
+    call    rax                        ; author: logic + world into fb
+    call    resolve_present            ; fb → pbuf (per-line + global LUTs)
+    mov     rax, [rip + gSprites]
+    call    rax                        ; author: composite sprites into pbuf
+endproc
+
+; ---- GameLoop: run interactively (timer-driven frames + message pump) ----
+proc GameLoop frame
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0    ; ~60 fps
+gl_loop:
+    invoke  GetMessageW, hMsg, 0, 0, 0
+    test    eax, eax
+    jle     gl_done
+    invoke  TranslateMessage, hMsg
+    invoke  DispatchMessageW, hMsg
+    jmp     gl_loop
+gl_done:
+endproc
+
+; ---- GameRun: the usual entry — set up then run ----
+proc GameRun frame in rcx rdx r8 r9
+    call    GameStart
+    call    GameLoop
+endproc
+
+; ---- GameSelfTest(rcx=frames, edx=every): headless — step + sample a filmstrip ----
+proc GameSelfTest uses rbx r12 r13 frame in rcx rdx
+    mov     ebx, ecx                  ; frames remaining
+    mov     r13d, edx                 ; sample every N
+    mov     r12d, 1                   ; countdown (sample on the first)
+gst_loop:
+    test    ebx, ebx
+    jz      gst_done
+    call    GameFrame                  ; builds pbuf (no blit)
+    dec     r12d
+    jnz     gst_skip
+    call    Snapshot                   ; sample this frame
+    mov     r12d, r13d
+gst_skip:
+    dec     ebx
+    jmp     gst_loop
+gst_done:
+endproc
+
+; ---- HWndProc: the window procedure — input + the timer frame ----
+.globl HWndProc
+HWndProc:
+    cmp     edx, 2                    ; WM_DESTROY
+    je      hw_destroy
+    cmp     edx, 275                  ; WM_TIMER
+    je      hw_timer
+    cmp     edx, 256                  ; WM_KEYDOWN
+    je      hw_keydn
+    cmp     edx, 257                  ; WM_KEYUP
+    je      hw_keyup
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+hw_keydn:
+    mov     rcx, r8                   ; vk = wParam
+    mov     edx, 1
+    call    InputKey
+    xor     eax, eax
+    ret
+hw_keyup:
+    mov     rcx, r8
+    xor     edx, edx
+    call    InputKey
+    xor     eax, eax
+    ret
+hw_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+hw_timer:
+    call    GameFrame
+    mov     ecx, 7                    ; QUIT action (Esc / stick) → close
+    call    ActionHit
+    test    eax, eax
+    jz      hw_blit
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+hw_blit:
+    call    blit_present
+    xor     eax, eax
+    ret
