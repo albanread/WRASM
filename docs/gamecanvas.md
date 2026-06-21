@@ -82,11 +82,30 @@ LUT for 0..15, global for 16..255); sprites then composite over `pbuf` through t
 own LUTs (0 transparent, else opaque RGB); `pbuf` is blitted. One `resolve_present`
 keeps the screen and the introspect snapshot identical.
 
-Status of sprites vs this model: CPU sprites today are **blitted** into `fb`, so they
-share the background's line/global palette (M2's CPU profile does the same). A
-**per-sprite-palette compositing** path (`BlitMap`-style remap, or a sprite layer
-resolved at present) is the next step — that's what makes a sprite carry its own
-colours and palette-swap.
+## The render stack (z-order)
+
+Back to front, every frame: **background → tile layers → sprites → text** — and it
+splits across the two surfaces:
+
+- **`fb` (indexed) = the world "below the line"** — the background (the per-line LUT
+  gradient or art) **+** the parallax tile layers, all drawn into `fb` with tile 0
+  transparent so they composite there. One `resolve_present` turns the whole stack
+  into `pbuf` through the per-line/global LUTs, so everything in the world shares the
+  layered palette and the sky.
+- **`pbuf` (RGB) = the overlay "above the line"** — **sprites** composite in via their
+  own RGB LUTs (over the world), then **text/HUD** composites last, on top.
+
+The harness frame already *is* this stack; tiles and HUD text are the two layers
+still to fill in:
+```
+GameStep        → background + tile layers   (into fb)
+resolve_present → fb → pbuf via the LUTs
+GameSprites     → sprites                     (composite pbuf, own LUTs)
+(HUD text)      → score / dialog              (composite pbuf, last)
+blit_present
+```
+In-world text (a sign in the level) is `Text` into `fb` like any tile; HUD text is the
+final `pbuf` overlay, so it sits above the sprites.
 
 ## Overscan & smooth scrolling (design)
 
