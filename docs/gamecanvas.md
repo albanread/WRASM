@@ -9,16 +9,16 @@ but written against *our* primitives, conventions, and roadmap. Companion:
 
 | Area | State | Where |
 |---|---|---|
-| Index framebuffer + 256 palette | ✅ | `examples/gamescanvas.was` |
+| Index framebuffer + 256 palette | ✅ | `library/canvas.was` |
 | GDI present (StretchDIBits, 3× nearest) | ✅ | `present` |
-| `Cls` / `FillRect` | ✅ | |
-| `Pset` / `Pget`, `HLine` / `VLine` | ✅ Pset/HLine/VLine · ⬜ Pget | |
+| `Cls` / `FillRect` | ✅ | `FillRect` clips all 4 edges |
+| `Pset` / `Pget`, `HLine` / `VLine` | ✅ | |
 | `Line` (Bresenham) / `Circle` (midpoint) / `Disc` | ✅ | verified pixel-exact |
-| `Rect` (outline) | ⬜ | trivial (4 lines / 2 H + 2 V) |
+| `Rect` (outline) | ✅ | |
 | `Text` (5×7 font) | ✅ | `library/gc_font.inc` |
 | Palette cycling | ✅ | `CyclePalette` |
-| **Double buffering** | ⬜ design below | |
-| **Inter/intra-buffer blit** | ⬜ design below | |
+| **Inter/intra-buffer blit** | ✅ | `library/blit.was` |
+| **Double buffering** | ⬜ design below (built on blit) | |
 | Sprites (text-authored + keyed blit) | ⬜ (built on blit) | |
 | Introspection (timestamped snapshot) | ✅ | `library/introspect.was` |
 | Input (keyboard/mouse state) | ⬜ | |
@@ -77,27 +77,32 @@ showPtr  QWORD ?             ; current front buffer (presented)
 This rides on the blit primitive — restore = inter-buffer blit of the saved
 background rect; that's the cheap "erase".
 
-## Inter/intra-buffer blit (design)
+## Inter/intra-buffer blit (implemented — `library/blit.was`)
 
 One primitive underlies sprites, scrolling, background save/restore, and the
 double-buffer flip. A **buffer** is any index bitmap (the framebuffer, an offscreen
-page, a sprite sheet, a saved-background scratch), described by a base pointer +
-stride.
+page, a sprite sheet, a saved-background scratch). The destination is a *settable
+surface* (defaults to the framebuffer); the source rect starts at the `src`
+pointer (point it into a sheet + pass that sheet's stride for a sub-rect).
 
 ```
-; Blit(src, srcStride, srcX, srcY,  dst, dstStride, dstX, dstY,  w, h)
-; BlitKey(... , keyIndex)   — skip pixels equal to keyIndex (sprite transparency)
+DestFramebuffer                                   dest = the canvas fb (320x200)
+SetDest(rcx=base, edx=stride, r8d=w, r9d=h)       dest = a custom surface
+SetKey(ecx=index)                                 transparent index (default 255)
+Blit   (rcx=src, edx=srcStride, r8d=w, r9d=h, r10d=dstX, r11d=dstY)   opaque
+BlitKey(rcx=src, edx=srcStride, r8d=w, r9d=h, r10d=dstX, r11d=dstY)   skip == key
 ```
 
-- **Intra-buffer** (`src == dst`): scrolling and on-canvas moves. Must pick the
-  copy direction by overlap (top-down vs bottom-up, left vs right) so an
-  overlapping region isn't corrupted mid-copy.
+- **Intra-buffer** (`src == dst`): scrolling and on-canvas moves. The copy
+  direction is picked by overlap (`cmp dstPtr,srcPtr`) so an overlapping region
+  isn't corrupted mid-copy (assumes a shared stride — always true within a buffer).
 - **Inter-buffer** (`src != dst`): sprite sheet → framebuffer; framebuffer → saved
   background (and back, to erase); back page → front (the `Flip` fast path).
-- **Clipping**: clip the destination rect to the dst buffer, adjusting src origin +
-  w/h in lockstep (same shape as `HLine`'s edge clip, in 2D).
-- **Row engine**: per row, a `rep movsb` for the opaque path; a tight
-  compare-and-store loop for the keyed (transparent) path.
+- **Clipping**: clips the destination rect to the dst surface, adjusting the src
+  origin + w/h in lockstep (the `HLine` edge clip, in 2D), overflow-safe.
+- **Row engine**: a tight per-pixel copy with the opaque/key decision hoisted to
+  registers outside the inner loop. (A `rep movsb` fast path for the opaque,
+  unclipped, non-overlapping case is a future optimization.)
 
 ### Sprites fall out of this
 

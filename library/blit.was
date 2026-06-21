@@ -1,0 +1,187 @@
+; ============================================================================
+; blit.was — the surface blit engine (the keystone for sprites/scroll/buffers)
+; ============================================================================
+; Reuse:  .include "../library/blit.was"   (alongside canvas.was)
+;
+; Copies rectangular blocks of palette indices between *surfaces* (any index
+; bitmap: the framebuffer, an offscreen page, a sprite sheet, a saved background).
+; One engine underlies sprites (keyed copy), scrolling (intra-buffer overlap),
+; and double buffering (background save/restore + flip).
+;
+; The DESTINATION is a settable surface (defaults to the framebuffer):
+;   DestFramebuffer                          dest = the canvas fb (320x200)
+;   SetDest(rcx=base, edx=stride, r8d=w, r9d=h)   dest = a custom surface
+;   SetKey(ecx=index)                        transparent index for BlitKey (def 255)
+;
+; The blits (source rect starts at the src pointer; for a sub-rect of a larger
+; sheet, point `src` into it and pass that sheet's stride):
+;   Blit   (rcx=src, edx=srcStride, r8d=w, r9d=h, r10d=dstX, r11d=dstY)  opaque
+;   BlitKey(rcx=src, edx=srcStride, r8d=w, r9d=h, r10d=dstX, r11d=dstY)  skip == key
+;
+; Both clip to the destination surface and choose the copy direction by overlap,
+; so an intra-buffer scroll (src and dst the same buffer) is never corrupted.
+; (Overlapping copies assume src and dst share a stride — always true for a scroll
+; within one buffer; non-overlapping inter-buffer copies are direction-agnostic.)
+;
+; Depends on: canvas.was (for `fb`, used by DestFramebuffer). Call DestFramebuffer
+; (or SetDest) once before blitting.
+; ============================================================================
+
+.DATA
+dstBase   QWORD ?                     ; destination surface base pointer
+dstStride DWORD ?                     ; destination bytes-per-row
+dstClipW  DWORD ?                     ; destination width  (clip bound)
+dstClipH  DWORD ?                     ; destination height (clip bound)
+blitKey   DWORD 255                   ; transparent index for BlitKey
+blitOpaque BYTE ?                     ; set by the Blit/BlitKey entry points
+
+.CODE
+; ---- DestFramebuffer: aim blits at the canvas framebuffer ----
+proc DestFramebuffer
+    lea     rax, [rip + fb]
+    mov     [rip + dstBase], rax
+    mov     dword ptr [rip + dstStride], 320
+    mov     dword ptr [rip + dstClipW], 320
+    mov     dword ptr [rip + dstClipH], 200
+endproc
+
+; ---- SetDest(rcx=base, edx=stride, r8d=w, r9d=h): aim at a custom surface ----
+proc SetDest in rcx rdx r8 r9
+    mov     [rip + dstBase], rcx
+    mov     [rip + dstStride], edx
+    mov     [rip + dstClipW], r8d
+    mov     [rip + dstClipH], r9d
+endproc
+
+; ---- SetKey(ecx=index): the transparent index for BlitKey ----
+proc SetKey in rcx
+    mov     [rip + blitKey], ecx
+endproc
+
+; ---- Blit / BlitKey: thin entry points that pick opaque vs keyed, then BlitEx --
+proc Blit frame in rcx rdx r8 r9 r10 r11
+    mov     byte ptr [rip + blitOpaque], 1
+    call    BlitEx
+endproc
+
+proc BlitKey frame in rcx rdx r8 r9 r10 r11
+    mov     byte ptr [rip + blitOpaque], 0
+    call    BlitEx
+endproc
+
+; ---- BlitEx: the engine — clip to dest, pick direction, copy row by row ----
+proc BlitEx uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx r8 r9 r10 r11
+    mov     rsi, rcx                  ; srcBase
+    mov     r14d, edx                 ; srcStride
+    mov     ebx, r8d                  ; w
+    mov     r12d, r9d                 ; h
+    mov     r13d, r10d                ; dstX
+    mov     r15d, r11d                ; dstY
+    xor     eax, eax                  ; sxoff (source x skipped by clipping)
+    xor     ecx, ecx                  ; syoff
+    test    r13d, r13d                ; clip left edge
+    jns     bx_l
+    mov     eax, r13d
+    neg     eax                       ; sxoff = -dstX
+    add     ebx, r13d                 ; w += dstX  (dstX<0 shrinks w)
+    xor     r13d, r13d
+bx_l:
+    test    r15d, r15d                ; clip top edge
+    jns     bx_t
+    mov     ecx, r15d
+    neg     ecx                       ; syoff = -dstY
+    add     r12d, r15d                ; h += dstY
+    xor     r15d, r15d
+bx_t:
+    mov     edx, [rip + dstClipW]     ; clip right: w = min(w, clipW - dstX)
+    sub     edx, r13d                 ; clipW - dstX (no dstX+w overflow)
+    cmp     ebx, edx
+    jle     bx_r
+    mov     ebx, edx
+bx_r:
+    mov     edx, [rip + dstClipH]     ; clip bottom: h = min(h, clipH - dstY)
+    sub     edx, r15d
+    cmp     r12d, edx
+    jle     bx_b
+    mov     r12d, edx
+bx_b:
+    test    ebx, ebx                  ; fully clipped away?
+    jle     bx_done
+    test    r12d, r12d
+    jle     bx_done
+    ; srcPtr (rsi) = srcBase + syoff*srcStride + sxoff
+    imul    ecx, r14d                 ; syoff*srcStride (zero-extends rcx)
+    add     rsi, rcx
+    add     rsi, rax                  ; + sxoff
+    ; dstPtr (rdi) = dstBase + dstY*dstStride + dstX
+    mov     edx, [rip + dstStride]
+    mov     rdi, [rip + dstBase]
+    mov     eax, r15d
+    imul    eax, edx                  ; dstY*dstStride
+    add     rdi, rax
+    mov     eax, r13d
+    add     rdi, rax                  ; + dstX
+    mov     r13d, edx                 ; r13 = dstStride (dstX done with)
+    movzx   r10d, byte ptr [rip + blitOpaque]   ; hoist loop-invariants out of the
+    mov     r11d, [rip + blitKey]               ; per-pixel path (r10b=opaque, r11d=key)
+    cmp     rdi, rsi                  ; overlap direction
+    ja      bx_back
+    ; ---- forward: rows top→bottom, cols left→right ----
+bx_f_row:
+    mov     r8, rsi
+    mov     r9, rdi
+    mov     edx, ebx                  ; column count
+bx_f_col:
+    movzx   eax, byte ptr [r8]
+    test    r10b, r10b
+    jne     bx_f_st                   ; opaque → always store
+    cmp     eax, r11d
+    je      bx_f_sk                   ; keyed + matches → skip
+bx_f_st:
+    mov     [r9], al
+bx_f_sk:
+    inc     r8
+    inc     r9
+    dec     edx
+    jnz     bx_f_col
+    add     rsi, r14
+    add     rdi, r13
+    dec     r12d
+    jnz     bx_f_row
+    jmp     bx_done
+    ; ---- backward: rows bottom→top, cols right→left (overlap-safe) ----
+bx_back:
+    mov     eax, r12d
+    dec     eax                       ; h-1
+    mov     edx, eax
+    imul    edx, r14d                 ; (h-1)*srcStride
+    add     rsi, rdx
+    imul    eax, r13d                 ; (h-1)*dstStride
+    add     rdi, rax
+    mov     edx, ebx
+    dec     edx                       ; w-1
+    add     rsi, rdx                  ; advance both to the last byte
+    add     rdi, rdx
+bx_b_row:
+    mov     r8, rsi
+    mov     r9, rdi
+    mov     edx, ebx
+bx_b_col:
+    movzx   eax, byte ptr [r8]
+    test    r10b, r10b
+    jne     bx_b_st
+    cmp     eax, r11d
+    je      bx_b_sk
+bx_b_st:
+    mov     [r9], al
+bx_b_sk:
+    dec     r8
+    dec     r9
+    dec     edx
+    jnz     bx_b_col
+    sub     rsi, r14
+    sub     rdi, r13
+    dec     r12d
+    jnz     bx_b_row
+bx_done:
+endproc

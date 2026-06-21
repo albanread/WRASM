@@ -1,0 +1,487 @@
+; ============================================================================
+; canvas.was — GamesCanvas core: a 320x200 indexed-colour surface (CPU profile)
+; ============================================================================
+; Reuse:  .include "../library/canvas.was"   (path relative to YOUR file)
+;
+; Provides a retro indexed framebuffer + palette + GDI present, and the drawing
+; primitives. Everything is a contract-checked `proc` (declared uses/in), so the
+; WRASM checks guard your calls. All primitives clip to the framebuffer; negative
+; coordinates are rejected (unsigned compare).
+;
+; DATA it owns (you may read/refer to these):
+;   fb       BYTE  64000 dup       320x200 index framebuffer (top-down)
+;   palette  DWORD 256             0x00RRGGBB entries (LE → BGRX); default CGA-16
+;   pbuf     DWORD 64000 dup       BGRX scratch the present resolves into
+;   hwndSave QWORD                 YOUR main must store the HWND here before present
+;
+; API (integer args in ecx, edx, r8d, r9d, then r10b — matches the spec):
+;   Cls(cl=index)                                   fill the framebuffer
+;   Pset(ecx=x, edx=y, r8b=index)                   one bounds-checked pixel
+;   Pget(ecx=x, edx=y) -> eax=index                 read a pixel (0 if off-screen)
+;   HLine/VLine(ecx=x, edx=y, r8d=len, r9b=index)   clipped runs
+;   FillRect(ecx=x, edx=y, r8d=w, r9d=h, r10b=ix)   solid rectangle
+;   Rect(ecx=x, edx=y, r8d=w, r9d=h, r10b=index)    1px outline
+;   Line(ecx=x0, edx=y0, r8d=x1, r9d=y1, r10b=ix)   Bresenham
+;   Circle/Disc(ecx=cx, edx=cy, r8d=r, r9b=index)   midpoint outline / filled
+;   Text(ecx=x, edx=y, r8b=index, r9=asciiz)        5x7 font, 6px advance
+;   CyclePalette(ecx=lo, edx=hi)                     rotate palette[lo..hi] up one
+;   present                                          resolve + StretchDIBits (3x)
+;
+; Depends on: library/gc_font.inc (the 5x7 font, included below).
+; The window itself is yours — create it, store the HWND in `hwndSave`, drive a
+; timer/paint loop, and call `present`. See examples/gamescanvas.was.
+; ============================================================================
+
+.DATA
+.include "gc_font.inc"               ; fontTab: 128 glyphs x 7 bytes (5x7)
+
+fb        BYTE  64000 dup(0)         ; 320x200 index framebuffer (top-down)
+pbuf      DWORD 64000 dup(0)         ; 320x200 BGRX present buffer
+
+; 256-entry palette, 0x00RRGGBB (little-endian → B,G,R,0 = BGRX, no swizzle).
+; The canonical CGA/EGA 16, then black.
+palette:
+    DWORD 0x000000, 0x0000AA, 0x00AA00, 0x00AAAA
+    DWORD 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA
+    DWORD 0x555555, 0x5555FF, 0x55FF55, 0x55FFFF
+    DWORD 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+    DWORD 240 dup(0)
+
+; BITMAPINFO (header only; 32bpp BI_RGB needs no colour table). biHeight < 0 =
+; top-down, matching the framebuffer.
+bmi:
+    DWORD 40                          ; biSize
+    DWORD 320                         ; biWidth
+    DWORD 0xFFFFFF38                  ; biHeight = -200 (top-down)
+    WORD  1, 32                       ; biPlanes=1, biBitCount=32
+    DWORD 0, 0, 0, 0, 0, 0            ; biCompression(BI_RGB)=0, …
+
+hwndSave  QWORD ?                     ; the host stores its HWND here for present
+hdcTmp    QWORD ?
+
+.CODE
+; ---- Cls(cl = index): fill the framebuffer ----
+proc Cls uses rdi in rcx
+    lea     rdi, [rip + fb]
+    mov     al, cl
+    mov     ecx, 64000
+    rep     stosb
+endproc
+
+; ---- Pset(ecx=x, edx=y, r8b=index): one bounds-checked pixel ----
+proc Pset in rcx rdx r8
+    cmp     ecx, 320                  ; unsigned: a negative x wraps high → rejected
+    jae     ps_done
+    cmp     edx, 200
+    jae     ps_done
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     r9, [rip + fb]
+    mov     [r9 + rax], r8b
+ps_done:
+endproc
+
+; ---- Pget(ecx=x, edx=y) -> eax = index (0 if off-screen) ----
+proc Pget in rcx rdx
+    xor     eax, eax
+    cmp     ecx, 320
+    jae     pg_done
+    cmp     edx, 200
+    jae     pg_done
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     r8, [rip + fb]
+    movzx   eax, byte ptr [r8 + rax]
+pg_done:
+endproc
+
+; ---- HLine(ecx=x, edx=y, r8d=len, r9b=index): clipped horizontal run ----
+proc HLine uses rdi in rcx rdx r8 r9
+    cmp     edx, 200
+    jae     hl_done                   ; row off-screen
+    test    ecx, ecx
+    jns     hl_xpos
+    add     r8d, ecx                  ; x<0 → shorten, clamp x to 0
+    xor     ecx, ecx
+hl_xpos:
+    mov     eax, ecx
+    add     eax, r8d                  ; x + len
+    cmp     eax, 320
+    jle     hl_go
+    mov     r8d, 320
+    sub     r8d, ecx                  ; clip right edge
+hl_go:
+    test    r8d, r8d
+    jle     hl_done
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     rdi, [rip + fb]
+    add     rdi, rax
+    mov     al, r9b
+    mov     ecx, r8d
+    rep     stosb
+hl_done:
+endproc
+
+; ---- VLine(ecx=x, edx=y, r8d=len, r9b=index): clipped vertical run ----
+proc VLine uses rdi in rcx rdx r8 r9
+    cmp     ecx, 320
+    jae     vl_done
+    test    edx, edx
+    jns     vl_ypos
+    add     r8d, edx                  ; y<0 → shorten, clamp y to 0
+    xor     edx, edx
+vl_ypos:
+    mov     eax, edx
+    add     eax, r8d
+    cmp     eax, 200
+    jle     vl_go
+    mov     r8d, 200
+    sub     r8d, edx
+vl_go:
+    test    r8d, r8d
+    jle     vl_done
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     rdi, [rip + fb]
+    add     rdi, rax
+vl_loop:
+    mov     [rdi], r9b
+    add     rdi, 320
+    dec     r8d
+    jnz     vl_loop
+vl_done:
+endproc
+
+; ---- FillRect(ecx=x, edx=y, r8d=w, r9d=h, r10b=index) ----
+proc FillRect uses rbx rsi rdi in rcx rdx r8 r9 r10
+    test    ecx, ecx                  ; clip the left edge (like HLine): x<0 →
+    jns     fr_xok
+    add     r8d, ecx                  ; shorten w by the off-screen part …
+    xor     ecx, ecx                  ; … and clamp x to 0
+fr_xok:
+    mov     ebx, edx                  ; y (row counter; negative y clips per-row below)
+fr_row:
+    test    r9d, r9d
+    jle     fr_done
+    cmp     ebx, 200
+    jae     fr_next                   ; row off-screen → skip (still advance)
+    mov     eax, ebx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     rdi, [rip + fb]
+    add     rdi, rax
+    mov     esi, r8d                  ; w
+    mov     edx, ecx                  ; x (for clip)
+fr_col:
+    test    esi, esi
+    jle     fr_next
+    cmp     edx, 320
+    jae     fr_next
+    mov     [rdi], r10b
+    inc     rdi
+    inc     edx
+    dec     esi
+    jmp     fr_col
+fr_next:
+    inc     ebx
+    dec     r9d
+    jmp     fr_row
+fr_done:
+endproc
+
+; ---- Rect(ecx=x, edx=y, r8d=w, r9d=h, r10b=index): 1px outline ----
+proc Rect uses rbx rsi rdi r12 r13 frame in rcx rdx r8 r9 r10
+    test    r8d, r8d                  ; empty rect → nothing (else x+w-1 / y+h-1
+    jle     rc_done                   ; would paint stray lines outside it)
+    test    r9d, r9d
+    jle     rc_done
+    mov     esi, ecx                  ; x
+    mov     edi, edx                  ; y
+    mov     ebx, r8d                  ; w
+    mov     r12d, r9d                 ; h
+    mov     r13b, r10b                ; index
+    mov     ecx, esi                  ; top: HLine(x, y, w)
+    mov     edx, edi
+    mov     r8d, ebx
+    movzx   r9d, r13b
+    call    HLine
+    mov     ecx, esi                  ; bottom: HLine(x, y+h-1, w)
+    mov     edx, edi
+    add     edx, r12d
+    dec     edx
+    mov     r8d, ebx
+    movzx   r9d, r13b
+    call    HLine
+    mov     ecx, esi                  ; left: VLine(x, y, h)
+    mov     edx, edi
+    mov     r8d, r12d
+    movzx   r9d, r13b
+    call    VLine
+    mov     ecx, esi                  ; right: VLine(x+w-1, y, h)
+    add     ecx, ebx
+    dec     ecx
+    mov     edx, edi
+    mov     r8d, r12d
+    movzx   r9d, r13b
+    call    VLine
+rc_done:
+endproc
+
+; ---- Line(ecx=x0, edx=y0, r8d=x1, r9d=y1, r10b=index): Bresenham (spec, verbatim) ----
+proc Line uses rbx rsi rdi r12 r13 in rcx rdx r8 r9 r10
+    mov     eax, r8d                  ; x: d=x1-x0 → sx (edi), dx (ebx = |d|)
+    sub     eax, ecx
+    mov     r11d, eax
+    sar     r11d, 31                  ; mask = (d<0)? -1 : 0
+    xor     edi, edi
+    test    eax, eax
+    setg    dil
+    add     edi, r11d                 ; sx = (d>0) + mask  ∈ {-1,0,1}
+    xor     eax, r11d
+    sub     eax, r11d                 ; |d|
+    mov     ebx, eax                  ; dx
+    mov     eax, r9d                  ; y: d=y1-y0 → sy (r12d), dy (esi = -|d|)
+    sub     eax, edx
+    mov     r11d, eax
+    sar     r11d, 31
+    xor     r12d, r12d
+    test    eax, eax
+    setg    r12b
+    add     r12d, r11d                ; sy
+    xor     eax, r11d
+    sub     eax, r11d
+    neg     eax
+    mov     esi, eax                  ; dy = -|y1-y0|
+    mov     r11d, ebx
+    add     r11d, esi                 ; err = dx + dy
+    lea     r13, [rip + fb]
+ln_loop:
+    cmp     ecx, 320                  ; plot (x0,y0) if in bounds
+    jae     ln_nopl
+    cmp     edx, 200
+    jae     ln_nopl
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    mov     [r13 + rax], r10b
+ln_nopl:
+    cmp     ecx, r8d                  ; x0==x1 ?
+    jne     ln_step
+    cmp     edx, r9d                  ; …and y0==y1 ? → done
+    je      ln_end
+ln_step:
+    mov     eax, r11d
+    add     eax, eax                  ; e2 = 2*err
+    cmp     eax, esi
+    jl      ln_chky                   ; if e2 >= dy: err += dy; x0 += sx
+    add     r11d, esi
+    add     ecx, edi
+ln_chky:
+    cmp     eax, ebx
+    jg      ln_loop                   ; if e2 <= dx: err += dx; y0 += sy
+    add     r11d, ebx
+    add     edx, r12d
+    jmp     ln_loop
+ln_end:
+endproc
+
+; ---- Circle(ecx=cx, edx=cy, r8d=r, r9b=index): midpoint outline (spec, verbatim) ----
+proc Circle uses rbx rsi rdi r12 r13 r14 frame in rcx rdx r8 r9
+    mov     esi, ecx                  ; cx
+    mov     edi, edx                  ; cy
+    mov     r12b, r9b                 ; index
+    mov     ebx, r8d
+    neg     ebx                       ; x = -r
+    xor     r13d, r13d                ; y = 0
+    mov     r14d, 2
+    mov     eax, r8d
+    add     eax, eax
+    sub     r14d, eax                 ; err = 2 - 2*r
+ci_loop:
+    mov     ecx, esi                  ; Pset(cx-x, cy+y)
+    sub     ecx, ebx
+    mov     edx, edi
+    add     edx, r13d
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi                  ; Pset(cx-y, cy-x)
+    sub     ecx, r13d
+    mov     edx, edi
+    sub     edx, ebx
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi                  ; Pset(cx+x, cy-y)
+    add     ecx, ebx
+    mov     edx, edi
+    sub     edx, r13d
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi                  ; Pset(cx+y, cy+x)
+    add     ecx, r13d
+    mov     edx, edi
+    add     edx, ebx
+    movzx   r8d, r12b
+    call    Pset
+    mov     eax, r14d                 ; r_tmp = err
+    cmp     eax, r13d
+    jg      ci_chkx                   ; if r_tmp <= y: y++; err += y*2+1
+    inc     r13d
+    mov     r9d, r13d
+    add     r9d, r9d
+    inc     r9d
+    add     r14d, r9d
+ci_chkx:
+    cmp     eax, ebx                  ; if r_tmp > x …
+    jg      ci_stepx
+    cmp     r14d, r13d                ; … or err > y:  x++; err += x*2+1
+    jle     ci_until
+ci_stepx:
+    inc     ebx
+    mov     r9d, ebx
+    add     r9d, r9d
+    inc     r9d
+    add     r14d, r9d
+ci_until:
+    test    ebx, ebx                  ; until x >= 0
+    js      ci_loop
+endproc
+
+; ---- Disc(ecx=cx, edx=cy, r8d=r, r9b=index): filled, span per row (spec) ----
+proc Disc uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx r8 r9
+    mov     esi, ecx                  ; cx
+    mov     edi, edx                  ; cy
+    mov     ebx, r8d                  ; r
+    mov     r12b, r9b                 ; index
+    mov     r14d, r8d
+    imul    r14d, r14d                ; r*r
+    mov     r13d, ebx
+    neg     r13d                      ; dy = -r
+di_row:
+    cmp     r13d, ebx
+    jg      di_done                   ; dy > r → done
+    mov     eax, r13d
+    imul    eax, eax                  ; dy*dy
+    mov     r11d, r14d
+    sub     r11d, eax                 ; rem = r² - dy²
+    xor     r15d, r15d                ; s = 0; grow while (s+1)² <= rem
+di_sqrt:
+    mov     eax, r15d
+    inc     eax
+    imul    eax, eax
+    cmp     eax, r11d
+    jg      di_span
+    inc     r15d
+    jmp     di_sqrt
+di_span:
+    mov     ecx, esi
+    sub     ecx, r15d                 ; x = cx - s
+    mov     edx, edi
+    add     edx, r13d                 ; y = cy + dy
+    mov     r8d, r15d
+    add     r8d, r8d
+    inc     r8d                       ; len = 2*s + 1
+    movzx   r9d, r12b
+    call    HLine
+    inc     r13d
+    jmp     di_row
+di_done:
+endproc
+
+; ---- Text(ecx=x, edx=y, r8b=index, r9=asciiz) — 5x7 font, 6px advance ----
+proc Text uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx r8 r9
+    mov     rsi, r9                   ; string
+    mov     r13d, ecx                 ; pen x
+    mov     r14d, edx                 ; pen y
+    mov     r15b, r8b                 ; colour
+    lea     rbx, [rip + fontTab]
+tx_char:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      tx_done
+    inc     rsi
+    cmp     al, 97                    ; 'a'
+    jb      tx_up
+    cmp     al, 122                   ; 'z'
+    ja      tx_up
+    sub     al, 32                    ; → uppercase
+tx_up:
+    cmp     al, 128
+    jae     tx_adv                    ; unprintable → blank cell
+    movzx   ecx, al
+    imul    ecx, ecx, 7
+    lea     r12, [rbx + rcx]          ; glyph (7 rows)
+    xor     r8d, r8d                  ; row 0..6
+tx_row:
+    movzx   r9d, byte ptr [r12 + r8]  ; row bits (bit4 = leftmost)
+    xor     ecx, ecx                  ; col 0..4
+tx_col:
+    mov     edx, 16
+    mov     eax, ecx
+    shr     edx, cl                   ; mask = 16 >> col   (cl = col)
+    mov     ecx, eax                  ; restore col
+    test    r9d, edx
+    jz      tx_skip
+    mov     eax, r14d                 ; plot (penx+col, peny+row)
+    add     eax, r8d
+    cmp     eax, 200
+    jae     tx_skip
+    imul    eax, eax, 320
+    mov     edx, r13d
+    add     edx, ecx
+    cmp     edx, 320
+    jae     tx_skip
+    add     eax, edx
+    lea     rdi, [rip + fb]
+    mov     [rdi + rax], r15b
+tx_skip:
+    inc     ecx
+    cmp     ecx, 5
+    jl      tx_col
+    inc     r8d
+    cmp     r8d, 7
+    jl      tx_row
+tx_adv:
+    add     r13d, 6                   ; advance the pen
+    jmp     tx_char
+tx_done:
+endproc
+
+; ---- CyclePalette(ecx=lo, edx=hi): rotate palette[lo..hi] up by one ----
+proc CyclePalette in rcx rdx
+    lea     r8, [rip + palette]
+    mov     eax, [r8 + rcx*4]         ; tmp = palette[lo]
+cp_loop:
+    cmp     ecx, edx
+    jge     cp_last
+    mov     r9d, [r8 + rcx*4 + 4]     ; palette[i+1]
+    mov     [r8 + rcx*4], r9d         ; palette[i] = palette[i+1]
+    inc     ecx
+    jmp     cp_loop
+cp_last:
+    mov     [r8 + rcx*4], eax         ; palette[hi] = tmp
+endproc
+
+; ---- present: resolve indices through the palette, blit upscaled (3x) ----
+proc present uses rsi rdi frame
+    lea     rsi, [rip + fb]
+    lea     rdi, [rip + pbuf]
+    lea     r8, [rip + palette]
+    xor     ecx, ecx
+pr_px:
+    movzx   eax, byte ptr [rsi + rcx]
+    mov     edx, [r8 + rax*4]
+    mov     [rdi + rcx*4], edx
+    inc     ecx
+    cmp     ecx, 64000
+    jl      pr_px
+    invoke  GetDC, [rip + hwndSave]
+    mov     [rip + hdcTmp], rax
+    invoke  SetStretchBltMode, [rip + hdcTmp], 3
+    invoke  StretchDIBits, [rip + hdcTmp], 0, 0, 960, 600, 0, 0, 320, 200, pbuf, bmi, 0, 0x00CC0020
+    invoke  ReleaseDC, [rip + hwndSave], [rip + hdcTmp]
+endproc
