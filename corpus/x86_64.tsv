@@ -5107,3 +5107,10 @@ vpshufd zmm18, zmm12, 0x7f	62c17d4870d47f
 vpshufd zmm18, zmm18, 0x7f	62a17d4870d27f	
 vpshufd zmm18, [rax], 0x7f	62e17d4870107f	
 vpshufd zmm18, [r13 + r14*2], 0x7f	62817d48705475007f	
+setg spl	400f9fc4	
+setg bpl	400f9fc5	
+setg sil	400f9fc6	
+setg dil	400f9fc7	
+mov sil, al	4088c6	
+mov dil, dil	4088ff	
+add dil, dil	4000ff	

@@ -40,6 +40,11 @@ impl W {
             W::Q => "rax",
         }
     }
+    // NOTE: the byte forms here use al + r9b, which exercise REX.B (r9b) but NOT
+    // the *force-REX* registers spl/bpl/sil/dil (num 4..7, which need a REX even
+    // with no W/R/X/B bit). Those are gated by hand-verified lines appended to
+    // corpus/x86_64.tsv (search `setg dil`) and the `rex_required_byte_regs…`
+    // unit test; fold them in here on the next llvm-mc regeneration.
     fn hi(self) -> &'static str {
         match self {
             W::B => "r9b",

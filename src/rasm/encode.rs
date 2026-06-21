@@ -33,6 +33,18 @@ pub enum FixupKind {
 pub struct Encoded {
     pub bytes: Vec<u8>,
     pub fixups: Vec<Fixup>,
+    /// Set for an instruction that names a REX-requiring byte register
+    /// (spl/bpl/sil/dil): it needs a REX prefix even with no W/R/X/B bit, else
+    /// `mod=11 rm=4..7` would decode as ah/ch/dh/bh. Transient — the r/m emitters
+    /// consult it; it is not part of the emitted output.
+    force_rex: bool,
+}
+
+/// A byte register that mandates a REX prefix. rasm has no ah/ch/dh/bh, so any
+/// `R8` with `num >= 4` is spl/bpl/sil/dil (4..7) or r8b..r15b (>=8, which already
+/// set REX.B). Naming one forces a REX prefix on the whole instruction.
+fn forces_rex(op: &Operand) -> bool {
+    matches!(op, Operand::Reg(r) if r.class == RegClass::R8 && r.num >= 4)
 }
 
 impl Encoded {
@@ -140,8 +152,10 @@ fn push_imm_sized(e: &mut Encoded, v: i64, s: OpSize) {
 /// register r/m (`mod = 11`). `reg_field` and `rm` are full 0..15 numbers.
 fn emit_reg_rm(e: &mut Encoded, rex_w: bool, mandatory: &[u8], opcode: &[u8], reg_field: u8, rm: u8) {
     e.ext(mandatory);
-    if let Some(r) = rex_byte(rex_w, reg_field >= 8, false, rm >= 8) {
-        e.b(r);
+    match rex_byte(rex_w, reg_field >= 8, false, rm >= 8) {
+        Some(r) => e.b(r),
+        None if e.force_rex => e.b(0x40),
+        None => {}
     }
     e.ext(opcode);
     e.b(0xC0 | ((reg_field & 7) << 3) | (rm & 7));
@@ -249,8 +263,10 @@ fn emit_mem_rm(
 ) -> Result<()> {
     e.ext(mandatory);
     let (rex_x, rex_b) = mem_xb(mem);
-    if let Some(r) = rex_byte(rex_w, reg_field >= 8, rex_x, rex_b) {
-        e.b(r);
+    match rex_byte(rex_w, reg_field >= 8, rex_x, rex_b) {
+        Some(r) => e.b(r),
+        None if e.force_rex => e.b(0x40),
+        None => {}
     }
     e.ext(opcode);
     emit_modrm_mem(e, reg_field, mem)
@@ -319,6 +335,7 @@ fn rm_size(op: &Operand) -> OpSize {
 /// ops, `test r/m,imm`, and `push r/m`/`push imm`.
 fn try_int_misc(mnemonic: &str, ops: &[Operand]) -> Option<Result<Encoded>> {
     let mut e = Encoded::default();
+    e.force_rex = ops.iter().any(forces_rex);
     let r = (|| -> Result<bool> {
         match (mnemonic, ops) {
             ("endbr64", []) => e.ext(&[0xF3, 0x0F, 0x1E, 0xFA]),
@@ -443,6 +460,7 @@ pub fn encode(mnemonic: &str, ops: &[Operand]) -> Result<Encoded> {
         return r;
     }
     let mut e = Encoded::default();
+    e.force_rex = ops.iter().any(forces_rex);
     match (mnemonic, ops) {
         ("ret", []) => e.b(0xC3),
         ("nop", []) => e.b(0x90),
@@ -611,6 +629,7 @@ fn string_op(s: &str) -> Option<(u8, bool)> {
 /// setcc r/m8 (0F 90+cc /0) and cmovcc r, r/m (0F 40+cc /r).
 fn try_cc(mnemonic: &str, ops: &[Operand]) -> Option<Result<Encoded>> {
     let mut e = Encoded::default();
+    e.force_rex = ops.iter().any(forces_rex);
     if let Some(cc) = mnemonic.strip_prefix("set").and_then(cc_code) {
         let [rm] = ops else {
             return Some(Err(anyhow::anyhow!("setcc needs 1 operand")));
@@ -628,6 +647,7 @@ fn try_cc(mnemonic: &str, ops: &[Operand]) -> Option<Result<Encoded>> {
 /// movzx/movsx/movsxd, 2-operand imul, xchg, xadd, and rep-string ops.
 fn try_misc(mnemonic: &str, ops: &[Operand]) -> Option<Result<Encoded>> {
     let mut e = Encoded::default();
+    e.force_rex = ops.iter().any(forces_rex);
     let r = (|| -> Result<bool> {
         match (mnemonic, ops) {
             ("movzx" | "movsx", [Operand::Reg(d), src]) => {
@@ -1550,6 +1570,7 @@ fn try_unary(mnemonic: &str, ops: &[Operand]) -> Option<Result<Encoded>> {
     };
     let [rm] = ops else { return None };
     let mut e = Encoded::default();
+    e.force_rex = ops.iter().any(forces_rex);
     match emit_rm(&mut e, operand_w(rm), &[], &[opcode], ext, rm) {
         Ok(()) => Some(Ok(e)),
         Err(err) => Some(Err(err)),
@@ -1570,6 +1591,7 @@ fn try_shift(mnemonic: &str, ops: &[Operand]) -> Option<Result<Encoded>> {
     };
     let [rm, count] = ops else { return None };
     let mut e = Encoded::default();
+    e.force_rex = ops.iter().any(forces_rex);
     let w = operand_w(rm);
     let r = match count {
         Operand::Imm(1) => emit_rm(&mut e, w, &[], &[0xD1], ext, rm),
@@ -1746,6 +1768,26 @@ mod tests {
         // rep string ops
         assert_eq!(bytes("rep movsq"), vec![0xF3, 0x48, 0xA5]);
         assert_eq!(bytes("rep stosb"), vec![0xF3, 0xAA]);
+    }
+
+    #[test]
+    fn rex_required_byte_regs_force_a_rex_prefix() {
+        // spl/bpl/sil/dil need a REX prefix even with no W/R/X/B bit, else
+        // `mod=11 rm=4..7` decodes as ah/ch/dh/bh. (rasm: a `setg dil` that
+        // silently became `setg bh` once spun a Bresenham loop forever.)
+        assert_eq!(bytes("setg al"), vec![0x0F, 0x9F, 0xC0]); // num<4: no REX
+        assert_eq!(bytes("setg spl"), vec![0x40, 0x0F, 0x9F, 0xC4]);
+        assert_eq!(bytes("setg bpl"), vec![0x40, 0x0F, 0x9F, 0xC5]);
+        assert_eq!(bytes("setg sil"), vec![0x40, 0x0F, 0x9F, 0xC6]);
+        assert_eq!(bytes("setg dil"), vec![0x40, 0x0F, 0x9F, 0xC7]);
+        assert_eq!(bytes("setg r12b"), vec![0x41, 0x0F, 0x9F, 0xC4]); // REX.B
+        // the reg side forces it too (byte reg in the reg field, memory r/m)
+        assert_eq!(bytes("mov byte ptr [rax], sil"), vec![0x40, 0x88, 0x30]);
+        assert_eq!(bytes("mov sil, al"), vec![0x40, 0x88, 0xC6]);
+        assert_eq!(bytes("add dil, dil"), vec![0x40, 0x00, 0xFF]);
+        // al/cl/dl/bl must NOT gain a spurious REX
+        assert_eq!(bytes("mov bl, al"), vec![0x88, 0xC3]);
+        assert_eq!(bytes("setz cl"), vec![0x0F, 0x94, 0xC1]);
     }
 
     #[test]
