@@ -242,10 +242,16 @@ impl Lang {
     /// than discarded — so interleaving a sync `call` with async `post_*` never
     /// loses a reply.
     pub fn call(&self, make: impl FnOnce(u64) -> Request) -> Option<Response> {
+        self.call_t(5, make)
+    }
+
+    /// Like [`call`](Lang::call) but with an explicit silence timeout in seconds —
+    /// a full exe build is much heavier than a card lookup.
+    fn call_t(&self, secs: u64, make: impl FnOnce(u64) -> Request) -> Option<Response> {
         let id = self.alloc();
         self.tx.send(make(id)).ok()?;
         loop {
-            match self.rx.recv_timeout(Duration::from_secs(5)) {
+            match self.rx.recv_timeout(Duration::from_secs(secs)) {
                 Ok(r) if r.id() == id => return Some(r),
                 Ok(r) => self.pending.borrow_mut().push_back(r), // keep it for poll()
                 Err(_) => return None,
@@ -263,7 +269,7 @@ impl Lang {
         self.call(|id| Request::Check { id, src: src.to_string() })
     }
     pub fn assemble(&self, src: &str, emit: Emit) -> Option<Response> {
-        self.call(|id| Request::Assemble { id, src: src.to_string(), emit })
+        self.call_t(30, |id| Request::Assemble { id, src: src.to_string(), emit })
     }
     pub fn suggest(&self, name: &str) -> Option<Response> {
         self.call(|id| Request::Suggest { id, name: name.to_string() })
@@ -343,7 +349,17 @@ fn worker(
             }
         }
         for req in coalesce_superseded(batch) {
-            if tx.send(handle(&kb, req)).is_err() {
+            // Catch a panic in a handler (a bug in lower/assemble/write_pe on some
+            // input) so it surfaces as an error reply instead of killing the worker
+            // — otherwise every later request silently times out to None ("build
+            // failed" with no reason).
+            let id = request_id(&req);
+            let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&kb, req)))
+                .unwrap_or_else(|p| Response::Error {
+                    id,
+                    message: format!("internal error: {}", panic_msg(&p)),
+                });
+            if tx.send(resp).is_err() {
                 return; // the GUI handle was dropped; nothing left to answer
             }
         }
@@ -391,6 +407,30 @@ fn coalesce_superseded(batch: Vec<Request>) -> Vec<Request> {
 /// Answer one request. Never panics on a backend error — every failure becomes a
 /// [`Response::Error`] so the worker loop stays alive. `Shutdown` is handled by
 /// the loop and never reaches here.
+/// The reply id of a request (so a panicked handler can still answer the caller).
+fn request_id(req: &Request) -> u64 {
+    match req {
+        Request::Card { id, .. }
+        | Request::Frame { id, .. }
+        | Request::Check { id, .. }
+        | Request::Assemble { id, .. }
+        | Request::Suggest { id, .. }
+        | Request::Complete { id, .. }
+        | Request::Hover { id, .. }
+        | Request::Signature { id, .. }
+        | Request::LineBytes { id, .. }
+        | Request::Listing { id, .. } => *id,
+        Request::Shutdown => 0,
+    }
+}
+
+fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {
+    p.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "panicked".to_string())
+}
+
 fn handle(kb: &Kb, req: Request) -> Response {
     match req {
         Request::Shutdown => unreachable!("Shutdown is handled by the worker loop"),

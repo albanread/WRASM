@@ -768,7 +768,7 @@ main:
                     Err(e) => format!("build ok ({info}) but write failed: {e}"),
                 },
                 Some(Response::Error { message, .. }) => format!("build error: {message}"),
-                _ => return,
+                _ => "build failed: no reply from the assembler (timed out)".to_string(),
             };
             self.invalidate();
         }
@@ -1582,7 +1582,7 @@ main:
                     Err(e) => format!("write failed: {e}"),
                 },
                 Some(Response::Error { message, .. }) => format!("build error: {message}"),
-                _ => "build failed".to_string(),
+                _ => "build failed: no reply from the assembler (timed out)".to_string(),
             };
             self.invalidate();
         }
