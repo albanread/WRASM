@@ -1,0 +1,179 @@
+; parallax.was — fly a ship over an endlessly-scrolling parallax world.
+;
+;   was examples\parallax.was -o parallax.exe   &&   parallax.exe   (arrows fly, Esc quits)
+;
+; The world auto-scrolls right forever (the maps wrap); three layers drift at rates
+; 64/128/256 (¼/½/1×) so clouds, hills and ground move at different speeds → depth.
+; The whole render stack in one frame: background sky → wrapping tile layers (into fb)
+; → the ship sprite (composited over, its own LUT). A game is just main + three procs.
+
+.DATA
+titleW    WCHAR "RASM — Parallax flyer", 0
+worldX    DWORD 0
+shipX     DWORD 140
+shipY     DWORD 40
+
+; the ship (E = yellow 14, its own sprite LUT); 8x8, pointing right
+shipSpr   BYTE "......../..E...../..EE..../.EEEEEE./EEEEEEEE/.EEEEEE./..EE..../..E.....", 0
+
+; 8x8 tiles ('/' = next row; 2/6/7/9/A = per-line CGA after SeedLinePalette; '.' = 0)
+brickTile BYTE "66666666/6......6/66666666/...6..../66666666/6......6/66666666/...6....", 0
+blockTile BYTE "AAAAAAAA/A222229A/A222229A/A222229A/A222229A/A222229A/A222229A/99999999", 0
+hillTile  BYTE "...22.../..2222../.222222./22222222/22222222/22222222/22222222/22222222", 0
+cloudTile BYTE ".7777.../77777777/77777777/.7777.../......../......../......../........", 0
+
+; three 48x12 maps (one byte per cell), wrapping. cloud/hill use value 1; ground 1/2.
+cloudMap  BYTE 96 dup(0)
+          BYTE 0,0,0,1,1,0,0,0, 0,0,0,0,1,1,1,0, 0,0,0,0,0,0,1,0, 0,0,0,1,1,0,0,0, 0,0,0,0,0,1,1,0, 0,0,0,1,0,0,0,0
+          BYTE 432 dup(0)
+hillMap   BYTE 384 dup(0)
+          BYTE 48 dup(1)
+          BYTE 144 dup(0)
+groundMap BYTE 480 dup(0)
+          BYTE 0,0,2,2,0,0,0,0, 0,0,2,2,2,0,0,0, 0,2,2,0,0,0,0,2, 2,0,0,0,0,0,0,2, 2,2,0,0,0,0,2,2, 0,0,0,2,2,0,0,0
+          BYTE 48 dup(1)
+
+; layers: mapPtr@0, mapW@8, mapH@12, tilesetId@16, camX@20, camY@24, scrollRate@28
+cloudLayer  QWORD 0
+            DWORD 48, 12, 2, 0, 0, 64
+hillLayer   QWORD 0
+            DWORD 48, 12, 1, 0, 0, 128
+groundLayer QWORD 0
+            DWORD 48, 12, 0, 0, 0, 256
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + titleW]
+    lea     rdx, [rip + GameInit]
+    lea     r8, [rip + GameStep]
+    lea     r9, [rip + GameSprites]
+    call    GameStart
+    mov     ecx, 30                  ; headless self-test: scroll + film 5 frames
+    mov     edx, 6
+    call    GameSelfTest
+    call    GameLoop                 ; live window until Esc
+    invoke  ExitProcess, 0
+
+; ---- init: three tilesets, the ship sprite, the layer map pointers ----
+GameInit:
+    call    SeedLinePalette
+    xor     ecx, ecx                 ; tileset 0: ground (1=brick, 2=block)
+    mov     edx, 8
+    mov     r8d, 8
+    call    DefineTileset
+    xor     ecx, ecx
+    lea     rdx, [rip + brickTile]
+    call    AddTile
+    xor     ecx, ecx
+    lea     rdx, [rip + blockTile]
+    call    AddTile
+    mov     ecx, 1                   ; tileset 1: hills
+    mov     edx, 8
+    mov     r8d, 8
+    call    DefineTileset
+    mov     ecx, 1
+    lea     rdx, [rip + hillTile]
+    call    AddTile
+    mov     ecx, 2                   ; tileset 2: clouds
+    mov     edx, 8
+    mov     r8d, 8
+    call    DefineTileset
+    mov     ecx, 2
+    lea     rdx, [rip + cloudTile]
+    call    AddTile
+    xor     ecx, ecx                 ; sprite 0: the ship (own LUT)
+    lea     rdx, [rip + shipSpr]
+    call    DefineSprite
+    lea     rax, [rip + cloudMap]
+    mov     [rip + cloudLayer], rax
+    lea     rax, [rip + hillMap]
+    mov     [rip + hillLayer], rax
+    lea     rax, [rip + groundMap]
+    mov     [rip + groundLayer], rax
+    ret
+
+; ---- step: auto-scroll the world, fly the ship (arrows), paint the layers far→near ----
+GameStep:
+    add     dword ptr [rip + worldX], 2   ; the world flows by (maps wrap → endless)
+    mov     ebx, [rip + worldX]
+    lea     rcx, [rip + cloudLayer]   ; one camera → each layer's camX via its rate
+    mov     edx, ebx
+    xor     r8d, r8d
+    call    LayerScroll
+    lea     rcx, [rip + hillLayer]
+    mov     edx, ebx
+    xor     r8d, r8d
+    call    LayerScroll
+    lea     rcx, [rip + groundLayer]
+    mov     edx, ebx
+    xor     r8d, r8d
+    call    LayerScroll
+    xor     ecx, ecx                 ; fly the ship: LEFT / RIGHT / UP / DOWN
+    call    Action
+    test    eax, eax
+    jz      gs_r
+    sub     dword ptr [rip + shipX], 3
+gs_r:
+    mov     ecx, 1
+    call    Action
+    test    eax, eax
+    jz      gs_u
+    add     dword ptr [rip + shipX], 3
+gs_u:
+    mov     ecx, 2
+    call    Action
+    test    eax, eax
+    jz      gs_d
+    sub     dword ptr [rip + shipY], 3
+gs_d:
+    mov     ecx, 3
+    call    Action
+    test    eax, eax
+    jz      gs_clamp
+    add     dword ptr [rip + shipY], 3
+gs_clamp:
+    mov     eax, [rip + shipX]       ; clamp X to [0, 312]
+    test    eax, eax
+    jns     gs_xhi
+    xor     eax, eax
+gs_xhi:
+    cmp     eax, 312
+    jle     gs_xs
+    mov     eax, 312
+gs_xs:
+    mov     [rip + shipX], eax
+    mov     eax, [rip + shipY]       ; clamp Y to [0, 192]
+    test    eax, eax
+    jns     gs_yhi
+    xor     eax, eax
+gs_yhi:
+    cmp     eax, 192
+    jle     gs_ys
+    mov     eax, 192
+gs_ys:
+    mov     [rip + shipY], eax
+    mov     cl, 1                    ; sky (per-line blue)
+    call    Cls
+    lea     rcx, [rip + cloudLayer]   ; composite far → near into fb
+    call    DrawTiles
+    lea     rcx, [rip + hillLayer]
+    call    DrawTiles
+    lea     rcx, [rip + groundLayer]
+    call    DrawTiles
+    ret
+
+; ---- sprites: the ship, over the resolved world ----
+GameSprites:
+    xor     ecx, ecx
+    mov     edx, [rip + shipX]
+    mov     r8d, [rip + shipY]
+    call    DrawSprite
+    ret
+
+.include "../library/canvas.was"      ; fb + palette LUTs + primitives + present
+.include "../library/sprite.was"      ; sprites with their own RGB LUTs
+.include "../library/tile.was"        ; tilesets + DrawTile / DrawTiles / LayerScroll
+.include "../library/input.was"       ; keyboard + actions (arrows / Esc = quit)
+.include "../library/harness.was"     ; window + loop + present
+.include "../library/introspect.was"  ; Snapshot (the self-test filmstrip)

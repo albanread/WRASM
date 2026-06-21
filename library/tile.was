@@ -18,10 +18,15 @@
 ;   TilesetColour(rcx=id, edx=value, r8b=fbindex) map 4-bit `value` → an fb index
 ;   DrawTile(rcx=id, edx=tile, r8d=x, r9d=y)      blit one tile into fb (keyed, clipped)
 ;   DrawTiles(rcx=layerPtr)                       paint a layer's visible window into fb
+;   LayerScroll(rcx=layerPtr, edx=camX, r8d=camY) camX/camY = world camera × scrollRate
 ;
 ; A Layer is a 32-byte block the game owns and updates (camX/camY = the smooth scroll):
-;       mapPtr Q@0, mapW @8, mapH @12, tilesetId @16, camX @20, camY @24
+;       mapPtr Q@0, mapW @8, mapH @12, tilesetId @16, camX @20, camY @24, scrollRate @28
 ; The map is one byte per cell: 0 = empty (transparent), k>=1 = the k-th tile.
+;
+; Parallax: give each layer a scrollRate (fixed-point /256: 256 = 1×, 128 = ½, 64 = ¼),
+; LayerScroll the same world camera into each, then DrawTiles them far→near (tile 0 lets
+; the layers behind show through). Far layers at a smaller rate drift slower → depth.
 ;
 ; Text rows use the sprite convention: '/' = next row; '1'-'9'/'A'-'F' = value 1..15;
 ; '0','.',space,other = 0 (transparent). Depends on: canvas.was (fb), sprite.was
@@ -211,8 +216,10 @@ dt_done:
 endproc
 
 ; ---- DrawTiles(rcx=layerPtr): paint the layer's visible tile window into fb at its
-; smooth (camX, camY) scroll — the simple first cut (a full redraw of the visible
-; grid each frame). map value 0 = empty; k>=1 = tile (k-1). ----
+; smooth (camX, camY) scroll. The map wraps HORIZONTALLY (a small map scrolls right
+; forever); vertically it is clamped to its rows — the world has a fixed height, with
+; open sky above and below. A full redraw of the visible grid each frame. map 0 = empty;
+; k>=1 = tile (k-1). camX/camY are treated as non-negative. ----
 proc DrawTiles uses rbx rsi rdi r12 r13 r14 r15 frame in rcx
     mov     rsi, rcx                  ; layer ptr
     mov     eax, [rsi + 16]           ; tilesetId → tileW/tileH
@@ -223,31 +230,32 @@ proc DrawTiles uses rbx rsi rdi r12 r13 r14 r15 frame in rcx
     mov     r12d, [rdx + 8]           ; tileW
     mov     r13d, [rdx + 12]          ; tileH
     test    r12d, r12d
-    jz      dts_done                  ; undefined tileset (tileW=0) → nothing to draw
-    mov     eax, [rsi + 24]           ; camY → trow0 = camY/tileH, offY = camY%tileH
+    jz      dts_done                  ; undefined tileset (tileW=0)
+    mov     eax, [rsi + 8]            ; mapW (guard the horizontal-wrap divisor)
+    test    eax, eax
+    jz      dts_done
+    mov     eax, [rsi + 24]           ; camY → screenY = -(camY%tileH); mapRow = camY/tileH (clamped)
     xor     edx, edx
     div     r13d
-    mov     ebx, eax                  ; mapRow = trow0
+    mov     ebx, eax                  ; mapRow = trow0 (finite vertical extent — no wrap)
     mov     r14d, edx
     neg     r14d                      ; screenY = -offY
 dts_yloop:
     cmp     r14d, 200
     jge     dts_done
-    mov     eax, [rsi + 12]           ; mapRow < mapH? (rows only grow → stop past it)
-    cmp     ebx, eax
+    cmp     ebx, [rsi + 12]           ; past the map's bottom row → done (sky below)
     jae     dts_done
-    mov     eax, [rsi + 20]           ; camX → tcol0 = camX/tileW, offX = camX%tileW
+    mov     eax, [rsi + 20]           ; camX → screenX = -(camX%tileW); mapCol = camX/tileW mod mapW
     xor     edx, edx
-    div     r12d
-    mov     edi, eax                  ; mapCol = tcol0
+    div     r12d                      ; eax = camX/tileW, edx = offX
     mov     r15d, edx
     neg     r15d                      ; screenX = -offX
+    xor     edx, edx
+    div     dword ptr [rsi + 8]       ; (camX/tileW) mod mapW → edx
+    mov     edi, edx                  ; mapCol (wrapped into [0, mapW))
 dts_xloop:
     cmp     r15d, 320
     jge     dts_xend
-    mov     eax, [rsi + 8]            ; mapCol < mapW? (cols only grow → end this row)
-    cmp     edi, eax
-    jae     dts_xend
     mov     eax, ebx                  ; tileVal = map[mapRow*mapW + mapCol]
     imul    eax, [rsi + 8]
     add     eax, edi
@@ -262,11 +270,27 @@ dts_xloop:
     call    DrawTile
 dts_xadv:
     add     r15d, r12d                ; screenX += tileW
-    inc     edi                       ; mapCol++
+    inc     edi                       ; mapCol++, wrap at mapW
+    cmp     edi, [rsi + 8]
+    jl      dts_xloop
+    xor     edi, edi
     jmp     dts_xloop
 dts_xend:
     add     r14d, r13d                ; screenY += tileH
-    inc     ebx                       ; mapRow++
+    inc     ebx                       ; mapRow++ (clamped at the loop top)
     jmp     dts_yloop
 dts_done:
+endproc
+
+; ---- LayerScroll(rcx=layerPtr, edx=camX, r8d=camY): drive this layer from one world
+; camera scaled by its scrollRate (fixed-point /256). The parallax knob — call it on
+; every layer with the same camera, then DrawTiles them far→near. ----
+proc LayerScroll in rcx rdx r8
+    mov     eax, [rcx + 28]           ; scrollRate (256 = 1×, 128 = ½, 64 = ¼)
+    imul    edx, eax                  ; camX = (worldX × rate) >> 8
+    sar     edx, 8
+    mov     [rcx + 20], edx
+    imul    r8d, eax                  ; camY = (worldY × rate) >> 8
+    sar     r8d, 8
+    mov     [rcx + 24], r8d
 endproc
