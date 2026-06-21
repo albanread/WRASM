@@ -18,6 +18,9 @@
 .DATA
 snapName  WCHAR "snap_00000000.bmp", 0      ; the 8 hex digits at char offset 5 are patched
 snapWrote DWORD ?
+snapSeq   DWORD ?                            ; sequence number — ordered, collision-free
+                                            ; so you can SAMPLE a run (a filmstrip), not
+                                            ; just snap one frame
 ; 54-byte BMP header: file header (14) + info header (40), 320x200 32bpp top-down
 snapHdr:
     BYTE 0x42, 0x4D, 0x56, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00
@@ -29,8 +32,8 @@ snapHdr:
 ; ---- Snapshot: write the framebuffer to snap_<ticks>.bmp ----
 proc Snapshot uses rbx rsi rdi r12 frame
     ; stamp the filename with GetTickCount (8 hex digits, MSB first, as wide chars)
-    invoke  GetTickCount
-    mov     r12d, eax
+    mov     r12d, [rip + snapSeq]      ; ordered sequence number (filmstrip-friendly)
+    inc     dword ptr [rip + snapSeq]
     lea     rdi, [rip + snapName]
     add     rdi, 10                   ; past L"snap_" (5 wide chars)
     mov     ecx, 8

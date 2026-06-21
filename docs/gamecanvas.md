@@ -166,12 +166,27 @@ buffer. `BlitFlip`/`BlitScale` are row-engine variants (mirror, nearest stretch)
   D3D11 plumbing in `examples/mandel_gpu.was` (shader via `.ASCIISTRING` +
   `D3DCompile`, the COM macros). Same authoring API, two backends.
 
-## Introspection
+## Input
 
-`library/introspect.was` — `call Snapshot` resolves the framebuffer and writes
-`snap_<ticks>.bmp`, a timestamped self-portrait. Window capture is unreliable
-here; this is the reliable way to *see* what the canvas drew (convert to PNG with
-System.Drawing). A core development feature, included early.
+`library/input.was` — two layers. **Raw**: `InputKey` (from `WndProc`) fills a
+256-key state + edges (`KeyDown`/`KeyHit`), plus mouse and a `joyGetPosEx` joystick.
+**Actions**: 8 device-independent predefined states — `LEFT RIGHT UP DOWN FIRE PAUSE
+RESTART QUIT` — each mapped from *both* keyboard (arrows+WASD, Space/Ctrl, P, R, Esc)
+and joystick (axes + buttons), queried with `Action`/`ActionHit`. `InputPoll` (once
+a frame, the harness's job) reads the stick and recomputes the actions + edges.
+
+## Introspection — and headless play
+
+`library/introspect.was` — `call Snapshot` resolves the current `pbuf` and writes
+`snap_<NNNN>.bmp` (sequence-numbered, so a rapid series is an ordered, collision-free
+**filmstrip** — *sample* a run, don't just snap one frame). Window capture is
+unreliable here; this is the reliable way to *see* what's drawn (→ PNG via
+System.Drawing).
+
+Crucially, the actions are **simulatable**: `SimAction(a, down)` forces a core state,
+so a headless self-test can *play* the game with nobody at the keyboard — inject an
+action, step `game_frame`, sample. The demo drives the hero right via `SimAction` and
+films 5 frames of the motion. This is how gameplay gets verified without a human.
 
 ## Toolkit scope — the "20 games" test
 

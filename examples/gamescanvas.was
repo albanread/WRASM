@@ -23,6 +23,7 @@ winRect   BYTE  16 dup(0)
 winW      DWORD ?
 winH      DWORD ?
 skyPhase  DWORD ?                      ; animates the per-line gradient sky
+heroX     DWORD 156                    ; the input-driven hero sprite's x
 
 .CODE
 .globl main
@@ -76,9 +77,26 @@ main:
     call    set_sky                    ; initial per-line gradient sky on index 1
 
     call    draw_scene                 ; the static world into fb (drawn once)
-    call    resolve_present            ; build one full frame for the startup snap:
-    call    draw_sprites               ;   background (fb→pbuf) then sprites composited
-    call    Snapshot
+    ; headless self-test: drive the hero RIGHT for 30 frames via SimAction — no key
+    ; pressed — then snapshot. Proves input → action → movement can be *played* and
+    ; introspected with nobody at the keyboard. (heroX: 156 → 216, well right of centre.)
+    mov     ecx, 1                     ; RIGHT
+    mov     edx, 1
+    call    SimAction
+    mov     r12d, 30                   ; frames to play
+    mov     r13d, 1                    ; sample countdown (snap now, then every 6)
+hs_loop:
+    call    game_frame
+    dec     r13d
+    jnz     hs_skip
+    call    Snapshot                   ; SAMPLE this frame → a filmstrip of the motion
+    mov     r13d, 6
+hs_skip:
+    dec     r12d
+    jnz     hs_loop
+    mov     ecx, 1                     ; release the simulated action
+    xor     edx, edx
+    call    SimAction
     invoke  SetTimer, [rip + hwndSave], 1, 60, 0
 msgloop:
     invoke  GetMessageW, msg, 0, 0, 0
@@ -162,20 +180,63 @@ WndProc:
     je      wp_destroy
     cmp     edx, 275                  ; WM_TIMER
     je      wp_timer
+    cmp     edx, 256                  ; WM_KEYDOWN
+    je      wp_keydn
+    cmp     edx, 257                  ; WM_KEYUP
+    je      wp_keyup
     invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_keydn:
+    mov     rcx, r8                   ; vk = wParam
+    mov     edx, 1
+    call    InputKey
+    xor     eax, eax
+    ret
+wp_keyup:
+    mov     rcx, r8
+    xor     edx, edx
+    call    InputKey
+    xor     eax, eax
     ret
 wp_destroy:
     invoke  PostQuitMessage, 0
     xor     eax, eax
     ret
 wp_timer:
+    call    game_frame                 ; input + logic + build pbuf
+    mov     ecx, 7                     ; QUIT (Esc / stick button) → close
+    call    ActionHit
+    test    eax, eax
+    jz      wpt_blit
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wpt_blit:
+    call    blit_present               ; pbuf → screen
+    xor     eax, eax
+    ret
+
+; ---- game_frame: one step — input, logic, build pbuf (NO blit). The timer blits;
+; the headless self-test in main snapshots. This is the seam a harness would own. ----
+game_frame:
+    call    InputPoll                  ; latch key edges + read the joystick
+    xor     ecx, ecx                   ; LEFT → move the hero
+    call    Action
+    test    eax, eax
+    jz      gf_right
+    sub     dword ptr [rip + heroX], 2
+gf_right:
+    mov     ecx, 1                     ; RIGHT
+    call    Action
+    test    eax, eax
+    jz      gf_render
+    add     dword ptr [rip + heroX], 2
+gf_render:
     inc     dword ptr [rip + skyPhase] ; animate the per-line gradient sky (LUT trick)
     mov     ecx, [rip + skyPhase]
     call    set_sky
     call    resolve_present            ; background (fb → pbuf) via the per-line LUTs
     call    draw_sprites               ; composite sprites over pbuf via their own LUTs
-    call    blit_present               ; pbuf → screen
-    xor     eax, eax
     ret
 
 ; ---- draw_sprites: composite the scene's sprites into pbuf each frame ----
@@ -183,6 +244,10 @@ wp_timer:
 ;   diamonds (id 1) on the sides. Their colours come from their own LUTs, so they
 ;   are identical top vs bottom regardless of the per-line sky behind them.
 draw_sprites:
+    xor     ecx, ecx                   ; the input-driven hero (id 0) at heroX
+    mov     edx, [rip + heroX]
+    mov     r8d, 100
+    call    DrawSprite
     xor     ecx, ecx
     mov     edx, 36
     mov     r8d, 24
@@ -232,4 +297,5 @@ endproc
 .include "../library/canvas.was"      ; framebuffer + palette + primitives + present
 .include "../library/blit.was"        ; surface blit engine (Blit / BlitKey)
 .include "../library/sprite.was"      ; text-authored sprites (DefineSprite/DrawSprite)
+.include "../library/input.was"       ; keyboard + joystick + predefined actions
 .include "../library/introspect.was"  ; Snapshot → timestamped snap_<ticks>.bmp
