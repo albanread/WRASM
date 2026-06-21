@@ -445,6 +445,15 @@ pub fn clobber_diags(src: &str) -> Vec<Diag> {
         if in_macro {
             continue;
         }
+        // A `proc`/`endproc` boundary starts a fresh function: its registers come
+        // from the caller (its `in` args are live, the rest indeterminate), not
+        // from whatever code physically precedes it. Reset — else a preceding
+        // proc's trailing `invoke` would falsely taint this proc's argument reads.
+        let head0 = t.split_whitespace().next().unwrap_or("");
+        if head0.eq_ignore_ascii_case("proc") || head0.eq_ignore_ascii_case("endproc") {
+            clobbered = [None; 6];
+            continue;
+        }
         // Peel a leading `label:`; a bare label (or any label) starts a new block
         // whose incoming register state we can't know — reset.
         if let Some((head, tail)) = t.split_once(':') {
@@ -2447,6 +2456,9 @@ mod tests {
             ".code\nf:\n  invoke GetTickCount\n  mov eax, 7\n  cdq\n  xor eax, edx\n  ret\n",
             // a plain call to a local function isn't assumed to clobber
             ".code\nf:\n  mov rcx, 5\n  call helper\n  mov [rcx], al\n  ret\n",
+            // a proc's trailing invoke must NOT taint the NEXT proc's argument
+            // reads — `proc`/`endproc` is a fresh function (its `in` regs are live)
+            "proc a frame\n  invoke ReleaseDC, rcx, rdx\nendproc\nproc b in rcx rdx\n  mov rsi, rcx\n  mov rdi, rdx\nendproc\n",
         ];
         for (i, c) in cases.iter().enumerate() {
             assert!(clobber_diags(c).is_empty(), "case {i} should be clean: {:?}", clobber_diags(c));
