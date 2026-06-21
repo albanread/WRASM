@@ -1,0 +1,62 @@
+; tiles.was — headless test of the tile module: a scrolling tilemap, filmed.
+;
+;   was examples\tiles.was -o tiles.exe   &&   tiles.exe   (writes snap_*.bmp)
+;
+; Defines an 8x8 tileset (brick + block), a 48x12 one-byte-per-cell map (sky over a
+; platform row over a ground row), then renders DrawTiles into fb at increasing camX
+; and films each — proving the tile blit, the 0=transparent key, clipping, and smooth
+; sub-tile scrolling. No window: Cls -> DrawTiles -> resolve_present -> Snapshot.
+
+.DATA
+; 8x8 tiles. '/' = next row; 1-9/A-F = value 1..15 (identity LUT -> fb index = per-line
+; palette after SeedLinePalette); '.' = 0 (transparent).
+brickTile BYTE "66666666/6......6/66666666/...6..../66666666/6......6/66666666/...6....", 0
+blockTile BYTE "AAAAAAAA/A222229A/A222229A/A222229A/A222229A/A222229A/A222229A/99999999", 0
+
+; map: 48 wide x 12 tall (8x8 tiles -> 384x96 world). 0 = empty; 1 = brick; 2 = block.
+tileMap   BYTE 480 dup(0)            ; rows 0..9: open sky
+          BYTE 0,0,2,2,0,0,0,0,0,0,2,2,2,0,0,0,0,2,2,0,0,0,0,2,2,0,0,0,0,0,0,2,2,2,0,0,0,0,2,2,0,0,0,2,2,0,0,0
+          BYTE 48 dup(1)             ; row 11: solid ground
+
+layer0    QWORD 0                    ; mapPtr (filled at runtime)
+          DWORD 48                   ; mapW
+          DWORD 12                   ; mapH
+          DWORD 0                    ; tilesetId
+          DWORD 0                    ; camX
+          DWORD 0                    ; camY
+
+.CODE
+.globl main
+main:
+    call    SeedLinePalette          ; per-line palette = CGA-16 (values 1..15 get colour)
+    xor     ecx, ecx                 ; tileset 0: 8x8
+    mov     edx, 8
+    mov     r8d, 8
+    call    DefineTileset
+    xor     ecx, ecx                 ; tile 1 (map value 1): brick
+    lea     rdx, [rip + brickTile]
+    call    AddTile
+    xor     ecx, ecx                 ; tile 2 (map value 2): block
+    lea     rdx, [rip + blockTile]
+    call    AddTile
+    lea     rax, [rip + tileMap]      ; layer0.mapPtr = &tileMap
+    mov     [rip + layer0], rax
+    xor     ebx, ebx                 ; camX
+tl_loop:
+    mov     [rip + layer0 + 20], ebx  ; layer0.camX = camX (smooth scroll)
+    mov     cl, 1                    ; sky: fb index 1 -> per-line blue
+    call    Cls
+    lea     rcx, [rip + layer0]
+    call    DrawTiles
+    call    resolve_present          ; fb -> pbuf via the LUTs
+    call    Snapshot                 ; film this scroll position
+    add     ebx, 11                  ; a non-tile-multiple step shows sub-tile scroll
+    cmp     ebx, 55
+    jl      tl_loop
+    invoke  ExitProcess, 0
+
+; ---- the GamesCanvas library (headless subset: no window/input needed) ----
+.include "../library/canvas.was"      ; fb + palette LUTs + primitives + resolve_present
+.include "../library/sprite.was"      ; pack_frame (the shared 4-bit packer tiles reuse)
+.include "../library/tile.was"        ; tilesets + DrawTile / DrawTiles
+.include "../library/introspect.was"  ; Snapshot -> sequence-numbered filmstrip
