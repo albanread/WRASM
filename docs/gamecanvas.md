@@ -56,28 +56,31 @@ Integer args in `ecx, edx, r8d, r9d` then `r10b`, matching the demo:
 
 All clip to the framebuffer (negative coords rejected via unsigned compare).
 
-## Palette architecture — lots of colour on a low-depth display
+## Palette architecture — thousands of colours on a low-depth display
 
-The whole point of an indexed display: **layered palette LUTs** let a 4-bit-feeling
-surface show hundreds of colours at once (the copper/raster trick). Grounded in the
-M2 reference (`GameView`/`GameViewGpu`):
+A true-colour (24-bit) screen driven by an indexed framebuffer through **many
+independent LUTs**. Every LUT entry is a real **RGB** colour (`0x00RRGGBB` — *no
+alpha*); **index 0 is 100% transparent** everywhere (the only transparency, binary).
 
-- **The regular 240** — indices **16..255** resolve through the single global
-  `palette` (0x00RRGGBB). The fixed, shared colours.
-- **Per-line LUT** — indices **0..15** of the background resolve through a
-  **per-scanline** palette: each display row owns its own 16 colours
-  (`linePal[row][0..15]`). So one index can be a different colour on every line —
-  a 200-line gradient from a single index, raster bars, split palettes.
-  `SeedLinePalette` defaults every line to the global 0..15; `SetLineColour(y,i,rgb)`
-  tweaks one. **Implemented** (`resolve_present`).
-- **Per-sprite LUT** — each sprite owns its own 16 colours; index **0 =
-  transparent**. To keep a sprite's palette independent of the line it sits on, the
-  sprite must be **composited** (resolved through its own LUT at present), not just
-  blitted as raw indices. ⬜ next phase (see below).
+- **Per-line LUT** — background indices **0..15** resolve through *that scanline's*
+  own 16-colour LUT (`linePal[row][0..15]`). One index → a different colour on every
+  line: gradients, raster bars, split palettes. ✅ (`resolve_present`,
+  `SeedLinePalette`/`SetLineColour`).
+- **The regular 240** — background indices **16..255** resolve through the single
+  global `palette`. The fixed, shared colours.
+- **Per-sprite LUT** — each sprite has its own 16-colour LUT, **independent** of the
+  line and global LUTs. A sprite pixel is `4-bit → that sprite's LUT → RGB`,
+  composited over the background (index 0 skipped, else opaque). ⬜ next.
 
-`present` resolves the background per scanline (0..15 → line LUT, 16..255 → global)
-into `pbuf`, then upscales/blits. `resolve_present` is the single source of truth so
-the on-screen image and introspect's snapshot can't diverge.
+Because the LUTs are independent and each holds a real colour, the simultaneous
+distinct-colour count *multiplies*: `240 + 16·(lines) + 16·(sprites)`. A 640-line
+screen with 128 sprites → 240 + 16·640 + 16·128 = **12,528** unique colours in a
+single frame, all from 4-/8-bit indices.
+
+Pipeline: `resolve_present` builds the background into the 32-bit `pbuf` (per-line
+LUT for 0..15, global for 16..255); sprites then composite over `pbuf` through their
+own LUTs (0 transparent, else opaque RGB); `pbuf` is blitted. One `resolve_present`
+keeps the screen and the introspect snapshot identical.
 
 Status of sprites vs this model: CPU sprites today are **blitted** into `fb`, so they
 share the background's line/global palette (M2's CPU profile does the same). A
