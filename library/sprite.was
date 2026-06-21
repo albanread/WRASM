@@ -31,7 +31,7 @@ spritePoolNext QWORD ?                 ; next free byte (lazy-init to spritePool
 
 .CODE
 ; ---- DefineSprite(rcx=id, rdx=asciiz): LUT (default = global 0..15) + 4-bit frame0 --
-proc DefineSprite uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx
+proc DefineSprite uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx
     cmp     ecx, 64                   ; ignore an out-of-range id
     jae     dsp_end
     mov     r12d, ecx                 ; id
@@ -92,6 +92,7 @@ dsp_stride:
     mov     [rax + 12], r13d          ; h
     mov     [rax + 16], r14d          ; frameStride
     mov     dword ptr [rax + 20], 1   ; frameCount
+    mov     dword ptr [rax + 24], 0   ; curFrame
     lea     rcx, [rip + palette]      ; default LUT = global palette 0..15
     mov     rdx, r15
     mov     r10d, 16
@@ -102,59 +103,11 @@ dsp_lut:
     add     rdx, 4
     dec     r10d
     jnz     dsp_lut
-    lea     rdi, [r15 + 64]           ; frame0 = dataPtr + 64 (after the LUT)
-    xor     r8d, r8d                  ; row
-    xor     r9d, r9d                  ; col
-dsp_p:
-    movzx   eax, byte ptr [rsi]
-    test    al, al
-    jz      dsp_pd
-    cmp     al, 47                    ; '/' → next row
-    jne     dsp_pchar
-    inc     r8d
-    xor     r9d, r9d
-    inc     rsi
-    jmp     dsp_p
-dsp_pchar:
-    cmp     al, 48                    ; map char → 4-bit index in al
-    jb      dsp_zero
-    cmp     al, 57
-    jbe     dsp_dig
-    cmp     al, 97
-    jb      dsp_up
-    sub     al, 32
-dsp_up:
-    cmp     al, 65
-    jb      dsp_zero
-    cmp     al, 70
-    ja      dsp_zero
-    sub     al, 55                    ; 'A'..'F' → 10..15
-    jmp     dsp_have
-dsp_dig:
-    sub     al, 48                    ; '0'..'9' → 0..9
-    jmp     dsp_have
-dsp_zero:
-    xor     al, al                    ; '.', space, etc → 0 (transparent)
-dsp_have:
-    cmp     r9d, ebx                  ; col within width? (clip ragged rows)
-    jae     dsp_padv
-    mov     edx, r8d                  ; offset = row*stride + col/2
-    imul    edx, r14d
-    mov     ecx, r9d
-    shr     ecx, 1
-    add     edx, ecx
-    test    r9d, 1                    ; even col → high nibble, odd → low
-    jnz     dsp_lo
-    shl     al, 4
-    mov     [rdi + rdx], al
-    jmp     dsp_padv
-dsp_lo:
-    or      [rdi + rdx], al
-dsp_padv:
-    inc     r9d
-    inc     rsi
-    jmp     dsp_p
-dsp_pd:
+    mov     rcx, rsi                  ; pack frame0 via the shared 4-bit packer
+    lea     rdx, [r15 + 64]           ; frame0 = dataPtr + 64 (after the LUT)
+    mov     r8d, ebx                  ; width
+    mov     r9d, r14d                 ; stride
+    call    pack_frame
     mov     rax, r15                  ; advance pool: dataPtr + 64 + stride*h
     add     rax, 64
     mov     ecx, r14d
@@ -162,6 +115,121 @@ dsp_pd:
     add     rax, rcx
     mov     [rip + spritePoolNext], rax
 dsp_end:
+endproc
+
+; ---- pack_frame(rcx=text, rdx=framePtr, r8d=width, r9d=stride): parse text rows
+; into 4-bit packed pixels (even col = high nibble, odd = low; clips col >= width;
+; '/' = next row). Shared by DefineSprite + AddFrame. ----
+proc pack_frame uses rbx rsi rdi in rcx rdx r8 r9
+    mov     rsi, rcx                  ; text
+    mov     rdi, rdx                  ; frame ptr
+    mov     ebx, r8d                  ; width
+    mov     r11d, r9d                 ; stride
+    xor     r8d, r8d                  ; row
+    xor     r9d, r9d                  ; col
+pf_p:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pf_done
+    cmp     al, 47                    ; '/' → next row
+    jne     pf_char
+    inc     r8d
+    xor     r9d, r9d
+    inc     rsi
+    jmp     pf_p
+pf_char:
+    cmp     al, 48                    ; map char → 4-bit index in al
+    jb      pf_zero
+    cmp     al, 57
+    jbe     pf_dig
+    cmp     al, 97
+    jb      pf_up
+    sub     al, 32
+pf_up:
+    cmp     al, 65
+    jb      pf_zero
+    cmp     al, 70
+    ja      pf_zero
+    sub     al, 55                    ; 'A'..'F' → 10..15
+    jmp     pf_have
+pf_dig:
+    sub     al, 48                    ; '0'..'9' → 0..9
+    jmp     pf_have
+pf_zero:
+    xor     al, al                    ; '.', space, etc → 0 (transparent)
+pf_have:
+    cmp     r9d, ebx                  ; col within width? (clip ragged rows)
+    jae     pf_adv
+    mov     edx, r8d                  ; offset = row*stride + col/2
+    imul    edx, r11d
+    mov     ecx, r9d
+    shr     ecx, 1
+    add     edx, ecx
+    test    r9d, 1                    ; even col → high nibble, odd → low
+    jnz     pf_lo
+    shl     al, 4
+    mov     [rdi + rdx], al
+    jmp     pf_adv
+pf_lo:
+    or      [rdi + rdx], al
+pf_adv:
+    inc     r9d
+    inc     rsi
+    jmp     pf_p
+pf_done:
+endproc
+
+; ---- AddFrame(rcx=id, rdx=text): append another frame (same w/h) to a sprite.
+; Call right after DefineSprite (before defining other sprites) so frames stay
+; contiguous in the pool. ----
+proc AddFrame uses rbx rsi rdi r12 r13 r14 frame in rcx rdx
+    cmp     ecx, 64
+    jae     af_end
+    lea     rsi, [rip + spriteTab]
+    mov     eax, ecx
+    shl     eax, 5
+    add     rsi, rax                  ; slot ptr
+    mov     rax, [rsi]                ; dataPtr
+    test    rax, rax
+    jz      af_end                    ; undefined sprite → ignore
+    mov     ebx, [rsi + 8]            ; w
+    mov     r13d, [rsi + 12]          ; h
+    mov     r14d, [rsi + 16]          ; frameStride
+    mov     r12d, [rsi + 20]          ; frameCount
+    mov     rdi, [rip + spritePoolNext]   ; new frame ptr (the pool's contiguous top)
+    mov     eax, r14d                 ; pool guard: rdi + stride*h must fit
+    imul    eax, r13d
+    lea     r8, [rdi + rax]
+    lea     r9, [rip + spritePool]
+    add     r9, 262144
+    cmp     r8, r9
+    ja      af_end
+    mov     rcx, rdx                  ; pack the new frame
+    mov     rdx, rdi
+    mov     r8d, ebx
+    mov     r9d, r14d
+    call    pack_frame
+    mov     eax, r14d                 ; advance pool by stride*h
+    imul    eax, r13d
+    add     rdi, rax
+    mov     [rip + spritePoolNext], rdi
+    inc     r12d                      ; frameCount++
+    mov     [rsi + 20], r12d
+af_end:
+endproc
+
+; ---- SetFrame(rcx=id, edx=frame): select a sprite's current frame ----
+proc SetFrame in rcx rdx
+    cmp     ecx, 64
+    jae     sf_end
+    lea     rax, [rip + spriteTab]
+    mov     r8d, ecx
+    shl     r8d, 5
+    add     rax, r8
+    cmp     edx, [rax + 20]           ; frame < frameCount?
+    jae     sf_end                    ; out of range → ignore
+    mov     [rax + 24], edx           ; curFrame = frame
+sf_end:
 endproc
 
 ; ---- SpriteColour(rcx=id, edx=index, r8d=rgb): set one of the sprite's 16 colours ----
@@ -193,9 +261,13 @@ proc DrawSprite uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx r8
     mov     ebx, [rax + 8]            ; w
     mov     r12d, [rax + 12]          ; h
     mov     r13d, [rax + 16]          ; frameStride
-    lea     rdi, [rsi + 64]           ; frame0 base
-    mov     r14d, edx                 ; x
+    mov     r14d, edx                 ; x  (save before edx is reused)
     mov     r15d, r8d                 ; y
+    mov     edx, [rax + 24]           ; curFrame → frame offset = curFrame*stride*h
+    imul    edx, r13d
+    imul    edx, r12d
+    lea     rdi, [rsi + 64]           ; frame base = dataPtr + 64 + offset
+    add     rdi, rdx
     xor     r8d, r8d                  ; sy
 ds_row:
     cmp     r8d, r12d

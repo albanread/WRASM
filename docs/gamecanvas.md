@@ -223,7 +223,9 @@ Ordered by the "20 games" test — most-needed, most-boilerplate first:
    now `main` + three procs.
 2. ✅ **Input** — keyboard + joystick + 8 predefined actions + edges, filled by the
    harness; simulatable for headless play (`library/input.was`).
-3. **Sprite animation** — `AddFrame` + a frame index/timer; then flip/scale + AABB.
+3. ✅ **Sprite animation** — `AddFrame` (append a frame) + `SetFrame` (select); a
+   shared `pack_frame` packs all frames; `DrawSprite` draws the current one.
+   ⬜ next: flip/scale + AABB collision.
 4. **Tilemap** — a tileset + map → scrolling background (with overscan + scroll).
 5. **LUT-effect helpers** — fade/flash/cycle/gradient; RNG + trig tables.
 6. **Audio** — the SFX synth + `PlaySfx`/`PlayMusic` ([gameaudio.md](gameaudio.md)).
