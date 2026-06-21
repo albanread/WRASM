@@ -1,0 +1,220 @@
+; catch.was — a tiny game on the GamesCanvas library: catch the falling gems.
+;
+;   was examples\catch.was -o catch.exe   &&   catch.exe
+;
+; Move the ship with ←/→ (or WASD, or a stick) and catch the gems for points; Esc
+; quits. A whole game in main + three procs: GameInit / GameStep / GameSprites.
+; Shows off the toolkit with NO tiles: a per-line gradient sky, sprites that reuse
+; ONE diamond shape in four colours (shape + LUT), input actions, and HUD text. On
+; startup it films a headless self-test (the ship driven right by simulated input).
+
+.DATA
+titleW    WCHAR "RASM — Catch!", 0
+scoreBuf  BYTE  "SCORE 0000", 0
+; a little ship (E = yellow 14) and one gem shape (C = 12, recoloured per id)
+shipSpr   BYTE  "E......E/E......E/E.EEEE.E/EEEEEEEE/.EEEEEE./..EEEE..", 0
+gemSpr    BYTE  "..C../.CCC./CCCCC/.CCC./..C..", 0
+playerX   DWORD 156
+score     DWORD ?
+rngSeed   DWORD 12345
+skyPhase  DWORD ?
+gems      DWORD 8 dup(0)            ; 4 gems × { x, y }
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + titleW]
+    lea     rdx, [rip + GameInit]
+    lea     r8, [rip + GameStep]
+    lea     r9, [rip + GameSprites]
+    call    GameStart
+    mov     ecx, 1                  ; headless self-test: drive RIGHT, film 5 frames
+    mov     edx, 1
+    call    SimAction
+    mov     ecx, 36
+    mov     edx, 8
+    call    GameSelfTest
+    mov     ecx, 1
+    xor     edx, edx
+    call    SimAction
+    call    GameLoop
+    invoke  ExitProcess, 0
+
+; ---- init: the ship, four gems from ONE shape (shape + LUT), the gems, the sky ----
+GameInit:
+    xor     ecx, ecx
+    lea     rdx, [rip + shipSpr]
+    call    DefineSprite             ; id 0: the ship (yellow)
+    mov     ecx, 1                   ; ids 1..4: the SAME gem shape, four LUT colours
+    lea     rdx, [rip + gemSpr]
+    call    DefineSprite             ; id 1: red (default global 12)
+    mov     ecx, 2
+    lea     rdx, [rip + gemSpr]
+    call    DefineSprite
+    mov     ecx, 2
+    mov     edx, 12
+    mov     r8d, 0x0055FF55          ; id 2: green
+    call    SpriteColour
+    mov     ecx, 3
+    lea     rdx, [rip + gemSpr]
+    call    DefineSprite
+    mov     ecx, 3
+    mov     edx, 12
+    mov     r8d, 0x0055FFFF          ; id 3: cyan
+    call    SpriteColour
+    mov     ecx, 4
+    lea     rdx, [rip + gemSpr]
+    call    DefineSprite
+    mov     ecx, 4
+    mov     edx, 12
+    mov     r8d, 0x00FF55FF          ; id 4: magenta
+    call    SpriteColour
+    lea     rsi, [rip + gems]        ; spread the gems, staggered above the screen
+    mov     dword ptr [rsi], 40
+    mov     dword ptr [rsi + 4], 0
+    mov     dword ptr [rsi + 8], 110
+    mov     dword ptr [rsi + 12], -60
+    mov     dword ptr [rsi + 16], 190
+    mov     dword ptr [rsi + 20], -120
+    mov     dword ptr [rsi + 24], 260
+    mov     dword ptr [rsi + 28], -180
+    call    SeedLinePalette
+    xor     ecx, ecx
+    call    set_sky
+    ret
+
+; ---- step: input → move the ship; gems fall, catch/miss → respawn; draw the world --
+GameStep:
+    xor     ecx, ecx                 ; LEFT
+    call    Action
+    test    eax, eax
+    jz      gs_right
+    sub     dword ptr [rip + playerX], 3
+gs_right:
+    mov     ecx, 1                   ; RIGHT
+    call    Action
+    test    eax, eax
+    jz      gs_clamp
+    add     dword ptr [rip + playerX], 3
+gs_clamp:
+    mov     eax, [rip + playerX]     ; clamp to [0, 312]
+    test    eax, eax
+    jns     gs_hi
+    xor     eax, eax
+gs_hi:
+    cmp     eax, 312
+    jle     gs_store
+    mov     eax, 312
+gs_store:
+    mov     [rip + playerX], eax
+    lea     rsi, [rip + gems]        ; gem physics
+    xor     ebx, ebx
+gem_loop:
+    add     dword ptr [rsi + rbx*8 + 4], 2   ; y += 2 (fall)
+    mov     edx, [rsi + rbx*8 + 4]   ; y
+    cmp     edx, 200
+    jge     gem_respawn              ; off the bottom → respawn (missed)
+    cmp     edx, 174
+    jl      gem_next                 ; not at the ship's level yet
+    mov     eax, [rsi + rbx*8]       ; |gem.x - playerX| < 14 ?
+    sub     eax, [rip + playerX]
+    mov     ecx, eax
+    sar     ecx, 31
+    xor     eax, ecx
+    sub     eax, ecx                 ; abs
+    cmp     eax, 14
+    jge     gem_next
+    add     dword ptr [rip + score], 10   ; caught!
+gem_respawn:
+    call    rng
+    xor     edx, edx
+    mov     ecx, 300
+    div     ecx                      ; edx = rng % 300
+    mov     [rsi + rbx*8], edx       ; x
+    mov     dword ptr [rsi + rbx*8 + 4], 0   ; y = top
+gem_next:
+    inc     ebx
+    cmp     ebx, 4
+    jl      gem_loop
+    call    format_score             ; the world: gradient sky + HUD score (into fb)
+    mov     cl, 1
+    call    Cls                      ; index 1 → the per-line gradient sky
+    mov     ecx, 8
+    mov     edx, 4
+    mov     r8b, 15
+    lea     r9, [rip + scoreBuf]
+    call    Text
+    inc     dword ptr [rip + skyPhase]
+    mov     ecx, [rip + skyPhase]
+    call    set_sky
+    ret
+
+; ---- sprites: composite the ship + the four gems into pbuf ----
+GameSprites:
+    xor     ecx, ecx                 ; the ship (id 0)
+    mov     edx, [rip + playerX]
+    mov     r8d, 180
+    call    DrawSprite
+    lea     rsi, [rip + gems]
+    xor     ebx, ebx
+spr_loop:
+    mov     ecx, ebx
+    inc     ecx                      ; gem sprite id = i + 1 (its own colour)
+    mov     edx, [rsi + rbx*8]
+    mov     r8d, [rsi + rbx*8 + 4]
+    call    DrawSprite
+    inc     ebx
+    cmp     ebx, 4
+    jl      spr_loop
+    ret
+
+; ---- rng: a 32-bit LCG → eax (deterministic, so the self-test is reproducible) ----
+proc rng
+    mov     eax, [rip + rngSeed]
+    imul    eax, eax, 1103515245
+    add     eax, 12345
+    mov     [rip + rngSeed], eax
+    shr     eax, 16
+endproc
+
+; ---- format_score: write `score` as 4 digits into scoreBuf ("SCORE 0000") ----
+proc format_score uses rdi
+    mov     eax, [rip + score]
+    lea     rdi, [rip + scoreBuf + 9]   ; the ones digit
+    mov     ecx, 4
+fmt:
+    xor     edx, edx
+    mov     r8d, 10
+    div     r8d                      ; eax /= 10, edx = digit
+    add     dl, 48
+    mov     [rdi], dl
+    dec     rdi
+    dec     ecx
+    jnz     fmt
+endproc
+
+; ---- set_sky(ecx=phase): a scrolling gradient on background index 1 ----
+proc set_sky uses rbx in rcx
+    lea     r8, [rip + linePal]
+    xor     edx, edx
+sky_row:
+    mov     eax, edx
+    add     eax, ecx
+    and     eax, 0x7F
+    add     eax, 0x40
+    mov     ebx, edx
+    shl     ebx, 4
+    inc     ebx
+    mov     [r8 + rbx*4], eax
+    inc     edx
+    cmp     edx, 200
+    jl      sky_row
+endproc
+
+; ---- the GamesCanvas library ----
+.include "../library/canvas.was"
+.include "../library/blit.was"
+.include "../library/sprite.was"
+.include "../library/input.was"
+.include "../library/harness.was"
+.include "../library/introspect.was"
