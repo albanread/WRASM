@@ -1,0 +1,70 @@
+; introspect.was — the canvas's self-portrait: a timestamped PNG-able snapshot.
+;
+;   .include "../library/introspect.was"     ; early, once
+;   call Snapshot                            ; writes snap_<ticks>.bmp
+;
+; A core development feature: lets us *see* what the canvas drew without trusting
+; window capture (which is unreliable here). `Snapshot` resolves the 320x200 index
+; framebuffer `fb` through `palette` into the BGRX scratch `pbuf` and writes a
+; 32bpp top-down BMP named with the low 32 bits of GetTickCount — so successive
+; pings never clobber each other. Convert to PNG with System.Drawing to view.
+;
+; Convention (the GamesCanvas standard): the including program must define
+;   fb      BYTE  64000 dup(0)      ; 320x200 index framebuffer
+;   palette DWORD 256 dup(0)        ; 0x00RRGGBB entries
+;   pbuf    DWORD 64000 dup(0)      ; BGRX scratch
+; (forward references are fine — labels resolve globally.)
+
+.DATA
+snapName  WCHAR "snap_00000000.bmp", 0      ; the 8 hex digits at char offset 5 are patched
+snapWrote DWORD ?
+; 54-byte BMP header: file header (14) + info header (40), 320x200 32bpp top-down
+snapHdr:
+    BYTE 0x42, 0x4D, 0xF6, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00
+    BYTE 0x28, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x38, 0xFF, 0xFF, 0xFF, 0x01, 0x00
+    BYTE 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00
+    BYTE 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+
+.CODE
+; ---- Snapshot: write the framebuffer to snap_<ticks>.bmp ----
+proc Snapshot uses rbx rsi rdi r12 frame
+    ; stamp the filename with GetTickCount (8 hex digits, MSB first, as wide chars)
+    invoke  GetTickCount
+    mov     r12d, eax
+    lea     rdi, [rip + snapName]
+    add     rdi, 10                   ; past L"snap_" (5 wide chars)
+    mov     ecx, 8
+sn_hex:
+    rol     r12d, 4                   ; next nibble (high first) into the low 4 bits
+    mov     eax, r12d
+    and     eax, 0xF
+    cmp     eax, 10
+    jb      sn_dig
+    add     eax, 55                   ; 'A'..'F'
+    jmp     sn_put
+sn_dig:
+    add     eax, 48                   ; '0'..'9'
+sn_put:
+    mov     [rdi], ax                 ; one UTF-16 code unit (high byte already 0)
+    add     rdi, 2
+    dec     ecx
+    jnz     sn_hex
+    ; resolve fb → pbuf (BGRX) through the palette
+    lea     rsi, [rip + fb]
+    lea     rdi, [rip + pbuf]
+    lea     r8, [rip + palette]
+    xor     ecx, ecx
+sn_px:
+    movzx   eax, byte ptr [rsi + rcx]
+    mov     edx, [r8 + rax*4]
+    mov     [rdi + rcx*4], edx
+    inc     ecx
+    cmp     ecx, 64000
+    jl      sn_px
+    ; write the BMP: header then the 256000-byte pixel block
+    invoke  CreateFileW, snapName, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     rbx, rax
+    invoke  WriteFile, rbx, snapHdr, 54, snapWrote, 0
+    invoke  WriteFile, rbx, pbuf, 256000, snapWrote, 0
+    invoke  CloseHandle, rbx
+endproc

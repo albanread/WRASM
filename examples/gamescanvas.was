@@ -13,7 +13,7 @@
 ; this is the CPU core that defines the palette, font, and present pipeline.
 
 .DATA
-.include "gc_font.inc"               ; fontTab: 128 glyphs x 7 bytes (5x7)
+.include "../library/gc_font.inc"    ; fontTab: 128 glyphs x 7 bytes (5x7)
 
 fb        BYTE  64000 dup(0)         ; 320x200 index framebuffer (top-down)
 pbuf      DWORD 64000 dup(0)         ; 320x200 BGRX present buffer
@@ -83,6 +83,7 @@ main:
     mov     [rip + hwndSave], rax
 
     call    draw_scene                ; draw once; the timer just cycles + presents
+    call    Snapshot                  ; introspect: a timestamped snap of what we drew
     invoke  SetTimer, [rip + hwndSave], 1, 60, 0
 msgloop:
     invoke  GetMessageW, msg, 0, 0, 0
@@ -94,33 +95,54 @@ msgloop:
 mdone:
     invoke  ExitProcess, 0
 
-; ---- draw the demo scene into the framebuffer ----
+; ---- draw the demo scene into the framebuffer (a drawing test-card) ----
 draw_scene:
-    mov     cl, 0
-    call    Cls                       ; black
-    ; 16 vertical palette bars across the width (each 20 wide, full height)
-    xor     r12d, r12d                ; bar index 0..15
-ds_bar:
+    mov     cl, 1
+    call    Cls                       ; dark-blue field
+    ; concentric midpoint circles, centred (160,104), colours 2..15
+    mov     r12d, 7                   ; radius
+    mov     r13d, 2                   ; colour
+ds_ring:
+    mov     ecx, 160
+    mov     edx, 104
+    mov     r8d, r12d
+    movzx   r9d, r13b
+    call    Circle
+    add     r12d, 7
+    inc     r13d
+    cmp     r13d, 16
+    jl      ds_ring
+    ; a Bresenham X across the field
+    mov     ecx, 8
+    mov     edx, 24
+    mov     r8d, 312
+    mov     r9d, 184
+    mov     r10b, 15
+    call    Line
+    mov     ecx, 312
+    mov     edx, 24
+    mov     r8d, 8
+    mov     r9d, 184
+    mov     r10b, 14
+    call    Line
+    ; a swatch row of filled discs (the palette), near the bottom
+    xor     r12d, r12d
+ds_swatch:
     mov     ecx, r12d
-    imul    ecx, ecx, 20              ; x = bar*20
-    mov     edx, 30                   ; y
-    mov     r8d, 20                   ; w
-    mov     r9d, 140                  ; h
-    mov     r10b, r12b                ; colour = bar index
-    call    FillRect
+    imul    ecx, ecx, 20
+    add     ecx, 10                   ; x = i*20 + 10
+    mov     edx, 192
+    mov     r8d, 7                    ; radius
+    mov     r9b, r12b                 ; colour = i
+    call    Disc
     inc     r12d
     cmp     r12d, 16
-    jl      ds_bar
-    ; titles (white = 15, bright cyan = 11)
-    mov     ecx, 84
-    mov     edx, 8
+    jl      ds_swatch
+    ; title (white)
+    mov     ecx, 64
+    mov     edx, 6
     mov     r8b, 15
     lea     r9, [rip + title1]
-    call    Text
-    mov     ecx, 44
-    mov     edx, 182
-    mov     r8b, 11
-    lea     r9, [rip + title2]
     call    Text
     ret
 
@@ -163,6 +185,242 @@ fr_next:
     dec     r9d
     jmp     fr_row
 fr_done:
+endproc
+
+; ---- Pset(ecx=x, edx=y, r8b=index): one bounds-checked pixel ----
+proc Pset in rcx rdx r8
+    cmp     ecx, 320                  ; unsigned: a negative x wraps high → rejected
+    jae     ps_done
+    cmp     edx, 200
+    jae     ps_done
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     r9, [rip + fb]
+    mov     [r9 + rax], r8b
+ps_done:
+endproc
+
+; ---- HLine(ecx=x, edx=y, r8d=len, r9b=index): clipped horizontal run ----
+proc HLine uses rdi in rcx rdx r8 r9
+    cmp     edx, 200
+    jae     hl_done                   ; row off-screen
+    test    ecx, ecx
+    jns     hl_xpos
+    add     r8d, ecx                  ; x<0 → shorten, clamp x to 0
+    xor     ecx, ecx
+hl_xpos:
+    mov     eax, ecx
+    add     eax, r8d                  ; x + len
+    cmp     eax, 320
+    jle     hl_go
+    mov     r8d, 320
+    sub     r8d, ecx                  ; clip right edge
+hl_go:
+    test    r8d, r8d
+    jle     hl_done
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     rdi, [rip + fb]
+    add     rdi, rax
+    mov     al, r9b
+    mov     ecx, r8d
+    rep     stosb
+hl_done:
+endproc
+
+; ---- VLine(ecx=x, edx=y, r8d=len, r9b=index): clipped vertical run ----
+proc VLine uses rdi in rcx rdx r8 r9
+    cmp     ecx, 320
+    jae     vl_done
+    test    edx, edx
+    jns     vl_ypos
+    add     r8d, edx                  ; y<0 → shorten, clamp y to 0
+    xor     edx, edx
+vl_ypos:
+    mov     eax, edx
+    add     eax, r8d
+    cmp     eax, 200
+    jle     vl_go
+    mov     r8d, 200
+    sub     r8d, edx
+vl_go:
+    test    r8d, r8d
+    jle     vl_done
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    lea     rdi, [rip + fb]
+    add     rdi, rax
+vl_loop:
+    mov     [rdi], r9b
+    add     rdi, 320
+    dec     r8d
+    jnz     vl_loop
+vl_done:
+endproc
+
+; ---- Line(ecx=x0, edx=y0, r8d=x1, r9d=y1, r10b=index): Bresenham (spec, verbatim) ----
+proc Line uses rbx rsi rdi r12 r13 in rcx rdx r8 r9 r10
+    ; x: d=x1-x0  →  sx (edi), dx (ebx = |d|)
+    mov     eax, r8d
+    sub     eax, ecx
+    mov     r11d, eax
+    sar     r11d, 31                  ; mask = (d<0)? -1 : 0
+    xor     edi, edi
+    test    eax, eax
+    setg    dil
+    add     edi, r11d                 ; sx = (d>0) + mask  ∈ {-1,0,1}
+    xor     eax, r11d
+    sub     eax, r11d                 ; |d|
+    mov     ebx, eax                  ; dx
+    ; y: d=y1-y0  →  sy (r12d), dy (esi = -|d|)
+    mov     eax, r9d
+    sub     eax, edx
+    mov     r11d, eax
+    sar     r11d, 31
+    xor     r12d, r12d
+    test    eax, eax
+    setg    r12b
+    add     r12d, r11d                ; sy
+    xor     eax, r11d
+    sub     eax, r11d
+    neg     eax
+    mov     esi, eax                  ; dy = -|y1-y0|
+    mov     r11d, ebx
+    add     r11d, esi                 ; err = dx + dy
+    lea     r13, [rip + fb]
+ln_loop:
+    cmp     ecx, 320                  ; plot (x0,y0) if in bounds
+    jae     ln_nopl
+    cmp     edx, 200
+    jae     ln_nopl
+    mov     eax, edx
+    imul    eax, eax, 320
+    add     eax, ecx
+    mov     [r13 + rax], r10b
+ln_nopl:
+    cmp     ecx, r8d                  ; x0==x1 ?
+    jne     ln_step
+    cmp     edx, r9d                  ; …and y0==y1 ? → done
+    je      ln_end
+ln_step:
+    mov     eax, r11d
+    add     eax, eax                  ; e2 = 2*err
+    cmp     eax, esi
+    jl      ln_chky                   ; if e2 >= dy: err += dy; x0 += sx
+    add     r11d, esi
+    add     ecx, edi
+ln_chky:
+    cmp     eax, ebx
+    jg      ln_loop                   ; if e2 <= dx: err += dx; y0 += sy
+    add     r11d, ebx
+    add     edx, r12d
+    jmp     ln_loop
+ln_end:
+endproc
+
+; ---- Circle(ecx=cx, edx=cy, r8d=r, r9b=index): midpoint outline (spec, verbatim) ----
+proc Circle uses rbx rsi rdi r12 r13 r14 frame in rcx rdx r8 r9
+    mov     esi, ecx                  ; cx
+    mov     edi, edx                  ; cy
+    mov     r12b, r9b                 ; index
+    mov     ebx, r8d
+    neg     ebx                       ; x = -r
+    xor     r13d, r13d                ; y = 0
+    mov     r14d, 2
+    mov     eax, r8d
+    add     eax, eax
+    sub     r14d, eax                 ; err = 2 - 2*r
+ci_loop:
+    mov     ecx, esi                  ; Pset(cx-x, cy+y)
+    sub     ecx, ebx
+    mov     edx, edi
+    add     edx, r13d
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi                  ; Pset(cx-y, cy-x)
+    sub     ecx, r13d
+    mov     edx, edi
+    sub     edx, ebx
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi                  ; Pset(cx+x, cy-y)
+    add     ecx, ebx
+    mov     edx, edi
+    sub     edx, r13d
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi                  ; Pset(cx+y, cy+x)
+    add     ecx, r13d
+    mov     edx, edi
+    add     edx, ebx
+    movzx   r8d, r12b
+    call    Pset
+    mov     eax, r14d                 ; r_tmp = err
+    cmp     eax, r13d
+    jg      ci_chkx                   ; if r_tmp <= y: y++; err += y*2+1
+    inc     r13d
+    mov     r9d, r13d
+    add     r9d, r9d
+    inc     r9d
+    add     r14d, r9d
+ci_chkx:
+    cmp     eax, ebx                  ; if r_tmp > x …
+    jg      ci_stepx
+    cmp     r14d, r13d                ; … or err > y:  x++; err += x*2+1
+    jle     ci_until
+ci_stepx:
+    inc     ebx
+    mov     r9d, ebx
+    add     r9d, r9d
+    inc     r9d
+    add     r14d, r9d
+ci_until:
+    test    ebx, ebx                  ; until x >= 0
+    js      ci_loop
+endproc
+
+; ---- Disc(ecx=cx, edx=cy, r8d=r, r9b=index): filled, span per row (spec) ----
+proc Disc uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx r8 r9
+    mov     esi, ecx                  ; cx
+    mov     edi, edx                  ; cy
+    mov     ebx, r8d                  ; r
+    mov     r12b, r9b                 ; index
+    mov     r14d, r8d
+    imul    r14d, r14d                ; r*r
+    mov     r13d, ebx
+    neg     r13d                      ; dy = -r
+di_row:
+    cmp     r13d, ebx
+    jg      di_done                   ; dy > r → done
+    mov     eax, r13d
+    imul    eax, eax                  ; dy*dy
+    mov     r11d, r14d
+    sub     r11d, eax                 ; rem = r² - dy²
+    xor     r15d, r15d                ; s = 0; grow while (s+1)² <= rem
+di_sqrt:
+    mov     eax, r15d
+    inc     eax
+    imul    eax, eax
+    cmp     eax, r11d
+    jg      di_span
+    inc     r15d
+    jmp     di_sqrt
+di_span:
+    mov     ecx, esi
+    sub     ecx, r15d                 ; x = cx - s
+    mov     edx, edi
+    add     edx, r13d                 ; y = cy + dy
+    mov     r8d, r15d
+    add     r8d, r8d
+    inc     r8d                       ; len = 2*s + 1
+    movzx   r9d, r12b
+    call    HLine
+    inc     r13d
+    jmp     di_row
+di_done:
 endproc
 
 ; ---- Text(ecx=x, edx=y, r8b=index, r9=asciiz) — 5x7 font, 6px advance ----
@@ -273,9 +531,12 @@ wp_destroy:
     xor     eax, eax
     ret
 wp_timer:
-    mov     ecx, 1
+    mov     ecx, 2
     mov     edx, 15
-    call    CyclePalette              ; animate the bars (palette trick, no redraw)
+    call    CyclePalette              ; shimmer colours 2..15 (palette trick, no redraw)
     call    present
     xor     eax, eax
     ret
+
+; --- introspection: the timestamped snapshot tool (a core dev feature) ---
+.include "../library/introspect.was"

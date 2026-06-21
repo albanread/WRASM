@@ -7,3 +7,5 @@ studio_shot_*.png
 *.obj
 # demo render dumps (each demo writes a <name>.bmp of its first frame)
 *.bmp
+snap_*.png
+snap_*.bmp
