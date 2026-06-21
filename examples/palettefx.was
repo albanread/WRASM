@@ -1,0 +1,113 @@
+; palettefx.was — palette effects with no redraw: cycle, flash, fade.
+;
+;   was examples\palettefx.was -o palettefx.exe   &&   palettefx.exe   (Esc quits)
+;
+; Draws 16 colour bars ONCE (each a global palette index 16..31), then only ever rewrites
+; the palette: ColourCycle flows the colours across the bars, Flash whites them out, Fade
+; dims them to black and back — all for free, the bars themselves never redrawn. Loops
+; cycle → flash → fade. A game is just main + GameInit / GameStep / GameSprites.
+
+.DATA
+titleW    WCHAR "RASM — Palette FX (cycle / flash / fade)", 0
+tick      DWORD 0
+; a 16-colour hue sweep that loops (magenta → red), copied into palette[16..31]
+rainbow   DWORD 0x00E03030, 0x00E07030, 0x00E0B030, 0x00E0E030, 0x00B0E030, 0x0070E030
+          DWORD 0x0030E030, 0x0030E070, 0x0030E0B0, 0x0030E0E0, 0x0030B0E0, 0x003070E0
+          DWORD 0x003030E0, 0x007030E0, 0x00B030E0, 0x00E030E0
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + titleW]
+    lea     rdx, [rip + GameInit]
+    lea     r8, [rip + GameStep]
+    lea     r9, [rip + GameSprites]
+    call    GameStart
+    mov     ecx, 30
+    mov     edx, 6
+    call    GameSelfTest
+    call    GameLoop
+    invoke  ExitProcess, 0
+
+; ---- init: load the rainbow into the global palette, snapshot it, draw the bars once ----
+GameInit:
+    call    SeedLinePalette
+    lea     rsi, [rip + rainbow]      ; palette[16..31] = rainbow
+    lea     rdi, [rip + palette]
+    add     rdi, 64
+    mov     ecx, 16
+gi_copy:
+    mov     eax, [rsi]
+    mov     [rdi], eax
+    add     rsi, 4
+    add     rdi, 4
+    dec     ecx
+    jnz     gi_copy
+    call    SaveBase                  ; the fade/flash master
+    xor     ebx, ebx                  ; 16 vertical bars, bar i = global index 16+i
+gi_bar:
+    mov     ecx, ebx
+    imul    ecx, ecx, 20              ; x = i*20
+    xor     edx, edx                  ; y = 0
+    mov     r8d, 20                   ; w
+    mov     r9d, 200                  ; h
+    mov     r10d, ebx
+    add     r10d, 16                  ; index 16+i
+    call    FillRect
+    inc     ebx
+    cmp     ebx, 16
+    jl      gi_bar
+    ret
+
+; ---- step: rewrite the palette only — cycle (128f) → flash (32f) → fade (128f), looping ----
+GameStep:
+    inc     dword ptr [rip + tick]
+    mov     eax, [rip + tick]
+    xor     edx, edx
+    mov     ecx, 288
+    div     ecx                       ; edx = tick mod 288
+    cmp     edx, 128
+    jl      gs_cycle
+    cmp     edx, 160
+    jl      gs_flash
+    sub     edx, 160                  ; fade: triangle over 128 frames, peak 256 at 64
+    mov     eax, edx
+    cmp     eax, 64
+    jl      gs_fade_up
+    mov     ecx, 128
+    sub     ecx, eax
+    jmp     gs_fade_t
+gs_fade_up:
+    mov     ecx, eax
+gs_fade_t:
+    imul    ecx, ecx, 4
+    call    Fade
+    ret
+gs_flash:
+    sub     edx, 128                  ; flash: triangle over 32 frames, peak 256 at 16
+    mov     eax, edx
+    cmp     eax, 16
+    jl      gs_flash_up
+    mov     ecx, 32
+    sub     ecx, eax
+    jmp     gs_flash_t
+gs_flash_up:
+    mov     ecx, eax
+gs_flash_t:
+    imul    ecx, ecx, 16
+    call    Flash
+    ret
+gs_cycle:
+    mov     ecx, 16                   ; rotate palette[16..31] → the colours flow
+    mov     edx, 31
+    call    ColourCycle
+    ret
+
+GameSprites:
+    ret
+
+.include "../library/canvas.was"      ; fb + palette LUTs + primitives + present
+.include "../library/fx.was"          ; SaveBase / Fade / Flash / Mix / ColourCycle
+.include "../library/input.was"       ; keyboard (Esc = quit)
+.include "../library/harness.was"     ; window + loop + present
+.include "../library/introspect.was"  ; Snapshot (the self-test filmstrip)

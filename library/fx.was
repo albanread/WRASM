@@ -1,0 +1,118 @@
+; ============================================================================
+; fx.was — palette effects: recolour the whole screen for free, no redraw
+; ============================================================================
+; Reuse:  .include "../library/fx.was"   (after canvas.was)
+;
+; The display palette is a tiny LUT, so rewriting it restyles everything that uses it
+; in one cheap pass — the classic trick behind fades, hit-flashes and flowing-colour
+; animation. These operate on the 256-entry global `palette` (indices 16..255 = the
+; "regular 240"; tiles/sprites that map into it inherit the effect).
+;
+;   SaveBase()              snapshot the current palette as the fade/flash master
+;   Fade(rcx=t)             lerp the palette toward black: 0 = normal, 256 = black
+;   Flash(rcx=t)            lerp toward white: 0 = normal, 256 = white (hit/explosion)
+;   Mix(rcx=rgb, edx=t)     general: lerp the palette toward `rgb` by t/256 from the master
+;   ColourCycle(rcx=lo, edx=hi)  rotate palette[lo..hi] up one — call per frame to animate
+;
+; Fade/Flash/Mix read the master (SaveBase first), so they are reversible and drift-free.
+; Depends on: canvas.was (palette).
+; ============================================================================
+
+.DATA
+paletteBase   DWORD 256 dup(0)        ; the fade/flash master (SaveBase snapshots palette here)
+
+.CODE
+; ---- SaveBase(): snapshot palette → paletteBase (the master for Fade/Flash/Mix) ----
+proc SaveBase uses rsi rdi
+    lea     rsi, [rip + palette]
+    lea     rdi, [rip + paletteBase]
+    mov     ecx, 256
+sb_loop:
+    mov     eax, [rsi]
+    mov     [rdi], eax
+    add     rsi, 4
+    add     rdi, 4
+    dec     ecx
+    jnz     sb_loop
+endproc
+
+; ---- Mix(rcx=rgb, edx=t): palette[i] = lerp(paletteBase[i], rgb, t/256), per channel.
+; t=0 → the master (normal); t=256 → solid rgb. The lerp stays between the two, so each
+; channel lands in 0..255 with no clamp. ----
+proc Mix uses rbx rsi rdi r12 r14 r15 in rcx rdx
+    mov     r14d, ecx                 ; target rgb
+    mov     r15d, edx                 ; t
+    lea     rsi, [rip + paletteBase]
+    lea     rdi, [rip + palette]
+    mov     r12d, 256
+mx_loop:
+    mov     eax, [rsi]                ; master 0x00RRGGBB
+    movzx   ebx, al                   ; --- blue ---
+    movzx   ecx, r14b
+    sub     ecx, ebx
+    imul    ecx, r15d
+    sar     ecx, 8
+    add     ebx, ecx                  ; out B
+    mov     edx, eax                  ; --- green ---
+    shr     edx, 8
+    movzx   edx, dl
+    mov     ecx, r14d
+    shr     ecx, 8
+    movzx   ecx, cl
+    sub     ecx, edx
+    imul    ecx, r15d
+    sar     ecx, 8
+    add     edx, ecx                  ; out G
+    shl     edx, 8
+    or      ebx, edx
+    mov     edx, eax                  ; --- red ---
+    shr     edx, 16
+    movzx   edx, dl
+    mov     ecx, r14d
+    shr     ecx, 16
+    movzx   ecx, cl
+    sub     ecx, edx
+    imul    ecx, r15d
+    sar     ecx, 8
+    add     edx, ecx                  ; out R
+    shl     edx, 16
+    or      ebx, edx
+    mov     [rdi], ebx                ; palette[i] = recombined
+    add     rsi, 4
+    add     rdi, 4
+    dec     r12d
+    jnz     mx_loop
+endproc
+
+; ---- Fade(rcx=t): lerp the palette toward black (0 = normal, 256 = black) ----
+proc Fade in rcx frame
+    mov     edx, ecx
+    xor     ecx, ecx                  ; rgb = black
+    call    Mix
+endproc
+
+; ---- Flash(rcx=t): lerp the palette toward white (0 = normal, 256 = white) ----
+proc Flash in rcx frame
+    mov     edx, ecx
+    mov     ecx, 0x00FFFFFF           ; rgb = white
+    call    Mix
+endproc
+
+; ---- ColourCycle(rcx=lo, edx=hi): rotate palette[lo..hi] up by one (palette[lo] takes
+; the old palette[hi]; the rest shift up). Call each frame on a colour band to flow it. ----
+proc ColourCycle uses rbx rsi in rcx rdx
+    cmp     ecx, edx
+    jae     cc_done                   ; lo >= hi → nothing to rotate
+    mov     r8d, ecx                  ; lo
+    lea     rsi, [rip + palette]
+    mov     eax, [rsi + rdx*4]        ; save palette[hi]
+    mov     ebx, edx                  ; i = hi
+cc_loop:
+    mov     ecx, [rsi + rbx*4 - 4]    ; palette[i-1]
+    mov     [rsi + rbx*4], ecx        ; palette[i] = palette[i-1]
+    dec     ebx
+    cmp     ebx, r8d
+    jg      cc_loop                   ; while i > lo
+    mov     [rsi + r8*4], eax         ; palette[lo] = old palette[hi]
+cc_done:
+endproc
