@@ -161,8 +161,11 @@ pub fn write_pe(
         // section's address — no import thunk involved.
         if let Some(&doff) = module.data_symbols.get(r.target.as_str()) {
             let site_rva = TEXT_RVA as i64 + r.at as i64;
+            // The disp32 field already holds the operand's literal `+disp` (the
+            // `[rip + sym + disp]` offset); fold it in rather than overwrite it.
+            let field = i32::from_le_bytes(text[r.at..r.at + 4].try_into().unwrap()) as i64;
             let target_rva = data_rva as i64 + doff as i64 + r.addend;
-            let disp = target_rva - (site_rva + 4);
+            let disp = target_rva - (site_rva + 4) + field;
             text[r.at..r.at + 4].copy_from_slice(&(disp as i32).to_le_bytes());
             continue;
         }
@@ -172,7 +175,9 @@ pub fn write_pe(
                     .get(r.target.as_str())
                     .ok_or_else(|| anyhow::anyhow!("reloc to unknown import '{}'", r.target))?;
                 let site_rva = TEXT_RVA as i64 + r.at as i64;
-                let disp = thunk_rva(i) as i64 - (site_rva + 4);
+                // Fold the disp32 field (a `[rip+import+disp]` offset; 0 for branches).
+                let field = i32::from_le_bytes(text[r.at..r.at + 4].try_into().unwrap()) as i64;
+                let disp = thunk_rva(i) as i64 - (site_rva + 4) + field;
                 text[r.at..r.at + 4].copy_from_slice(&(disp as i32).to_le_bytes());
             }
             RelocKind::Abs64 => bail!("abs64 reloc to '{}' unsupported in PE writer", r.target),

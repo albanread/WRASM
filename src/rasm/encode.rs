@@ -19,6 +19,10 @@ pub struct Fixup {
     pub at: usize,
     pub kind: FixupKind,
     pub target: String,
+    /// Literal displacement of a `[rip + sym + disp]` operand. Written into the
+    /// disp32 field so it survives to the linker as the standard addend — without
+    /// it, `[rip + sym + 20]` would resolve as `[rip + sym]` (the +20 dropped).
+    pub disp: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,8 +191,10 @@ fn emit_modrm_mem(e: &mut Encoded, reg_field: u8, mem: &Mem) -> Result<()> {
     if let Some(sym) = &mem.rip_sym {
         e.b(0x00 | ((reg_field & 7) << 3) | 0b101);
         let at = e.len();
-        e.ext(&[0, 0, 0, 0]);
-        e.fixups.push(Fixup { at, kind: FixupKind::RipRel32, target: sym.clone() });
+        // The disp32 field carries the literal `+disp` (0 for a bare `[rip+sym]`),
+        // which the linker adds to the resolved RIP-relative target.
+        e.ext(&(mem.disp as i32).to_le_bytes());
+        e.fixups.push(Fixup { at, kind: FixupKind::RipRel32, target: sym.clone(), disp: mem.disp as i32 });
         return Ok(());
     }
 
@@ -557,7 +563,7 @@ fn push_pop(e: &mut Encoded, base: u8, num: u8) {
 fn rel32_fixup(e: &mut Encoded, sym: &str) {
     let at = e.len();
     e.ext(&[0, 0, 0, 0]);
-    e.fixups.push(Fixup { at, kind: FixupKind::Rel32, target: sym.to_string() });
+    e.fixups.push(Fixup { at, kind: FixupKind::Rel32, target: sym.to_string(), disp: 0 });
 }
 
 /// Condition-code nibble for a bare condition suffix (shared by jcc/setcc/cmovcc).
