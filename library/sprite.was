@@ -1,0 +1,136 @@
+; ============================================================================
+; sprite.was — text-authored sprites on top of the blit engine
+; ============================================================================
+; Reuse:  .include "../library/sprite.was"   (after canvas.was AND blit.was)
+;
+; A sprite is authored as TEXT: rows of palette-index characters separated by '/'.
+;   '0'-'9' → index 0..9,  'A'-'F'/'a'-'f' → 10..15,  anything else → transparent.
+; All rows must be the same width. DefineSprite parses the text once into an index
+; bitmap (transparent = 255); DrawSprite stamps it with a keyed blit, so the
+; "holes" let the background show through.
+;
+;   DefineSprite(rcx=id, rdx=asciiz text)   parse + store sprite `id` (0..63)
+;   DrawSprite(rcx=id, edx=x, r8d=y)         keyed-blit it to the current dest
+;
+; Example (a 8x7 heart, C = bright red = 12):
+;   heart BYTE ".CC.CC../CCCCCCC./CCCCCCC./CCCCCCC./.CCCCC../..CCC.../...C....", 0
+;   ... DefineSprite(0, heart) ... DrawSprite(0, 50, 80) ...
+;
+; The destination is whatever blit.was points at — call DestFramebuffer (or
+; SetDest) first. DrawSprite always keys on 255 (the transparent index).
+; Depends on: blit.was (BlitKey, blitKey).
+; ============================================================================
+
+.DATA
+spriteTab      BYTE 1024 dup(0)       ; 64 slots × {base QWORD, w DWORD, h DWORD}
+spritePool     BYTE 65536 dup(0)      ; pixel storage (bump-allocated)
+spritePoolNext QWORD ?                 ; next free byte (lazy-init to spritePool)
+
+.CODE
+; ---- DefineSprite(rcx=id, rdx=asciiz): parse text rows → an index bitmap ----
+proc DefineSprite uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx
+    cmp     ecx, 64                   ; ignore an out-of-range id (no OOB slot write)
+    jae     dsp_end
+    mov     r12d, ecx                 ; id
+    mov     rsi, rdx                  ; text base
+    mov     rax, [rip + spritePoolNext]   ; lazy-init the bump allocator
+    test    rax, rax
+    jnz     dsp_pool
+    lea     rax, [rip + spritePool]
+    mov     [rip + spritePoolNext], rax
+dsp_pool:
+    ; pass 1a: width = chars before the first '/' (or end)
+    xor     ebx, ebx
+dsp_w:
+    movzx   eax, byte ptr [rsi + rbx]
+    test    al, al
+    jz      dsp_wd
+    cmp     al, 47                    ; '/'
+    je      dsp_wd
+    inc     ebx
+    jmp     dsp_w
+dsp_wd:
+    ; pass 1b: height = ('/' count) + 1
+    mov     r13d, 1
+    xor     edi, edi
+dsp_h:
+    movzx   eax, byte ptr [rsi + rdi]
+    test    al, al
+    jz      dsp_hd
+    cmp     al, 47
+    jne     dsp_hn
+    inc     r13d
+dsp_hn:
+    inc     edi
+    jmp     dsp_h
+dsp_hd:
+    ; record slot[id] = { base = pool next, w, h }
+    mov     r14, [rip + spritePoolNext]
+    lea     r15, [rip + spriteTab]
+    mov     eax, r12d
+    shl     eax, 4                    ; id * 16
+    add     r15, rax
+    mov     [r15], r14                ; base
+    mov     [r15 + 8], ebx            ; w
+    mov     [r15 + 12], r13d          ; h
+    ; pass 2: map each char → index, store row-major (skip '/')
+    mov     rdi, r14                  ; write pointer
+dsp_p:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      dsp_pd
+    cmp     al, 47                    ; '/' → row break, don't store
+    je      dsp_skip
+    cmp     al, 48                    ; '0'
+    jb      dsp_trans
+    cmp     al, 57                    ; '9'
+    jbe     dsp_dig
+    cmp     al, 97                    ; 'a' → fold to upper
+    jb      dsp_up
+    sub     al, 32
+dsp_up:
+    cmp     al, 65                    ; 'A'
+    jb      dsp_trans
+    cmp     al, 70                    ; 'F'
+    ja      dsp_trans
+    sub     al, 55                    ; 'A'..'F' → 10..15
+    jmp     dsp_store
+dsp_dig:
+    sub     al, 48                    ; '0'..'9' → 0..9
+    jmp     dsp_store
+dsp_trans:
+    mov     al, 255                   ; transparent
+dsp_store:
+    mov     [rdi], al
+    inc     rdi
+dsp_skip:
+    inc     rsi
+    jmp     dsp_p
+dsp_pd:
+    mov     eax, ebx                  ; advance the pool by w*h
+    imul    eax, r13d
+    add     r14, rax
+    mov     [rip + spritePoolNext], r14
+dsp_end:
+endproc
+
+; ---- DrawSprite(rcx=id, edx=x, r8d=y): keyed-blit sprite `id` ----
+proc DrawSprite uses rsi rdi frame in rcx rdx r8
+    cmp     ecx, 64                   ; ignore an out-of-range id (no OOB slot read)
+    jae     dsr_end
+    mov     esi, edx                  ; x
+    mov     edi, r8d                  ; y
+    lea     rax, [rip + spriteTab]
+    mov     edx, ecx
+    shl     edx, 4                    ; id * 16
+    add     rax, rdx                  ; &slot[id]
+    mov     rcx, [rax]                ; src base
+    mov     r8d, [rax + 8]            ; w
+    mov     edx, r8d                  ; srcStride = w
+    mov     r9d, [rax + 12]           ; h
+    mov     r10d, esi                 ; dstX
+    mov     r11d, edi                 ; dstY
+    mov     dword ptr [rip + blitKey], 255   ; sprites are keyed on 255
+    call    BlitKey
+dsr_end:
+endproc

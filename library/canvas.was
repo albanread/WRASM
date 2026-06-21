@@ -47,6 +47,13 @@ palette:
     DWORD 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
     DWORD 240 dup(0)
 
+; Per-scanline palette LUT. Background indices 0..15 resolve HERE, per display
+; row, so each line shows its own 16 colours — a 4-bit-feeling display showing
+; hundreds of colours at once (the copper/raster trick). Indices 16..255 use the
+; global `palette` above (the "regular 240"). Seed it with SeedLinePalette, tweak
+; rows with SetLineColour. Sized for the tallest display (400 rows).
+linePal   DWORD 6400 dup(0)           ; [400 rows][16 colours] of 0x00RRGGBB
+
 ; BITMAPINFO (header only; 32bpp BI_RGB needs no colour table). biHeight < 0 =
 ; top-down, matching the framebuffer.
 bmi:
@@ -466,19 +473,71 @@ cp_last:
     mov     [r8 + rcx*4], eax         ; palette[hi] = tmp
 endproc
 
-; ---- present: resolve indices through the palette, blit upscaled (3x) ----
-proc present uses rsi rdi frame
+; ---- SeedLinePalette: set every scanline's 0..15 to the global palette 0..15 ----
+proc SeedLinePalette uses rsi rdi
+    lea     rdi, [rip + linePal]
+    xor     r8d, r8d                  ; row
+sl_row:
+    lea     rsi, [rip + palette]      ; copy palette[0..15]
+    mov     ecx, 16
+sl_col:
+    mov     eax, [rsi]
+    mov     [rdi], eax
+    add     rsi, 4
+    add     rdi, 4
+    dec     ecx
+    jnz     sl_col
+    inc     r8d
+    cmp     r8d, 400
+    jl      sl_row
+endproc
+
+; ---- SetLineColour(ecx=y, edx=index, r8d=rgb): one per-line palette entry ----
+proc SetLineColour in rcx rdx r8
+    mov     eax, ecx
+    shl     eax, 4                    ; y*16
+    add     eax, edx                  ; + index
+    lea     r9, [rip + linePal]
+    mov     [r9 + rax*4], r8d
+endproc
+
+; ---- resolve_present: fill pbuf (BGRX) from fb, per scanline (0..15 = that
+; line's LUT, 16..255 = the global 240). The single source of truth for "what's
+; on screen" — present blits it; introspect's Snapshot writes it to a BMP. ----
+proc resolve_present uses rsi rdi
     lea     rsi, [rip + fb]
     lea     rdi, [rip + pbuf]
-    lea     r8, [rip + palette]
-    xor     ecx, ecx
-pr_px:
-    movzx   eax, byte ptr [rsi + rcx]
-    mov     edx, [r8 + rax*4]
-    mov     [rdi + rcx*4], edx
-    inc     ecx
-    cmp     ecx, 64000
-    jl      pr_px
+    lea     r8, [rip + palette]       ; global colours (indices 16..255 = the 240)
+    lea     r9, [rip + linePal]       ; per-line colours (indices 0..15)
+    xor     r10d, r10d                ; y
+rp_row:
+    mov     r11, r9                   ; lineBase = &linePal[y][0]
+    mov     eax, r10d
+    shl     eax, 6                    ; y * 64  (16 colours × 4 bytes)
+    add     r11, rax
+    mov     ecx, 320                  ; columns this row
+rp_col:
+    movzx   eax, byte ptr [rsi]
+    cmp     eax, 16
+    jae     rp_glob
+    mov     edx, [r11 + rax*4]        ; index 0..15 → this line's palette
+    jmp     rp_put
+rp_glob:
+    mov     edx, [r8 + rax*4]         ; index 16..255 → the global 240
+rp_put:
+    mov     [rdi], edx
+    add     rsi, 1
+    add     rdi, 4
+    dec     ecx
+    jnz     rp_col
+    inc     r10d
+    cmp     r10d, 200
+    jl      rp_row
+endproc
+
+; ---- present: resolve (per-line + global), then blit upscaled (3x) ----
+proc present frame
+    call    resolve_present
     invoke  GetDC, [rip + hwndSave]
     mov     [rip + hdcTmp], rax
     invoke  SetStretchBltMode, [rip + hdcTmp], 3

@@ -12,6 +12,9 @@
 .DATA
 title1    BYTE  "RASM GAMESCANVAS", 0
 title2    BYTE  "320X200 INDEXED  CYCLING PALETTE", 0
+; text-authored sprites (C = bright red 12, B = bright cyan 11; '.' = transparent)
+spriteHeart   BYTE ".CC.CC../CCCCCCC./CCCCCCC./CCCCCCC./.CCCCC../..CCC.../...C....", 0
+spriteDiamond BYTE "..B../.BBB./BBBBB/.BBB./..B..", 0
 className WCHAR "rasm_gc", 0
 titleW    WCHAR "RASM — GamesCanvas (CPU)", 0
 wc        BYTE  80 dup(0)
@@ -19,6 +22,7 @@ msg       BYTE  48 dup(0)
 winRect   BYTE  16 dup(0)
 winW      DWORD ?
 winH      DWORD ?
+skyPhase  DWORD ?                      ; animates the per-line gradient sky
 
 .CODE
 .globl main
@@ -53,7 +57,18 @@ main:
     invoke  CreateWindowExW, 0, className, titleW, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
     mov     [rip + hwndSave], rax      ; the library's present reads this
 
-    call    draw_scene                ; draw once; the timer just cycles + presents
+    xor     ecx, ecx                   ; define the text-authored sprites once
+    lea     rdx, [rip + spriteHeart]
+    call    DefineSprite
+    mov     ecx, 1
+    lea     rdx, [rip + spriteDiamond]
+    call    DefineSprite
+
+    call    SeedLinePalette            ; lines 0..15 default to the global palette
+    xor     ecx, ecx
+    call    set_sky                    ; initial per-line gradient sky on index 1
+
+    call    draw_scene                ; draw once; the timer animates the sky
     call    Snapshot                  ; introspect: a timestamped snap of what we drew
     invoke  SetTimer, [rip + hwndSave], 1, 60, 0
 msgloop:
@@ -130,6 +145,31 @@ ds_swatch:
     mov     r10d, 100                 ; dstX
     mov     r11d, 150                 ; dstY
     call    BlitKey
+    ; keyed sprites — the transparent holes let the background show through
+    xor     ecx, ecx                  ; hearts at the corners
+    mov     edx, 36
+    mov     r8d, 28
+    call    DrawSprite
+    xor     ecx, ecx
+    mov     edx, 276
+    mov     r8d, 28
+    call    DrawSprite
+    xor     ecx, ecx
+    mov     edx, 36
+    mov     r8d, 165
+    call    DrawSprite
+    xor     ecx, ecx
+    mov     edx, 276
+    mov     r8d, 165
+    call    DrawSprite
+    mov     ecx, 1                    ; diamonds on the sides
+    mov     edx, 16
+    mov     r8d, 96
+    call    DrawSprite
+    mov     ecx, 1
+    mov     edx, 298
+    mov     r8d, 96
+    call    DrawSprite
     ret
 
 .globl WndProc
@@ -145,14 +185,34 @@ wp_destroy:
     xor     eax, eax
     ret
 wp_timer:
-    mov     ecx, 2
-    mov     edx, 15
-    call    CyclePalette              ; shimmer colours 2..15 (palette trick, no redraw)
+    inc     dword ptr [rip + skyPhase] ; animate the per-line gradient sky (LUT trick)
+    mov     ecx, [rip + skyPhase]
+    call    set_sky
     call    present
     xor     eax, eax
     ret
 
+; ---- set_sky(ecx=phase): a scrolling vertical gradient on background index 1,
+; written straight into the per-line palette — one index, 200 different blues ----
+proc set_sky uses rbx in rcx
+    lea     r8, [rip + linePal]
+    xor     edx, edx                  ; y
+sky_row:
+    mov     eax, edx
+    add     eax, ecx                  ; y + phase
+    and     eax, 0x7F                 ; 0..127 …
+    add     eax, 0x40                 ; … lifted to 0x40..0xBF (blue channel)
+    mov     ebx, edx
+    shl     ebx, 4                    ; y*16
+    inc     ebx                       ; + index 1
+    mov     [r8 + rbx*4], eax         ; linePal[y][1] = 0x0000_00BB
+    inc     edx
+    cmp     edx, 200
+    jl      sky_row
+endproc
+
 ; ---- the GamesCanvas library ----
 .include "../library/canvas.was"      ; framebuffer + palette + primitives + present
 .include "../library/blit.was"        ; surface blit engine (Blit / BlitKey)
+.include "../library/sprite.was"      ; text-authored sprites (DefineSprite/DrawSprite)
 .include "../library/introspect.was"  ; Snapshot → timestamped snap_<ticks>.bmp

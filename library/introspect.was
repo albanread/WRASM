@@ -49,18 +49,7 @@ sn_put:
     add     rdi, 2
     dec     ecx
     jnz     sn_hex
-    ; resolve fb → pbuf (BGRX) through the palette
-    lea     rsi, [rip + fb]
-    lea     rdi, [rip + pbuf]
-    lea     r8, [rip + palette]
-    xor     ecx, ecx
-sn_px:
-    movzx   eax, byte ptr [rsi + rcx]
-    mov     edx, [r8 + rax*4]
-    mov     [rdi + rcx*4], edx
-    inc     ecx
-    cmp     ecx, 64000
-    jl      sn_px
+    call    resolve_present           ; same resolve present uses → snap matches screen
     ; write the BMP: header then the 256000-byte pixel block
     invoke  CreateFileW, snapName, 0x40000000, 0, 0, 2, 0x80, 0
     mov     rbx, rax
