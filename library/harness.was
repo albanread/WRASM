@@ -27,6 +27,8 @@
 gInit     QWORD ?                     ; the author's callbacks
 gStep     QWORD ?
 gSprites  QWORD ?
+gPresent  QWORD ?                     ; optional: fb→pbuf resolver (default resolve_present);
+                                      ; an overscan game sets it to a ScrollPresent wrapper
 hClassName WCHAR "rasm_game", 0
 hWc       BYTE  80 dup(0)
 hMsg      BYTE  48 dup(0)
@@ -86,7 +88,14 @@ proc GameFrame uses rbx rsi rdi r12 r13 r14 r15 frame
     call    InputPoll
     mov     rax, [rip + gStep]
     call    rax                        ; author: logic + world into fb
-    call    resolve_present            ; fb → pbuf (per-line + global LUTs)
+    mov     rax, [rip + gPresent]      ; fb → pbuf: the author's resolver, else the default
+    test    rax, rax
+    jz      gf_default
+    call    rax
+    jmp     gf_sprites
+gf_default:
+    call    resolve_present            ; per-line + global LUTs
+gf_sprites:
     mov     rax, [rip + gSprites]
     call    rax                        ; author: composite sprites into pbuf
 endproc

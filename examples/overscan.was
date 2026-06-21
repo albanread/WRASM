@@ -1,0 +1,95 @@
+; overscan.was — the "proper" scroll: render into a buffer wider than the display, then
+; present a smooth window into it, repainting tiles only when the window crosses a tile.
+;
+;   was examples\overscan.was -o overscan.exe   &&   overscan.exe   (Esc quits)
+;
+; The camera auto-scrolls right. Each frame is just ScrollPresent (a windowed copy at the
+; sub-tile offset) — cheap. DrawTiles re-paints worldBuf only on a "bump" (every tileW=8
+; pixels, i.e. once every few frames), at the new tile-aligned origin. So an arbitrarily
+; large map costs only display-plus-margin of repaint, however far you scroll.
+
+.DATA
+titleW    WCHAR "RASM — Overscan (bump scroll)", 0
+worldX    DWORD 0
+lastOrigin DWORD -1                   ; force a bump on the first frame
+scrollX   DWORD 0
+
+brickTile BYTE "66666666/6......6/66666666/...6..../66666666/6......6/66666666/...6....", 0
+blockTile BYTE "AAAAAAAA/A222229A/A222229A/A222229A/A222229A/A222229A/A222229A/99999999", 0
+omap      BYTE 480 dup(0)
+          BYTE 0,0,2,2,0,0,0,0, 0,0,2,2,2,0,0,0, 0,2,2,0,0,0,0,2, 2,0,0,0,0,0,0,2, 2,2,0,0,0,0,2,2, 0,0,0,2,2,0,0,0
+          BYTE 48 dup(1)
+olayer    QWORD 0
+          DWORD 48, 12, 0, 0, 0, 256
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + titleW]
+    lea     rdx, [rip + GameInit]
+    lea     r8, [rip + GameStep]
+    lea     r9, [rip + GameSprites]
+    call    GameStart
+    mov     ecx, 30
+    mov     edx, 6
+    call    GameSelfTest
+    call    GameLoop
+    invoke  ExitProcess, 0
+
+GameInit:
+    call    SeedLinePalette
+    xor     ecx, ecx
+    mov     edx, 8
+    mov     r8d, 8
+    call    DefineTileset
+    xor     ecx, ecx
+    lea     rdx, [rip + brickTile]
+    call    AddTile
+    xor     ecx, ecx
+    lea     rdx, [rip + blockTile]
+    call    AddTile
+    lea     rax, [rip + omap]
+    mov     [rip + olayer], rax
+    lea     rcx, [rip + worldBuf]     ; render into the overscan buffer (336x216)
+    mov     edx, 336
+    mov     r8d, 216
+    call    SetTileTarget
+    lea     rax, [rip + OvPresent]    ; tell the harness to present via ScrollPresent
+    mov     [rip + gPresent], rax
+    ret
+
+; ---- step: advance the camera; re-paint worldBuf only when crossing a tile boundary ----
+GameStep:
+    add     dword ptr [rip + worldX], 2
+    mov     eax, [rip + worldX]
+    and     eax, 0xFFFFFFF8           ; tile-aligned origin (tileW = 8 → mask off the low 3)
+    cmp     eax, [rip + lastOrigin]
+    je      gs_scroll                 ; same tile → no repaint, just keep scrolling
+    mov     [rip + lastOrigin], eax
+    mov     [rip + olayer + 20], eax  ; render worldBuf from the new origin (the bump)
+    mov     cl, 1
+    call    ClsTarget                 ; clear worldBuf to sky
+    lea     rcx, [rip + olayer]
+    call    DrawTiles
+gs_scroll:
+    mov     eax, [rip + worldX]
+    and     eax, 7                    ; sub-tile offset → the smooth scroll
+    mov     [rip + scrollX], eax
+    ret
+
+; ---- the harness's fb→pbuf hook: present a window of worldBuf at the smooth offset ----
+OvPresent:
+    mov     ecx, [rip + scrollX]
+    xor     edx, edx
+    call    ScrollPresent
+    ret
+
+GameSprites:
+    ret
+
+.include "../library/canvas.was"      ; fb + palette LUTs + primitives
+.include "../library/sprite.was"      ; pack_frame (tiles reuse the 4-bit packer)
+.include "../library/tile.was"        ; tilesets + DrawTiles + SetTileTarget/ScrollPresent
+.include "../library/input.was"       ; keyboard (Esc = quit)
+.include "../library/harness.was"     ; window + loop + present (gPresent hook)
+.include "../library/introspect.was"  ; Snapshot (the self-test filmstrip)

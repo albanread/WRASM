@@ -38,6 +38,15 @@ tilesetTab    BYTE 512 dup(0)        ; 16 slots × {dataPtr Q@0, tileW@8, tileH@
 tilePool      BYTE 65536 dup(0)      ; LUT(16) + 4-bit tile data, bump-allocated
 tilePoolNext  QWORD ?                 ; next free byte (lazy-init to tilePool)
 
+; --- overscan: DrawTiles renders into a target buffer (default = the 320x200 display
+; --- fb); for overscan it targets `worldBuf`, larger than the display, and ScrollPresent
+; --- reads a 320x200 window from it at (scrollX, scrollY) — smooth scroll for free, and
+; --- the tiles only get repainted when the window crosses a tile (a "bump"). ---
+tileDst       QWORD 0                 ; render target ptr (lazy-init to &fb)
+tileDstW      DWORD 320               ; target stride / clip width
+tileDstH      DWORD 200               ; target clip height
+worldBuf      BYTE 98304 dup(0)       ; overscan world buffer (indexed, up to 384x256)
+
 .CODE
 ; ---- DefineTileset(rcx=id, edx=tileW, r8d=tileH): a tileset slot + identity LUT ----
 proc DefineTileset uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx r8
@@ -145,9 +154,15 @@ proc TilesetColour in rcx rdx r8
 tc_end:
 endproc
 
-; ---- DrawTile(rcx=id, edx=tile, r8d=x, r9d=y): blit one tile into fb via its LUT,
-; keyed on 0, clipped to the 320x200 surface (negative x/y handled as off-screen). ----
+; ---- DrawTile(rcx=id, edx=tile, r8d=x, r9d=y): blit one tile into the render target
+; via its LUT, keyed on 0, clipped to the target (negative x/y handled as off-screen). ----
 proc DrawTile uses rbx rsi rdi r12 r13 r14 r15 in rcx rdx r8 r9
+    mov     rax, [rip + tileDst]      ; lazy-init the render target to the display fb
+    test    rax, rax
+    jnz     dt_haveDst
+    lea     rax, [rip + fb]
+    mov     [rip + tileDst], rax
+dt_haveDst:
     cmp     ecx, 16
     jae     dt_done
     lea     rax, [rip + tilesetTab]
@@ -175,14 +190,14 @@ dt_row:
     jge     dt_done
     mov     r9d, r15d
     add     r9d, r8d                  ; py = y + sy
-    cmp     r9d, 200
-    jae     dt_nextrow                ; row off-screen (unsigned: neg → huge)
+    cmp     r9d, [rip + tileDstH]
+    jae     dt_nextrow                ; row off the target (unsigned: neg → huge)
     mov     eax, r8d                  ; tile row = base + sy*stride
     imul    eax, r13d
     lea     r10, [rdi + rax]
-    mov     eax, r9d                  ; fb row = fb + py*320
-    imul    eax, eax, 320
-    lea     r11, [rip + fb]
+    mov     eax, r9d                  ; target row = dst + py*stride
+    imul    eax, [rip + tileDstW]
+    mov     r11, [rip + tileDst]
     add     r11, rax
     xor     edx, edx                  ; sx
 dt_col:
@@ -190,8 +205,8 @@ dt_col:
     jge     dt_nextrow
     mov     ecx, r14d
     add     ecx, edx                  ; px = x + sx
-    cmp     ecx, 320
-    jae     dt_skip                   ; col off-screen
+    cmp     ecx, [rip + tileDstW]
+    jae     dt_skip                   ; col off the target
     mov     eax, edx                  ; unpack 4-bit value at sx
     shr     eax, 1
     movzx   eax, byte ptr [r10 + rax]
@@ -241,7 +256,7 @@ proc DrawTiles uses rbx rsi rdi r12 r13 r14 r15 frame in rcx
     mov     r14d, edx
     neg     r14d                      ; screenY = -offY
 dts_yloop:
-    cmp     r14d, 200
+    cmp     r14d, [rip + tileDstH]
     jge     dts_done
     cmp     ebx, [rsi + 12]           ; past the map's bottom row → done (sky below)
     jae     dts_done
@@ -254,7 +269,7 @@ dts_yloop:
     div     dword ptr [rsi + 8]       ; (camX/tileW) mod mapW → edx
     mov     edi, edx                  ; mapCol (wrapped into [0, mapW))
 dts_xloop:
-    cmp     r15d, 320
+    cmp     r15d, [rip + tileDstW]
     jge     dts_xend
     mov     eax, ebx                  ; tileVal = map[mapRow*mapW + mapCol]
     imul    eax, [rsi + 8]
@@ -293,4 +308,94 @@ proc LayerScroll in rcx rdx r8
     imul    r8d, eax                  ; camY = (worldY × rate) >> 8
     sar     r8d, 8
     mov     [rcx + 24], r8d
+endproc
+
+; ---- SetTileTarget(rcx=ptr, edx=w, r8d=h): aim DrawTiles at a buffer larger than the
+; display (worldBuf) for overscan, instead of the 320x200 fb. ptr=0 resets to the fb. ----
+proc SetTileTarget in rcx rdx r8
+    test    rcx, rcx
+    jnz     stt_set
+    lea     rcx, [rip + fb]           ; ptr=0 → back to the display fb
+    mov     edx, 320
+    mov     r8d, 200
+stt_set:
+    mov     [rip + tileDst], rcx
+    mov     [rip + tileDstW], edx
+    mov     [rip + tileDstH], r8d
+endproc
+
+; ---- ScrollPresent(rcx=scrollX, edx=scrollY): resolve a 320x200 display window out of
+; the overscan tile target at (scrollX, scrollY) into pbuf, through the per-line / global
+; LUTs (so it inherits the sky). Smooth scroll = just move (scrollX, scrollY) — no tiles
+; are redrawn; repaint the world (DrawTiles) only when the window crosses a tile. ----
+proc ScrollPresent uses rsi rdi r12 r13 r14 r15 in rcx rdx
+    mov     r14d, ecx                 ; scrollX
+    mov     r15d, edx                 ; scrollY
+    mov     rsi, [rip + tileDst]      ; source = the tile target (worldBuf)
+    test    rsi, rsi
+    jnz     sp_have
+    lea     rsi, [rip + fb]
+sp_have:
+    mov     r12d, [rip + tileDstW]    ; source stride
+    mov     eax, r15d                 ; window row-0 = src + scrollY*stride + scrollX
+    imul    eax, r12d
+    add     eax, r14d
+    add     rsi, rax
+    lea     rdi, [rip + pbuf]
+    lea     r8, [rip + palette]       ; global 240 (indices 16..255)
+    lea     r9, [rip + linePal]       ; per-line (indices 0..15), by display row
+    xor     r10d, r10d                ; display y
+sp_row:
+    mov     r11, r9
+    mov     eax, r10d
+    shl     eax, 6                    ; y*64
+    add     r11, rax                  ; linePal[y]
+    mov     r13, rsi                  ; source ptr for this display row
+    mov     ecx, 320
+sp_col:
+    movzx   eax, byte ptr [r13]
+    cmp     eax, 16
+    jae     sp_glob
+    mov     edx, [r11 + rax*4]        ; 0..15 → this line's palette
+    jmp     sp_put
+sp_glob:
+    mov     edx, [r8 + rax*4]         ; 16..255 → global
+sp_put:
+    mov     [rdi], edx
+    add     r13, 1
+    add     rdi, 4
+    dec     ecx
+    jnz     sp_col
+    add     rsi, r12                  ; next source row (+ stride)
+    inc     r10d
+    cmp     r10d, 200
+    jl      sp_row
+endproc
+
+; ---- ClsTarget(cl=index): fill the whole current tile target (worldBuf) with an fb
+; index — the overscan equivalent of Cls (which only clears the display fb). ----
+proc ClsTarget uses rdi in rcx
+    mov     rdi, [rip + tileDst]
+    test    rdi, rdi
+    jnz     ct_have
+    lea     rdi, [rip + fb]
+ct_have:
+    movzx   eax, cl                   ; replicate the index across 4 bytes
+    mov     edx, eax
+    shl     edx, 8
+    or      eax, edx
+    mov     edx, eax
+    shl     edx, 16
+    or      eax, edx                  ; eax = idx * 0x01010101
+    mov     edx, [rip + tileDstW]     ; dwords = (W*H)/4
+    imul    edx, [rip + tileDstH]
+    shr     edx, 2
+ct_loop:
+    test    edx, edx
+    jz      ct_done
+    mov     [rdi], eax
+    add     rdi, 4
+    dec     edx
+    jmp     ct_loop
+ct_done:
 endproc
