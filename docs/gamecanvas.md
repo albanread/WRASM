@@ -98,6 +98,28 @@ display pixel, and the per-line LUT is indexed by the display row. Display modes
 320×200 and 640×400, integer-upscaled to the window. ⬜ next-phase work (today the
 buffer == the 320×200 display).
 
+## Tilemaps & parallax (design)
+
+Tiles are **sprites in a grid**: a **tileset** is an array of small index bitmaps
+(8×8 / 16×16), and a **map** is a *compact* grid — **one byte per cell** (which
+tile). A 64×64 level is 4 KB; scrolling is just changing a start position, no pixel
+copy. Index **0 is transparent**, exactly like sprites — that's what makes layering
+work.
+
+A **layer** = `{ map, mapW, mapH, tileset, scrollRate }`. Draw several **back to
+front** at `camera × scrollRate` and you get **parallax**: the clouds (rate ¼) drift
+behind the hills (½) behind the tower blocks (1×), all sliding at different speeds as
+the player moves — depth from three byte-grids. Transparent cells (tile 0) let the
+layers behind show through.
+
+CPU realization: `DrawLayer(map, mapW, mapH, tileset, scrollX, scrollY)` blits the
+visible window's tiles into `fb` keyed on 0 (reusing the blit engine); the host calls
+it once per layer with that layer's `camera × rate`, far layer first. `present` then
+resolves `fb` through the line/global LUTs as usual — so tiles get the per-line
+gradient sky for free behind them. The overscan world above is the optimisation
+(draw once, move the present window); the per-frame `DrawLayer` is the simple start.
+⬜ next.
+
 ## Double buffering (design)
 
 The GDI present is already *atomic* (one `StretchDIBits`), so a full-frame
