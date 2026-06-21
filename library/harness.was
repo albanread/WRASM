@@ -36,7 +36,8 @@ hWinH     DWORD ?
 
 .CODE
 ; ---- GameStart(rcx=titleW, rdx=init, r8=step, r9=sprites): window + init ----
-proc GameStart uses rsi rdi r12 frame in rcx rdx r8 r9
+; Shields all non-volatiles around the author's init() callback too (see GameFrame).
+proc GameStart uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx r8 r9
     mov     [rip + gInit], rdx
     mov     [rip + gStep], r8
     mov     [rip + gSprites], r9
@@ -73,7 +74,15 @@ proc GameStart uses rsi rdi r12 frame in rcx rdx r8 r9
 endproc
 
 ; ---- GameFrame: one frame — input, your step + sprite composite, into pbuf ----
-proc GameFrame frame
+; Firewall: this saves *every* non-volatile (rbx rsi rdi r12-r15) around the
+; author's step/sprites callbacks. Those callbacks are ordinary functions, so by
+; the Win64 ABI they ought to preserve non-volatiles themselves — but a game
+; writer shouldn't have to think about that to scribble a loop counter in rbx.
+; GameFrame is called from GameSelfTest (which keeps its frame counter live across
+; the call) and from HWndProc (which must hand Windows back clean non-volatiles),
+; so shielding here means a register slip in your game can never corrupt the loop
+; or the message dispatch — it just works.
+proc GameFrame uses rbx rsi rdi r12 r13 r14 r15 frame
     call    InputPoll
     mov     rax, [rip + gStep]
     call    rax                        ; author: logic + world into fb
