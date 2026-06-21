@@ -173,13 +173,43 @@ buffer. `BlitFlip`/`BlitScale` are row-engine variants (mirror, nearest stretch)
 here; this is the reliable way to *see* what the canvas drew (convert to PNG with
 System.Drawing). A core development feature, included early.
 
+## Toolkit scope — the "20 games" test
+
+The boundary: *what would you not want to rewrite across 20 retro games?* That's the
+library. What expresses **this** game is yours. The library owns the **machine**
+(identical every game); the author owns the **game** (unique every game). Rich
+primitives, no imposed architecture — no mandatory ECS, scene graph, or scripting.
+
+**Library — write once, reuse every game:**
+- **Harness** — window + message pump + fixed-step loop + present, calling the
+  author's `update(dt)`/`render()`. (Today the demo hand-writes `WndProc`+timer+loop.)
+- **Input** — `KeyDown`/`KeyHit` (edge) + mouse, filled by the harness.
+- Canvas + LUT palettes + primitives + `present` ✅; text/font ✅.
+- **Sprites** — define + per-sprite LUT ✅; frames/animation, flip, scale, AABB collision.
+- **Tilemap** — tiled, scrolling background over the overscan buffer.
+- **Audio** — `PlaySfx(id)` / `PlayMusic(tune)`.
+- **LUT effects** — fade, flash, colour-cycle, line-gradient (the colour magic, one-liners).
+- **Util** — deterministic RNG + sin/cos tables.
+
+**Author — fresh each game:** the art, sound, levels; the game state / rules / AI /
+scoring in their own structures; the bodies of `update(dt)` and `render()`. The
+sprite-instance pool / collision / physics are **opt-in**, never load-bearing.
+
+Success test: game #20 is *"new art + a tilemap + a few dozen lines of
+update/render"* because the machine was written for game #1.
+
 ## Roadmap (logical bits)
 
-1. `Rect` + `Pget` (finish the primitive table).
-2. Blit row engine → `Blit`/`BlitKey` (the keystone for the rest).
-3. Sprites (`DefineSprite`/`DrawSprite`/`BlitFlip`/`BlitScale`).
-4. Double buffering (`SetDrawBuffer`/`Flip`) + background save/restore.
-5. Input (`WM_KEYDOWN`/mouse → a key-state table; `KeyDown(vk)`, `MouseX/Y`).
-6. GPU profile (index texture + LUT shader + sprite pass).
+Ordered by the "20 games" test — most-needed, most-boilerplate first:
 
-Then it's a playable engine — [gameaudio.md](gameaudio.md) supplies sound + tunes.
+1. **Harness** — `GameRun(init, update, render)`: own the window, message pump,
+   fixed-step timing, input, and the resolve→composite→blit present. *Biggest cut in
+   per-game boilerplate.*
+2. **Input** — key-state + edge + mouse (filled by the harness).
+3. **Sprite animation** — `AddFrame` + a frame index/timer; then flip/scale + AABB.
+4. **Tilemap** — a tileset + map → scrolling background (with overscan + scroll).
+5. **LUT-effect helpers** — fade/flash/cycle/gradient; RNG + trig tables.
+6. **Audio** — the SFX synth + `PlaySfx`/`PlayMusic` ([gameaudio.md](gameaudio.md)).
+7. **GPU profile** — index texture + per-line/per-sprite LUT shader + sprite pass.
+
+Then it's a playable engine that gets out of the author's way.
