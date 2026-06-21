@@ -455,6 +455,18 @@ fn handle(kb: &Kb, req: Request) -> Response {
 /// gives *real* branch displacements (relaxed `rel8`/`rel32`, resolved offsets);
 /// only true externs stay as reloc placeholders, flagged for `??`. If the buffer
 /// can't assemble yet (mid-edit), fall back to per-instruction isolation.
+/// A lowered line worth a ghost (machine-code) row: an actual instruction — not a
+/// label, a directive, or **data**. Data (`.byte`/`.zero`/`.ascii`/…) is excluded
+/// so a 64 KB framebuffer or a sine table doesn't flood the editor with byte rows;
+/// the ghost view is about *instructions*.
+fn is_ghost_instruction(t: &str) -> bool {
+    !t.is_empty()
+        && !t.starts_with(';')
+        && !t.starts_with('#')
+        && !t.starts_with('.')
+        && !t.ends_with(':')
+}
+
 fn buffer_listing(kb: &Kb, src: &str) -> Vec<Vec<ListingRow>> {
     let n = src.lines().count();
     let mut out = vec![Vec::new(); n];
@@ -467,7 +479,7 @@ fn buffer_listing(kb: &Kb, src: &str) -> Vec<Vec<ListingRow>> {
     let unresolved = reloc_mask(&module);
     for (i, line) in lowered.lines().enumerate() {
         let t = line.trim();
-        if t.is_empty() || t.starts_with(';') || t.starts_with('#') {
+        if !is_ghost_instruction(t) {
             continue;
         }
         let Some(&src_line) = src_map.get(i) else { continue };
@@ -506,7 +518,7 @@ fn isolated_listing(lowered: &str, src_map: &[usize], n: usize) -> Vec<Vec<Listi
     let mut out = vec![Vec::new(); n];
     for (i, line) in lowered.lines().enumerate() {
         let t = line.trim();
-        if t.is_empty() || t.starts_with(';') || t.starts_with('#') {
+        if !is_ghost_instruction(t) {
             continue;
         }
         let Some(&src_line) = src_map.get(i) else { continue };
@@ -670,6 +682,16 @@ fn assemble_bytes(kb: &Kb, src: &str, emit: Emit) -> Result<(Vec<u8>, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ghost_view_is_instructions_only() {
+        assert!(is_ghost_instruction("mov rax, rcx"));
+        assert!(is_ghost_instruction("call qword ptr [rax + 160]"));
+        // data + directives + labels + blanks/comments are not ghosted
+        for t in [".zero 64000", ".byte 10", ".ascii \"hi\"", ".word 1, 2", ".globl main", "main:", "", "; note"] {
+            assert!(!is_ghost_instruction(t), "should skip: {t:?}");
+        }
+    }
 
     /// Spawn the language thread, or skip the test if the db isn't present here.
     fn lang() -> Option<Lang> {
