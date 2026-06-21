@@ -738,11 +738,31 @@ main:
             }
         }
 
+        /// The buffer with `.include "file"`s expanded (relative to the saved file's
+        /// directory), so a multi-file program builds/runs in the IDE exactly as it
+        /// does from the `was` CLI. An unsaved buffer has no base directory, so its
+        /// includes can't resolve — save first. A missing include is surfaced.
+        fn build_source(&self) -> Result<String, String> {
+            let text = self.doc.text();
+            match &self.path {
+                Some(p) => was::expand_includes(&text, p).map_err(|e| e.to_string()),
+                None => Ok(text),
+            }
+        }
+
         /// Assemble the whole buffer to a self-contained exe and report.
         fn build_exe(&mut self) {
             let Some(lang) = self.lang.as_ref() else { return };
             let out = self.output_exe_path();
-            self.notice = match lang.assemble(&self.doc.text(), Emit::Exe) {
+            let src = match self.build_source() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.notice = format!("include error: {e}");
+                    self.invalidate();
+                    return;
+                }
+            };
+            self.notice = match lang.assemble(&src, Emit::Exe) {
                 Some(Response::Assembled { bytes, info, .. }) => match std::fs::write(&out, &bytes) {
                     Ok(()) => format!("built {} — {info}", out.display()),
                     Err(e) => format!("build ok ({info}) but write failed: {e}"),
@@ -1539,7 +1559,15 @@ main:
         fn run_exe(&mut self) {
             let Some(lang) = self.lang.as_ref() else { return };
             let out = self.output_exe_path();
-            self.notice = match lang.assemble(&self.doc.text(), Emit::Exe) {
+            let src = match self.build_source() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.notice = format!("include error: {e}");
+                    self.invalidate();
+                    return;
+                }
+            };
+            self.notice = match lang.assemble(&src, Emit::Exe) {
                 Some(Response::Assembled { bytes, .. }) => match std::fs::write(&out, &bytes) {
                     Ok(()) => {
                         let mut cmd = std::process::Command::new(&out);
