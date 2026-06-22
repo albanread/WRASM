@@ -55,3 +55,4 @@
 .include "abc_note.was"
 .include "abc_parse.was"
 .include "abc_finalize.was"
+.include "abc_play.was"

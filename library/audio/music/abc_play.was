@@ -1,0 +1,171 @@
+; ============================================================================
+; abc_play.was — Sprint 5: the midiOut scheduler thread.
+; Part of the abc.was shell.  Opens its own .DATA for the player state, then
+; .CODE for the procs, so it can sit after abc_finalize.was in the shell.
+; ============================================================================
+; ParseTune fully populates the global `tuneEv` array (sorted by time,priority)
+; and `tuneCount` BEFORE this thread is ever started.  So the scheduler thread
+; touches NO mutable shared state: it only READS the static, immutable event
+; array and checks the `gMusicQuit` flag.  A plain aligned 32-bit load of that
+; flag is atomic on x86-64, so there is NOTHING to lock — no voice table, no
+; mixing, no spinlock.  (sound_play.was needs gLock because the game thread
+; mutates a live voice table; here the data is frozen before the thread runs.)
+;
+; Public API:
+;   MusicInit                 midiOutOpen the MIDI_MAPPER, start the thread
+;   MusicThread(rcx=param)    the Win64 callback: walk tuneEv at wall-clock time
+;   MusicShutdown             signal -> join -> reset -> close (like AudioShutdown)
+;
+; THE THREADING (review this) ------------------------------------------------
+; * MusicThread is a Win64 *callback* — the OS calls it (param in rcx, must
+;   preserve every GP non-volatile, return in rax).  Written as
+;   `proc MusicThread uses rbx rsi rdi r12 r13 r14 r15 frame in rcx` so the
+;   prologue/epilogue is the firewall: every GP non-volatile is push/pop saved.
+;   The body uses NO xmm registers at all (timing is pure integer ms), so
+;   xmm6..xmm15 are never touched — nothing to save, nothing handed back dirty.
+; * Timing: timeBeginPeriod(1) for 1 ms granularity; startMs recorded once from
+;   timeGetTime.  For each event, spin-sleep with Sleep(1) (NOT a busy spin)
+;   until timeGetTime()-startMs >= event.timeMs, then send it.
+; * Shutdown order is signal -> join -> reset -> close.  MusicShutdown sets
+;   gMusicQuit, WaitForSingleObject on the thread handle (the thread sees the
+;   flag and returns), THEN midiOutReset (all-notes-off) + midiOutClose.
+; * Timer API: timeGetTime (winmm).  Its resolution IS sharpened by the
+;   timeBeginPeriod(1) above to ~1 ms — unlike GetTickCount, whose returned value
+;   stays ~15.6 ms-granular no matter the timer period.  So note onsets land on
+;   true millisecond boundaries: the parser emits drift-free ms stamps and the
+;   scheduler must not quantise them back onto coarse ticks.
+; ----------------------------------------------------------------------------
+
+.DATA
+
+hmo          QWORD  0                     ; HMIDIOUT from midiOutOpen
+gMusicQuit   DWORD  0                     ; scheduler loop stop flag (0 = run)
+hMusicThread QWORD  0                     ; scheduler thread handle (for the join)
+gMusicTid    DWORD  0                     ; thread id sink for CreateThread
+mStartMs     DWORD  0                     ; wall-clock base (GetTickCount at start)
+mMsg         DWORD  0                     ; staged dwMsg (invoke clobbers eax — trap #1)
+
+.CODE
+
+; ----------------------------------------------------------------------------
+; MusicInit: open the MIDI_MAPPER, then (on success) start the scheduler thread.
+;   midiOutOpen(&hmo, MIDI_MAPPER=0xFFFFFFFF, 0, 0, 0)
+;   if MMRESULT != 0 -> bail (hmo stays 0, no thread) — the Sprint-3 lesson.
+;   CreateThread(0, 0, &MusicThread, 0, 0, &gMusicTid)
+; Calls -> frame.  No non-volatiles needed.
+; ----------------------------------------------------------------------------
+proc MusicInit frame
+    ; single-shot guard: if a thread is already running, do nothing — the
+    ; scheduler reads tuneEv unlocked, so a second start over a live tune would
+    ; race.  (MusicShutdown zeroes the handle, so re-init after it is fine.)
+    mov     rax, [rip + hMusicThread]
+    test    rax, rax
+    jnz     mi_done
+    invoke  midiOutOpen, hmo, 0xFFFFFFFF, 0, 0, 0
+    test    eax, eax                       ; MMRESULT != 0 -> open failed
+    jnz     mi_done                        ; bail: hmo stays 0, no thread started
+
+    invoke  CreateThread, 0, 0, MusicThread, 0, 0, gMusicTid
+    mov     [rip + hMusicThread], rax
+mi_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; MusicThread(rcx = param): the Win64 callback.  Walks the pre-sorted tuneEv at
+; wall-clock time, emitting each MIDI short message at its timeMs; stops early if
+; gMusicQuit is set; resets the device (all-notes-off) on the way out.
+;
+; ABI firewall: `uses rbx rsi rdi r12 r13 r14 r15` saves/restores every GP
+; non-volatile (the OS demands them back intact).  No xmm is touched, so
+; xmm6..xmm15 stay clean.  Returns 0 in eax (thread exit code).
+;
+; Register roles:
+;   r12 = event index i (0..tuneCount-1)   r13 = tuneCount (cached)
+;   rsi = &tuneEv[i] (walks by +20)
+; ----------------------------------------------------------------------------
+proc MusicThread uses rbx rsi rdi r12 r13 r14 r15 frame in rcx
+    invoke  timeBeginPeriod, 1             ; 1 ms scheduler granularity for Sleep
+
+    invoke  timeGetTime                    ; wall-clock base (winmm; honours timeBeginPeriod)
+    mov     [rip + mStartMs], eax          ; via memory (invoke clobbers eax later)
+
+    mov     r13d, [rip + tuneCount]        ; event count (cached)
+    xor     r12d, r12d                     ; i = 0
+    lea     rsi, [rip + tuneEv]            ; &tuneEv[0]
+
+mtt_loop:
+    cmp     r12d, r13d                     ; i >= count -> done
+    jae     mtt_end
+
+    mov     eax, [rip + gMusicQuit]        ; atomic aligned DWORD read (no lock)
+    test    eax, eax
+    jnz     mtt_end                        ; quit requested -> stop sending
+
+    ; --- spin-sleep (Sleep(1), not a busy spin) until this event is due ---
+    ;     due when  timeGetTime() - mStartMs >= ev.timeMs
+    mov     r14d, [rsi + 0]                ; r14d = ev.timeMs (target elapsed)
+mtt_wait:
+    mov     eax, [rip + gMusicQuit]        ; re-check quit while waiting
+    test    eax, eax
+    jnz     mtt_end
+    invoke  timeGetTime                    ; eax = now (ms, ~1 ms resolution)
+    sub     eax, [rip + mStartMs]          ; eax = elapsed since start
+    cmp     eax, r14d                      ; elapsed >= ev.timeMs ?
+    jae     mtt_send
+    invoke  Sleep, 1                       ; yield ~1 ms, then re-check
+    jmp     mtt_wait
+
+mtt_send:
+    ; --- build the MIDI short message DWORD ---
+    ;   dwMsg = (status | chan) | (d1 << 8) | (d2 << 16)
+    ;   low byte  = status-byte (0x90|chan NoteOn / 0x80|chan NoteOff)
+    ;   2nd byte  = d1 (note)
+    ;   3rd byte  = d2 (velocity)
+    ;   high byte = 0
+    mov     eax, [rsi + 4]                 ; status (0x90 / 0x80)
+    or      eax, [rsi + 8]                 ; | chan  (0..15) -> status-byte
+    and     eax, 0xFF                      ; keep it one byte
+    mov     ecx, [rsi + 12]               ; d1 (note)
+    and     ecx, 0xFF
+    shl     ecx, 8                         ; d1 << 8
+    or      eax, ecx
+    mov     ecx, [rsi + 16]               ; d2 (velocity)
+    and     ecx, 0xFF
+    shl     ecx, 16                        ; d2 << 16
+    or      eax, ecx                       ; eax = dwMsg
+    mov     [rip + mMsg], eax              ; stage in .DATA (trap #1: arg can't be in eax)
+
+    invoke  midiOutShortMsg, [rip + hmo], [rip + mMsg]
+
+    ; --- advance to next event ---
+    add     rsi, 20                        ; &tuneEv[i+1]
+    inc     r12d
+    jmp     mtt_loop
+
+mtt_end:
+    invoke  midiOutReset, [rip + hmo]      ; all-notes-off (silence any held NoteOn)
+    invoke  timeEndPeriod, 1
+    xor     eax, eax                       ; thread exit code 0
+endproc
+
+; ----------------------------------------------------------------------------
+; MusicShutdown: signal -> join -> close -> reset+close device.  Order matters:
+; the thread must stop (and run its own midiOutReset) before we close the device,
+; or a send could hit a closed handle.
+;   gMusicQuit = 1
+;   WaitForSingleObject(hMusicThread, INFINITE=0xFFFFFFFF)   (the join)
+;   CloseHandle(hMusicThread)
+;   midiOutReset(hmo) ; midiOutClose(hmo)
+; Calls -> frame.  No non-volatiles needed.
+; ----------------------------------------------------------------------------
+proc MusicShutdown frame
+    mov     dword ptr [rip + gMusicQuit], 1            ; tell the loop to stop
+    invoke  WaitForSingleObject, [rip + hMusicThread], 0xFFFFFFFF  ; join
+    invoke  CloseHandle, [rip + hMusicThread]
+    invoke  midiOutReset, [rip + hmo]                  ; belt-and-braces all-notes-off
+    invoke  midiOutClose, [rip + hmo]
+    ; reset state so a later MusicInit can start a fresh tune cleanly
+    mov     qword ptr [rip + hMusicThread], 0
+    mov     qword ptr [rip + hmo], 0
+    mov     dword ptr [rip + gMusicQuit], 0
+endproc

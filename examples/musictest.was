@@ -1,0 +1,31 @@
+; musictest.was — Sprint 5: the midiOut scheduler thread plays a short tune.
+;
+;   was examples\musictest.was -o /tmp/music.exe
+;   cd /tmp && timeout 8 /tmp/music.exe; echo exit=$?      ; ~4 s, exit 0
+;
+; Parses a one-line C-major fragment, opens MIDI_MAPPER, starts the scheduler
+; thread, sleeps for the whole tune, then shuts the thread + device down cleanly.
+;
+; Tune: L:1/4 M:4/4 Q:120 K:C  -> a quarter note = 4*60000/120/4 = 500 ms.
+;   C D E F  = 4 quarters       = 2000 ms
+;   G2       = a half note      = 1000 ms
+;   z2       = a half rest      = 1000 ms
+;   total tune length           ~ 4000 ms  (Sleep 4500 to let the last NoteOff fire)
+
+.DATA
+tune  BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "C D E F | G2 z2", 10, 0
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tune]
+    call    ParseTune                ; fills tuneEv / tuneCount (already sorted)
+
+    call    MusicInit                ; midiOutOpen + start the scheduler thread
+
+    invoke  Sleep, 4500              ; let the whole tune play out
+
+    call    MusicShutdown            ; signal -> join -> reset -> close
+    invoke  ExitProcess, 0
+
+.include "../library/audio/music/abc.was"
