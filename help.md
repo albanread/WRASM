@@ -100,6 +100,13 @@ These are the dialect's sharp edges. Most were found the hard way; learn them on
    as an instruction and errors. *(Symptom: a window that never appears, or a `movaps` #GP
    on a misaligned `real8` buffer.)*
 
+9. **A COM `pObj.Method(reg, …)` can clobber a register argument.** The call macro loads
+   `this` into `rcx` and marshals the args into `rcx`/`rdx`/`r8`/`r9` — so a method argument
+   that lives in a register the macro overwrites (notably `ecx`/`rcx`, or one clobbered while
+   `this`/earlier args load) arrives corrupted. Stage such an argument in a `.DATA` slot (or a
+   register the marshalling doesn't touch) — the COM cousin of trap #1. *(Symptom:
+   `DrawInstanced(4, ecx, 0, 0)` passed the low 32 bits of the `this` pointer as the count.)*
+
 ## See also
 
 - [docs/macros.md](docs/macros.md) — `invoke` lowering, the `proc` frame layout, the

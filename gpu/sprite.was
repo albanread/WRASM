@@ -1,0 +1,794 @@
+; gpu/sprite.was — GPU Canvas G3 "Sprites — brakes off".
+;
+; Built ON TOP of gpu/canvas.was (G0: device/swapchain, the comobj/.Method idioms,
+; the .ASCIISTRING + D3DCompile path, the struct..ends descriptors, BuildPalettes's
+; global palette which sprites do NOT use — sprites carry their OWN per-sprite LUT)
+; and gpu/blit.was (G1: pBlendAlpha — the SRC_ALPHA/INV_SRC_ALPHA alpha-over state,
+; blendFactor, vp). Include AFTER both. (docs/gpucanvas.md §3 row 5, §5 sprite path.)
+;
+; This MIRRORS library/sprite.was authoring semantics on the GPU:
+;
+;   * a sprite ATLAS — an R8_UINT index texture (512x512) of sprite frames; each
+;     frame is a rectangle of indexed pixels. Index 0 = TRANSPARENT (discarded),
+;     1..15 = a colour through the per-sprite palette LUT. Frames are appended with
+;     SprAddFrame (returns a frame-id; the id picks the atlas sub-rect). Mirrors
+;     library/sprite.was's "[ LUT ][ frame0 ][ frame1 ]…" model, but the LUT lives
+;     in a SEPARATE palette texture (a slot row) and the frame pixels live in the
+;     shared atlas — the GPU samples both.
+;   * a per-sprite PALETTE LUT — a B8G8R8A8_UNORM texture, 16 wide x SPR_PAL_SLOTS
+;     tall. Row s = palette slot s = that sprite's 16 colours (col c = colour c).
+;     SprSetPalette(slot, c, rgb) writes one entry. Colour 0 is never sampled (the
+;     shader discards index 0 first), exactly like library/sprite.was index 0.
+;   * the sprite SHADER — a VS that positions a quad PER INSTANCE from the per-
+;     instance data {screenX, screenY, atlasX, atlasY, w, h, paletteSlot, alpha}
+;     (the base quad comes from SV_VertexID: 4 verts, a triangle STRIP), and a PS
+;     that .Load's the atlas at the instance's atlas region, DISCARDS index 0,
+;     resolves the index through the per-sprite palette row, and outputs
+;     float4(rgb, instanceAlpha) — alpha-over via the G1 alpha blend state.
+;   * an INSTANCE vertex buffer (DYNAMIC + CPU_ACCESS_WRITE), refilled each frame
+;     (Map WRITE_DISCARD / memcpy / Unmap) with N sprite instances; an INPUT LAYOUT
+;     (D3D11_INPUT_ELEMENT_DESC[], InputSlotClass = PER_INSTANCE_DATA,
+;     InstanceDataStepRate 1). DrawSprites draws ALL instances in ONE DrawInstanced
+;     call — NO per-scanline cap (the brakes-off moment).
+;
+; winkb supplied every D3D11 detail (no hand-counted structs):
+;   D3D11_INPUT_ELEMENT_DESC{ SemanticName@0(PSTR), SemanticIndex@8(u32),
+;     Format@12, InputSlot@16, AlignedByteOffset@20, InputSlotClass@24,
+;     InstanceDataStepRate@28 } = 32 bytes (winkb skel — note the 4-byte pad after
+;     the u32 SemanticIndex so the PSTR at +0 stays 8-aligned: name@0(8), index@8,
+;     format@12, slot@16, offset@20, class@24, step@28).
+;   D3D11_BUFFER_DESC{ ByteWidth@0, Usage@4, BindFlags@8, CPUAccessFlags@12,
+;     MiscFlags@16, StructureByteStride@20 } = 24 bytes (winkb skel).
+;   D3D11_MAPPED_SUBRESOURCE{ pData@0, RowPitch@8, DepthPitch@12 } (winkb skel).
+;   Enum values (winkb resolve / the D3D headers):
+;     D3D11_USAGE_DYNAMIC=2, D3D11_CPU_ACCESS_WRITE=0x10000,
+;     D3D11_BIND_VERTEX_BUFFER=1, D3D11_INPUT_PER_INSTANCE_DATA=1,
+;     D3D11_MAP_WRITE_DISCARD=4, DXGI_FORMAT_R32G32_FLOAT=16,
+;     DXGI_FORMAT_R32_FLOAT=41, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP=5.
+;   ID3D11DeviceContext vtbl (winkb iface): Map[14], Unmap[15],
+;     IASetInputLayout[17], IASetVertexBuffers[18], DrawInstanced[21],
+;     IASetPrimitiveTopology[24]. ID3D11Device CreateInputLayout[11]. All reached
+;     through the comobj/.Method macro (same as G0's pContext.Map).
+;
+; Every .DATA block opens with .balign 16 (trap #8).
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The SPRITE shader.
+;   VS  — a base quad from SV_VertexID (4 verts, TRIANGLESTRIP): corner =
+;         (vid&1, vid>>1) in {0,1}^2. The per-instance attributes place + size it:
+;           pos  = inst.scr.xy + corner*inst.wh   (screen pixels)
+;           clip = pos / canvasHalf - 1, y flipped (640x360 -> NDC)
+;         and forward the ATLAS texel the corner maps to:
+;           atl  = inst.atl.xy + corner*inst.wh
+;         plus the palette slot + the instance alpha (flat).
+;   PS  — .Load the atlas at int(atl) (integer fetch, R8_UINT, no sampler).
+;         index 0 -> discard (transparent). else resolve through the per-sprite
+;         palette row: spritePal.Load(int3(index, slot, 0)). output the resolved
+;         rgb with the instance alpha (alpha-over via the G1 blend state).
+;
+; idxAtlas : Texture2D<uint>  at t0  (R8_UINT, 512x512 sprite atlas)
+; spritePal: Texture2D<float4> at t1 (B8G8R8A8_UNORM, 16 x SPR_PAL_SLOTS)
+;
+; Per-instance vertex inputs (one InputSlot, PER_INSTANCE_DATA, step 1):
+;   INSTSCR (R32G32_FLOAT) : screenX, screenY   (top-left, screen px)
+;   INSTATL (R32G32_FLOAT) : atlasX,  atlasY    (top-left texel in the atlas)
+;   INSTWH  (R32G32_FLOAT) : w, h                (sprite size, px)
+;   INSTPAL (R32_FLOAT)    : paletteSlot          (row in spritePal; floored in PS)
+;   INSTA   (R32_FLOAT)    : alpha                 (0..1, the output alpha)
+; ---------------------------------------------------------------------------
+sprSrc:
+.ASCIISTRING
+Texture2D<uint> idxAtlas:register(t0);
+Texture2D<float4> spritePal:register(t1);
+struct VO{float4 p:SV_Position;float2 atl:TEXCOORD0;float pal:TEXCOORD1;float a:TEXCOORD2;
+          nointerpolation float2 org:TEXCOORD3; nointerpolation float2 wh:TEXCOORD4;};
+VO SVS(uint vid:SV_VertexID,
+       float2 scr:INSTSCR, float2 atl:INSTATL, float2 wh:INSTWH,
+       float pal:INSTPAL, float a:INSTA){
+  VO o;
+  float2 corner=float2((float)(vid&1u),(float)((vid>>1)&1u));
+  float2 pos=scr+corner*wh;
+  o.p=float4(pos.x/320.0-1.0, 1.0-pos.y/180.0, 0.0, 1.0);
+  o.atl=atl+corner*wh;
+  o.pal=pal;
+  o.a=a;
+  o.org=atl;            // frame top-left texel (flat) — to clamp the PS fetch
+  o.wh=wh;              // frame size (flat)
+  return o;
+}
+float4 SPS(VO v):SV_Target{
+  // Clamp the interpolated fetch to THIS frame's rect [org, org+wh-1]: the quad's
+  // atl spans [org, org+wh], so the far edge would (int)-truncate to org+wh — the
+  // ADJACENT frame's column/row 0 (the shelf packer leaves no gutter). Clamp first,
+  // then the global 0..511 atlas guard.
+  int ax=(int)v.atl.x; int ay=(int)v.atl.y;
+  int x0=(int)v.org.x; int y0=(int)v.org.y;
+  ax=clamp(ax, x0, x0+(int)v.wh.x-1);
+  ay=clamp(ay, y0, y0+(int)v.wh.y-1);
+  ax=clamp(ax,0,511); ay=clamp(ay,0,511);
+  uint c=idxAtlas.Load(int3(ax,ay,0));
+  if(c==0u) discard;
+  int slot=(int)(v.pal+0.5);
+  float4 col=spritePal.Load(int3((int)c,slot,0));
+  return float4(col.rgb, v.a);
+}
+.ENDASCIISTRING
+sprEnd:
+    BYTE 0
+
+svsEntry  BYTE "SVS", 0
+spsEntry  BYTE "SPS", 0
+sprName   BYTE "gpusprite", 0
+
+; per-instance attribute SEMANTIC names (PSTRs the input layout points at).
+semScr    BYTE "INSTSCR", 0
+semAtl    BYTE "INSTATL", 0
+semWh     BYTE "INSTWH", 0
+semPal    BYTE "INSTPAL", 0
+semA      BYTE "INSTA", 0
+
+.balign 16
+; ---- sprite geometry constants ----
+; Atlas: 512x512 R8_UINT. Palette: 16 wide x SPR_PAL_SLOTS tall.
+.globl SprAtlasW
+.globl SprAtlasH
+SprAtlasW   DWORD 512
+SprAtlasH   DWORD 512
+.globl SprPalSlots
+SprPalSlots DWORD 32                     ; 32 per-sprite 16-colour banks
+
+; the maximum number of instances the dynamic VB / CPU mirror can hold.
+.globl SprMaxInst
+SprMaxInst  DWORD 8192                   ; brakes-off headroom (>> any 16-bit cap)
+
+.balign 16
+; ---- sprite COM objects + scalar state ----
+comobj pVSBlobS : ID3DBlob
+comobj pPSBlobS : ID3DBlob
+comobj pSprAtlasTex : ID3D11Texture2D   ; 512x512 R8_UINT atlas
+comobj pSprPalTex   : ID3D11Texture2D   ; 16 x slots B8G8R8A8 palette
+comobj pSprInstVB   : ID3D11Buffer      ; dynamic per-instance vertex buffer
+
+pSprVS      QWORD ?
+pSprPS      QWORD ?
+pSprLayout  QWORD ?                      ; ID3D11InputLayout*
+pSprSRVatlas QWORD ?
+pSprSRVpal   QWORD ?
+sprSrcLen   QWORD ?
+tmpPtrS     QWORD ?
+tmpSizeS    QWORD ?
+
+; how many frames the atlas holds (for SprAddFrame's cursor) + the frame table.
+; each frame = { atlasX(@0,u32), atlasY(@4), w(@8), h(@12) } = 16 bytes, 256 frames.
+.globl sprFrameCount
+sprFrameCount DWORD 0
+.balign 16
+.globl sprFrameTab
+sprFrameTab   BYTE 4096 dup(0)           ; 256 * 16
+
+; the live instance count for the upcoming DrawSprites.
+.globl sprInstCount
+sprInstCount  DWORD 0
+
+; DrawInstanced's InstanceCount, marshalled through memory (NOT a live register):
+; the comcall macro loads `this` into rcx FIRST, which would clobber any GP-reg
+; arg that aliases rcx/ecx — so we snapshot sprInstCount here (zero-extended to a
+; full QWORD) and pass [rip + sprDrawCount]. The 64-bit load is then self-contained
+; (upper dword is part of this same field), and InstanceCount (r8d) reads true.
+sprDrawCount  QWORD 0
+
+; per-instance stride (8 floats = 32 bytes) + the IASetVertexBuffers stride/offset
+; single-element arrays (the API wants pointers to u32).
+sprStride   DWORD 32
+sprOffset   DWORD 0
+.balign 16
+sprVBArr    QWORD 0                       ; single-element ppVertexBuffers array
+sprMapped   BYTE 16 dup(0)                ; D3D11_MAPPED_SUBRESOURCE out
+
+.balign 16
+; ---- the CPU instance mirror: SprMaxInst * 32 bytes (8 floats per instance).
+;      packed as {screenX, screenY, atlasX, atlasY, w, h, paletteSlot, alpha}.
+;      8192 * 32 = 262144 bytes. SprPushInstance appends here; SprUpload Maps the
+;      dynamic VB and copies sprInstCount*32 bytes in.
+.globl sprInstData
+sprInstData  BYTE 262144 dup(0)
+
+.balign 16
+; ---- the sprite atlas CPU mirror: 512*512 indexed bytes, index 0 = transparent.
+;      SprAddFrame stamps frame pixels here; SprUploadAtlas pushes it to the GPU.
+.globl sprAtlasPix
+sprAtlasPix  BYTE 262144 dup(0)          ; 512*512
+
+.balign 16
+; ---- the per-sprite palette CPU mirror: 16 * SprPalSlots BGRA entries.
+;      16 * 32 * 4 = 2048 bytes. row s = slot s's 16 colours.
+.globl sprPalData
+sprPalData   DWORD 512 dup(0)            ; 16 * 32
+
+.balign 16
+; ---- descriptors --------------------------------------------------------
+; sprite atlas texture: 512x512, R8_UINT, DEFAULT, BIND_SHADER_RESOURCE.
+tdSprAtlas struct D3D11_TEXTURE2D_DESC
+    Width            = 512
+    Height           = 512
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 62                ; DXGI_FORMAT_R8_UINT
+    SampleDesc.Count = 1
+    Usage            = 0                 ; D3D11_USAGE_DEFAULT
+    BindFlags        = 8                ; D3D11_BIND_SHADER_RESOURCE
+ends
+
+; per-sprite palette texture: 16 x 32, B8G8R8A8_UNORM, DEFAULT, SHADER_RESOURCE.
+tdSprPal struct D3D11_TEXTURE2D_DESC
+    Width            = 16
+    Height           = 32                ; = SprPalSlots
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 87                ; DXGI_FORMAT_B8G8R8A8_UNORM
+    SampleDesc.Count = 1
+    Usage            = 0
+    BindFlags        = 8
+ends
+
+; SRV for the R8_UINT atlas (TEXTURE2D, MipLevels patched to 1 at init).
+srvSprAtlas struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 62                   ; R8_UINT
+    ViewDimension = 4                    ; D3D11_SRV_DIMENSION_TEXTURE2D
+ends
+; SRV for the BGRA palette.
+srvSprPal struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 87                   ; B8G8R8A8_UNORM
+    ViewDimension = 4
+ends
+
+; subresource upload descriptors (pSysMem patched at init).
+sdSprAtlas struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 512                    ; R8 -> width
+ends
+sdSprPal struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 64                     ; 16 * 4
+ends
+
+; the DYNAMIC instance vertex buffer: 8192*32 = 262144 bytes, DYNAMIC +
+; CPU_ACCESS_WRITE + BIND_VERTEX_BUFFER (so Map WRITE_DISCARD works each frame).
+vbDesc struct D3D11_BUFFER_DESC
+    ByteWidth      = 262144              ; SprMaxInst * 32
+    Usage          = 2                   ; D3D11_USAGE_DYNAMIC
+    BindFlags      = 1                   ; D3D11_BIND_VERTEX_BUFFER
+    CPUAccessFlags = 0x10000             ; D3D11_CPU_ACCESS_WRITE
+ends
+
+.balign 16
+; ---- the input layout: 5 per-instance attributes, one InputSlot (0),
+;      InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA (1), step rate 1.
+;      Each D3D11_INPUT_ELEMENT_DESC is 32 bytes; the SemanticName PSTR (@0) is
+;      patched at init (the assembler can't put a label inside a struct field that
+;      the macro lays out as a u64). Offsets walk the 32-byte instance record:
+;        INSTSCR @0 (R32G32_FLOAT=16), INSTATL @8, INSTWH @16,
+;        INSTPAL @24 (R32_FLOAT=41),   INSTA   @28.
+sprElems:
+elScr struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16            ; DXGI_FORMAT_R32G32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 0
+    InputSlotClass       = 1             ; D3D11_INPUT_PER_INSTANCE_DATA
+    InstanceDataStepRate = 1
+ends
+elAtl struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16
+    InputSlot            = 0
+    AlignedByteOffset    = 8
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elWh struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16
+    InputSlot            = 0
+    AlignedByteOffset    = 16
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elPal struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 41            ; DXGI_FORMAT_R32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 24
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elA struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 41
+    InputSlot            = 0
+    AlignedByteOffset    = 28
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; SprInit — compile the sprite VS/PS, patch + create the input layout (against
+; the VS blob's input signature), create the atlas + palette textures + SRVs,
+; create the dynamic instance vertex buffer. Returns 0 in eax; on D3D failure
+; exits with a small distinct code (like G0/G1/G2). Call AFTER GpuInit + BlitInit.
+; ===========================================================================
+.globl SprInit
+SprInit:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    sub     rsp, 40
+
+    ; SRV anonymous-union MipLevels patch (+12) — MipLevels=0 fails (G0/G1/G2 trap).
+    mov     dword ptr [rip + srvSprAtlas + 12], 1
+    mov     dword ptr [rip + srvSprPal + 12], 1
+
+    ; patch each input element's SemanticName PSTR (@0). The struct macro lays the
+    ; rest; the name pointer must be written at runtime (a label, not a constant).
+    lea     rax, [rip + semScr]
+    mov     [rip + elScr + 0], rax
+    lea     rax, [rip + semAtl]
+    mov     [rip + elAtl + 0], rax
+    lea     rax, [rip + semWh]
+    mov     [rip + elWh + 0], rax
+    lea     rax, [rip + semPal]
+    mov     [rip + elPal + 0], rax
+    lea     rax, [rip + semA]
+    mov     [rip + elA + 0], rax
+
+    ; ---- compile the sprite VS/PS ----
+    lea     rax, [rip + sprEnd]
+    lea     rcx, [rip + sprSrc]
+    sub     rax, rcx
+    mov     [rip + sprSrcLen], rax
+    invoke  D3DCompile, sprSrc, [rip + sprSrcLen], sprName, 0, 0, svsEntry, vsTarget, 0, 0, pVSBlobS, pErrBlob
+    test    eax, eax
+    js      si_fail_compile
+    invoke  D3DCompile, sprSrc, [rip + sprSrcLen], sprName, 0, 0, spsEntry, psTarget, 0, 0, pPSBlobS, pErrBlob
+    test    eax, eax
+    js      si_fail_compile
+
+    pVSBlobS.GetBufferPointer()
+    mov     [rip + tmpPtrS], rax
+    pVSBlobS.GetBufferSize()
+    mov     [rip + tmpSizeS], rax
+    pDevice.CreateVertexShader([rip + tmpPtrS], [rip + tmpSizeS], 0, pSprVS)
+    test    eax, eax
+    js      si_fail_d3d
+    pPSBlobS.GetBufferPointer()
+    mov     [rip + tmpPtrS], rax
+    pPSBlobS.GetBufferSize()
+    mov     [rip + tmpSizeS], rax
+    pDevice.CreatePixelShader([rip + tmpPtrS], [rip + tmpSizeS], 0, pSprPS)
+    test    eax, eax
+    js      si_fail_d3d
+
+    ; ---- input layout (against the VS blob's input signature) ----
+    ; CreateInputLayout(pElems, NumElements=5, pVSBytecode, BytecodeLength, ppLayout)
+    pVSBlobS.GetBufferPointer()
+    mov     [rip + tmpPtrS], rax
+    pVSBlobS.GetBufferSize()
+    mov     [rip + tmpSizeS], rax
+    pDevice.CreateInputLayout(sprElems, 5, [rip + tmpPtrS], [rip + tmpSizeS], pSprLayout)
+    test    eax, eax
+    js      si_fail_d3d
+
+    ; ---- atlas texture + SRV (seeded from sprAtlasPix; re-uploaded by SprUploadAtlas) ----
+    lea     rax, [rip + sprAtlasPix]
+    mov     [rip + sdSprAtlas + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdSprAtlas, sdSprAtlas, pSprAtlasTex)
+    test    eax, eax
+    js      si_fail_d3d
+    pDevice.CreateShaderResourceView([rip + pSprAtlasTex], srvSprAtlas, pSprSRVatlas)
+    test    eax, eax
+    js      si_fail_d3d
+
+    ; ---- palette texture + SRV (seeded from sprPalData; re-uploaded by SprUploadPalette) ----
+    lea     rax, [rip + sprPalData]
+    mov     [rip + sdSprPal + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdSprPal, sdSprPal, pSprPalTex)
+    test    eax, eax
+    js      si_fail_d3d
+    pDevice.CreateShaderResourceView([rip + pSprPalTex], srvSprPal, pSprSRVpal)
+    test    eax, eax
+    js      si_fail_d3d
+
+    ; ---- the dynamic instance vertex buffer (no init data) ----
+    pDevice.CreateBuffer(vbDesc, 0, pSprInstVB)
+    test    eax, eax
+    js      si_fail_d3d
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+si_fail_compile:
+    invoke  ExitProcess, 35
+si_fail_d3d:
+    invoke  ExitProcess, 33
+
+; ===========================================================================
+; SprAddFrame(rcx=src, edx=w, r8d=h) — append one frame to the atlas. `src`
+; points at w*h indexed pixels (row-major, one byte each; index 0 = transparent).
+; Frames are packed left-to-right into the 512-wide atlas, wrapping to a new row
+; band when the next frame would overflow the row (each band is as tall as the
+; tallest frame placed in it — here a simple shelf packer: track the row cursor
+; (curX,curY) and the band height (bandH)). Returns the frame-id in eax (-1 if
+; the atlas is full / the frame table is full). Mirrors library/sprite.was's frame
+; model (each frame is its own little bitmap); the per-sprite LUT is separate.
+;   frame record: { atlasX@0, atlasY@4, w@8, h@12 } in sprFrameTab[id*16].
+; ===========================================================================
+.globl SprAddFrame
+SprAddFrame:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    mov     rsi, rcx                      ; src pixels
+    mov     r12d, edx                     ; w
+    mov     r13d, r8d                     ; h
+
+    ; frame-table-full guard (256 frames).
+    mov     r14d, [rip + sprFrameCount]
+    cmp     r14d, 256
+    jae     saf_fail
+
+    ; ---- shelf-pack: place at (sprCurX, sprCurY); wrap a band if it overflows 512 ----
+    mov     eax, [rip + sprCurX]          ; curX
+    add     eax, r12d                     ; curX + w
+    cmp     eax, 512
+    jle     saf_place                     ; fits in this band
+    ; new band: curX=0, curY += bandH, bandH=0
+    mov     dword ptr [rip + sprCurX], 0
+    mov     eax, [rip + sprCurY]
+    add     eax, [rip + sprBandH]
+    mov     [rip + sprCurY], eax
+    mov     dword ptr [rip + sprBandH], 0
+saf_place:
+    ; vertical overflow guard: curY + h must fit in 512.
+    mov     eax, [rip + sprCurY]
+    add     eax, r13d
+    cmp     eax, 512
+    jg      saf_fail
+
+    mov     r15d, [rip + sprCurX]         ; atlasX = curX
+    mov     ebp, [rip + sprCurY]          ; atlasY = curY
+
+    ; ---- stamp the w*h pixels into sprAtlasPix at (atlasX, atlasY) ----
+    ; dst base = (atlasY*512 + atlasX); src stride = w, dst stride = 512.
+    lea     rdi, [rip + sprAtlasPix]
+    mov     eax, ebp
+    imul    eax, eax, 512
+    add     eax, r15d
+    add     rdi, rax                      ; dst top-left
+    xor     ecx, ecx                      ; row 0..h-1
+saf_row:
+    cmp     ecx, r13d
+    jge     saf_rowdone
+    ; copy w bytes: dst + row*512 <- src + row*w
+    mov     r8, rdi
+    mov     eax, ecx
+    imul    eax, eax, 512
+    add     r8, rax                       ; dst row
+    mov     r9, rsi
+    mov     eax, ecx
+    imul    eax, r12d
+    add     r9, rax                       ; src row
+    push    rcx
+    mov     ecx, r12d                     ; byte count = w
+    xor     r10d, r10d
+saf_cpy:
+    cmp     r10d, ecx
+    jge     saf_cpydone
+    mov     al, [r9 + r10]
+    mov     [r8 + r10], al
+    inc     r10d
+    jmp     saf_cpy
+saf_cpydone:
+    pop     rcx
+    inc     ecx
+    jmp     saf_row
+saf_rowdone:
+
+    ; ---- record the frame { atlasX, atlasY, w, h } in sprFrameTab[id*16] ----
+    lea     rdi, [rip + sprFrameTab]
+    mov     eax, r14d
+    shl     eax, 4                         ; id*16
+    add     rdi, rax
+    mov     [rdi + 0], r15d               ; atlasX
+    mov     [rdi + 4], ebp                ; atlasY
+    mov     [rdi + 8], r12d               ; w
+    mov     [rdi + 12], r13d              ; h
+
+    ; ---- advance the shelf cursor: curX += w; bandH = max(bandH, h) ----
+    mov     eax, [rip + sprCurX]
+    add     eax, r12d
+    mov     [rip + sprCurX], eax
+    mov     eax, [rip + sprBandH]
+    cmp     r13d, eax
+    jle     saf_bandok
+    mov     eax, r13d
+saf_bandok:
+    mov     [rip + sprBandH], eax
+
+    ; frameCount++, return the id we just wrote.
+    inc     r14d
+    mov     [rip + sprFrameCount], r14d
+    mov     eax, r14d
+    dec     eax                           ; return id
+
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+saf_fail:
+    mov     eax, -1
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; SprUploadAtlas — push sprAtlasPix to the GPU atlas texture (UpdateSubresource,
+; full subresource, srcRowPitch=512). Call once after all SprAddFrame calls.
+; ===========================================================================
+.globl SprUploadAtlas
+SprUploadAtlas:
+    push    rbx
+    sub     rsp, 32
+    pContext.UpdateSubresource([rip + pSprAtlasTex], 0, 0, sprAtlasPix, 512, 0)
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; SprSetPalette(rcx=slot, edx=index, r8d=rgb) — set one entry of a per-sprite
+; palette slot. rgb is 0x00RRGGBB; stored as BGRA (B8G8R8A8_UNORM little-endian
+; => DWORD 0xFFRRGGBB lands as B,G,R,A). Colour 0 is never sampled (the PS
+; discards index 0) but is still writable. Mirrors library/sprite.was SpriteColour.
+;   sprPalData[slot*16 + index] = 0xFF<RR><GG><BB>.
+; ===========================================================================
+.globl SprSetPalette
+SprSetPalette:
+    cmp     ecx, 32                       ; slot < SprPalSlots
+    jae     ssp_end
+    cmp     edx, 16                       ; index < 16
+    jae     ssp_end
+    ; force opaque alpha so the texel's .a is 1 (the shader uses the INSTANCE alpha
+    ; for output, but a clean 0xFF keeps the LUT readable / future-proof).
+    or      r8d, 0xFF000000
+    lea     rax, [rip + sprPalData]
+    mov     r9d, ecx
+    shl     r9d, 4                         ; slot*16 entries
+    add     r9d, edx                      ; + index
+    mov     [rax + r9*4], r8d
+ssp_end:
+    ret
+
+; ===========================================================================
+; SprUploadPalette — push sprPalData to the GPU palette texture
+; (UpdateSubresource, srcRowPitch=64 = 16*4). Call after the SprSetPalette calls
+; (re-callable for GPU palette cycling, like the canvas LUT re-upload).
+; ===========================================================================
+.globl SprUploadPalette
+SprUploadPalette:
+    push    rbx
+    sub     rsp, 32
+    pContext.UpdateSubresource([rip + pSprPalTex], 0, 0, sprPalData, 64, 0)
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; SprClear — reset the per-frame instance list (sprInstCount = 0). Call at the
+; start of each frame's sprite build.
+; ===========================================================================
+.globl SprClear
+SprClear:
+    mov     dword ptr [rip + sprInstCount], 0
+    ret
+
+; ===========================================================================
+; SprPush(rcx=frameId, xmm1=screenX, xmm2=screenY, r8d=paletteSlot, xmm3=alpha)
+;   — append one sprite instance to the CPU mirror. The frame-id picks the atlas
+;   sub-rect (atlasX,atlasY,w,h) from sprFrameTab. Records the 8-float record
+;   {screenX, screenY, atlasX, atlasY, w, h, paletteSlot, alpha}. No-op if the
+;   list is full or the frame-id is out of range.
+;
+; Float args via the SSE ABI: screenX=xmm1, screenY=xmm2, alpha=xmm3 (xmm0 free
+; for scratch). frameId=ecx (int), paletteSlot=r8d (int, converted to float here).
+; ===========================================================================
+.globl SprPush
+SprPush:
+    push    rbx
+    push    rsi
+    push    rdi
+
+    ; list-full guard.
+    mov     eax, [rip + sprInstCount]
+    cmp     eax, 8192                     ; SprMaxInst
+    jae     sp_end
+    ; frame-id range guard.
+    cmp     ecx, [rip + sprFrameCount]
+    jae     sp_end
+
+    ; frame record base = sprFrameTab + frameId*16.
+    lea     rsi, [rip + sprFrameTab]
+    mov     edx, ecx
+    shl     edx, 4
+    add     rsi, rdx                      ; rsi -> {atlasX, atlasY, w, h}
+
+    ; dst record = sprInstData + count*32.
+    lea     rdi, [rip + sprInstData]
+    mov     edx, eax                      ; count
+    shl     edx, 5                        ; *32
+    add     rdi, rdx                      ; rdi -> the 32-byte record
+
+    ; [0] screenX = xmm1 ; [4] screenY = xmm2
+    movss   [rdi + 0], xmm1
+    movss   [rdi + 4], xmm2
+    ; [8] atlasX = (float)frame.atlasX ; [12] atlasY = (float)frame.atlasY
+    cvtsi2ss xmm0, dword ptr [rsi + 0]
+    movss   [rdi + 8], xmm0
+    cvtsi2ss xmm0, dword ptr [rsi + 4]
+    movss   [rdi + 12], xmm0
+    ; [16] w = (float)frame.w ; [20] h = (float)frame.h
+    cvtsi2ss xmm0, dword ptr [rsi + 8]
+    movss   [rdi + 16], xmm0
+    cvtsi2ss xmm0, dword ptr [rsi + 12]
+    movss   [rdi + 20], xmm0
+    ; [24] paletteSlot = (float)r8d
+    cvtsi2ss xmm0, r8d
+    movss   [rdi + 24], xmm0
+    ; [28] alpha = xmm3
+    movss   [rdi + 28], xmm3
+
+    inc     eax
+    mov     [rip + sprInstCount], eax
+sp_end:
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; SprUpload — copy the live sprInstData (sprInstCount*32 bytes) into the dynamic
+; instance VB via Map(WRITE_DISCARD)/memcpy/Unmap. Call once per frame after all
+; the SprPush calls, before DrawSprites.
+; ===========================================================================
+.globl SprUpload
+SprUpload:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    ; Map(pResource, Subresource=0, MapType=D3D11_MAP_WRITE_DISCARD(4), MapFlags=0, &mapped)
+    pContext.Map([rip + pSprInstVB], 0, 4, 0, sprMapped)
+    test    eax, eax
+    js      su_done                       ; Map failed -> skip (nothing to draw safely)
+
+    ; memcpy sprInstCount*32 bytes: sprInstData -> mapped.pData
+    mov     rdi, [rip + sprMapped + 0]    ; dst (GPU)
+    lea     rsi, [rip + sprInstData]      ; src
+    mov     ecx, [rip + sprInstCount]
+    shl     ecx, 5                        ; *32 = byte count
+    test    ecx, ecx
+    jz      su_unmap
+su_cpy:
+    mov     al, [rsi]
+    mov     [rdi], al
+    inc     rsi
+    inc     rdi
+    dec     ecx
+    jnz     su_cpy
+su_unmap:
+    pContext.Unmap([rip + pSprInstVB], 0)
+su_done:
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; DrawSprites(rcx=dstRTV) — draw ALL live instances onto dstRTV in ONE
+; DrawInstanced call (NO per-scanline cap — the brakes-off moment). Binds the
+; input layout, the dynamic instance VB (slot 0, stride 32), the sprite VS/PS,
+; the atlas SRV (t0) + palette SRV (t1), the G1 ALPHA blend state (alpha-over),
+; TRIANGLESTRIP topology, then DrawInstanced(4, instCount, 0, 0).
+;
+; The caller has set dstRTV up (e.g. the composited back-buffer or a layer RT) and
+; the matching viewport; we set the RT here too so the sprite pass writes into it
+; and to unbind any texture that was a render target (safe to sample the atlas).
+; ===========================================================================
+.globl DrawSprites
+DrawSprites:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     rdi, rcx                      ; dstRTV
+
+    ; bind the dst RT FIRST (unbinds any prior RT, so its texture is safe to sample).
+    mov     [rip + sprRTVTmp], rdi
+    pContext.OMSetRenderTargets(1, sprRTVTmp, 0)
+
+    ; input layout + instance VB (slot 0, stride 32, offset 0).
+    pContext.IASetInputLayout([rip + pSprLayout])
+    mov     rax, [rip + pSprInstVB]
+    mov     [rip + sprVBArr], rax
+    pContext.IASetVertexBuffers(0, 1, sprVBArr, sprStride, sprOffset)
+
+    ; shaders + raster.
+    pContext.VSSetShader([rip + pSprVS], 0, 0)
+    pContext.PSSetShader([rip + pSprPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+
+    ; atlas SRV at t0, palette SRV at t1 (contiguous 2-entry array).
+    mov     rax, [rip + pSprSRVatlas]
+    mov     [rip + sprSrvArr + 0], rax
+    mov     rax, [rip + pSprSRVpal]
+    mov     [rip + sprSrvArr + 8], rax
+    pContext.PSSetShaderResources(0, 2, sprSrvArr)
+
+    ; the G1 alpha-over blend state (SRC_ALPHA / INV_SRC_ALPHA).
+    pContext.OMSetBlendState([rip + pBlendAlpha], blendFactor, 0xFFFFFFFF)
+
+    ; TRIANGLESTRIP (4 verts -> a quad).
+    pContext.IASetPrimitiveTopology(5)    ; D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+    ; DrawInstanced(VertexCountPerInstance=4, InstanceCount=sprInstCount, 0, 0).
+    ; Marshal the count through memory — NEVER a live GP register: the comcall macro
+    ; materializes `this` into rcx BEFORE consuming the arg, so a register that
+    ; aliases rcx (e.g. ecx) is clobbered. Snapshot to sprDrawCount (zero-extended
+    ; via the qword store) then pass [rip + sprDrawCount]; the macro emits an
+    ; independent `mov r8, [rip + sprDrawCount]` and InstanceCount (r8d) is correct.
+    mov     eax, [rip + sprInstCount]
+    mov     qword ptr [rip + sprDrawCount], 0
+    mov     [rip + sprDrawCount], eax
+    pContext.DrawInstanced(4, [rip + sprDrawCount], 0, 0)
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+; scratch + shelf-packer cursor state.
+sprCurX    DWORD 0                         ; shelf-pack X cursor
+sprCurY    DWORD 0                         ; shelf-pack Y cursor (band top)
+sprBandH   DWORD 0                         ; current band height
+sprRTVTmp  QWORD ?                         ; single-element RTV array for OMSetRenderTargets
+.balign 16
+sprSrvArr  QWORD 0, 0                       ; t0=atlas, t1=palette

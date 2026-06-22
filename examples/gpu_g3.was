@@ -1,0 +1,898 @@
+; gpu_g3.was — GPU Canvas G3 driver: sprites, brakes off.
+;
+;   was examples\gpu_g3.was -o gpu_g3.exe   &&   gpu_g3.exe
+;
+; Brings up G0 (gpu/canvas.was: device/swapchain/palettes), G1 (gpu/blit.was: the
+; alpha blend state), G2 (gpu/tile.was: a parallax tile background) and G3
+; (gpu/sprite.was: the sprite atlas + per-sprite palette LUT + the INSTANCED sprite
+; pass), then runs a per-frame SWARM:
+;
+;   * a sprite ATLAS of 3 recognizable 16x16 frames — a BALL, a STAR, an ARROW —
+;     indexed pixels (index 0 transparent, 1..15 a per-sprite palette colour).
+;   * a per-sprite PALETTE with several slots (so the same frame appears in many
+;     colours): slot 0 red-ish, 1 green-ish, 2 blue-ish, 3 yellow-ish, ... 7.
+;   * a SWARM of 3000 sprites at varied positions / frames / palette slots, each
+;     drifting per frame (a simple velocity + screen-wrap), all drawn in ONE
+;     DrawInstanced call — way past any 16-bit per-scanline cap.
+;   * the swarm composites OVER a G2 parallax tile background (drawn first into the
+;     back buffer), with index-0 transparency + per-sprite palettes + instance alpha.
+;   * present; dump examples/gpu_g3.bmp showing the full swarm over the background.
+;
+; Two gates (docs/gpucanvas.md §8): a live window AND the BMP.
+
+.include "../gpu/canvas.was"
+.include "../gpu/blit.was"
+.include "../gpu/tile.was"
+.include "../gpu/sprite.was"
+
+.DATA
+.balign 16
+className   WCHAR  "rasm_gpu_g3", 0
+titleText   WCHAR  "RASM — GPU Canvas G3 (3000 sprites, brakes off @ 720p)", 0
+wc          BYTE   80 dup(0)
+msg         BYTE   48 dup(0)
+hwndSave    QWORD  ?
+winRect     BYTE   16 dup(0)
+winW        DWORD  ?
+winH        DWORD  ?
+
+; tile-layer pool RT handles (the parallax background, like G2).
+hLayerRT0   DWORD  ?              ; far  layer RT
+hLayerRT1   DWORD  ?              ; near layer RT
+
+; sprite frame ids (fixed by SprAddFrame order).
+fidBall     DWORD  ?
+fidStar     DWORD  ?
+fidArrow    DWORD  ?
+
+worldCam    DWORD  0
+frameNo     DWORD  0
+snapDone    DWORD  0
+
+bmpNameG3   WCHAR  "E:/RASM/examples/gpu_g3.bmp", 0
+
+.balign 16
+; the swarm: 3000 sprites. Each has { x, y (fixed-point .8), vx, vy, frame, slot }.
+; SOA-ish: parallel arrays sized SWARM_N. 3000 * 4 = 12000 bytes per int array.
+SWARM_N     DWORD  3000
+swarmX      DWORD  3000 dup(0)       ; x position, fixed-point (<<8)
+swarmY      DWORD  3000 dup(0)       ; y position, fixed-point (<<8)
+swarmVX     DWORD  3000 dup(0)       ; x velocity, fixed-point
+swarmVY     DWORD  3000 dup(0)       ; y velocity, fixed-point
+swarmFrame  DWORD  3000 dup(0)       ; 0..2 frame id
+swarmSlot   DWORD  3000 dup(0)       ; 0..7 palette slot
+
+; a tiny LCG seed for varied spawns.
+rngState    DWORD  0x12345678
+
+.balign 16
+; the tile maps (reuse the G2 tile machinery for the background).
+mapFar      BYTE   720 dup(0)        ; 16*45 sparse stars
+mapNear     BYTE   1080 dup(0)       ; 24*45 ground band
+
+.balign 16
+; scratch 8x8 tile pixel buffers (for the background atlas).
+tileStar8   BYTE   64 dup(0)
+tileBrick8  BYTE   64 dup(0)
+
+.balign 16
+; scratch 16x16 sprite frame pixel buffers (indexed; one byte per pixel).
+sprBall     BYTE   256 dup(0)
+sprStarF    BYTE   256 dup(0)
+sprArrow    BYTE   256 dup(0)
+
+.balign 16
+; float constants for SprPush (fixed -> pixel conversions).
+f256        DWORD  0x43800000        ; 256.0f (>>8 fixed-point divisor)
+fAlpha      DWORD  0x3F800000        ; 1.0f instance alpha
+
+.balign 16
+.CODE
+.globl main
+main:
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 1280
+    mov     dword ptr [rdi + 12], 720
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + winH], eax
+
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail_window
+
+    ; ---- build assets BEFORE creating GPU resources ----
+    call    BuildBgTiles
+    call    BuildBgMaps
+    call    BuildSpriteFrames
+
+    ; ---- bring up G0 / G1 / G2 / G3 ----
+    mov     rcx, [rip + hwndSave]
+    call    GpuInit
+    call    BlitInit
+    call    TileInit
+    call    SprInit
+
+    ; ---- background tile atlas (star tile id 0, brick tile id 1) ----
+    lea     rcx, [rip + tileStar8]
+    call    AddTile                       ; id 0 -> map value 1
+    lea     rcx, [rip + tileBrick8]
+    call    AddTile                       ; id 1 -> map value 2
+
+    ; ---- two background layer RTs (G1 LAYER) ----
+    mov     ecx, 2
+    xor     edx, edx
+    call    PoolAlloc
+    mov     [rip + hLayerRT0], eax
+    mov     ecx, 2
+    xor     edx, edx
+    call    PoolAlloc
+    mov     [rip + hLayerRT1], eax
+
+    ; ---- bake the two background maps ----
+    mov     ecx, 0
+    lea     rdx, [rip + mapFar]
+    mov     r8d, 16
+    mov     r9d, 45
+    call    DrawTiles
+    mov     ecx, 0
+    call    TileUpload
+    mov     ecx, 1
+    lea     rdx, [rip + mapNear]
+    mov     r8d, 24
+    mov     r9d, 45
+    call    DrawTiles
+    mov     ecx, 1
+    call    TileUpload
+
+    ; colour key = magenta (the tile PS emits magenta for index-0 pixels).
+    mov     ecx, 0x00FF00FF
+    call    BlitSetKey
+
+    ; ---- sprite atlas: 3 frames (ball=0, star=1, arrow=2), 16x16 each ----
+    lea     rcx, [rip + sprBall]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fidBall], eax
+    lea     rcx, [rip + sprStarF]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fidStar], eax
+    lea     rcx, [rip + sprArrow]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fidArrow], eax
+    call    SprUploadAtlas
+
+    ; ---- per-sprite palettes: 8 slots, each a distinct hue ramp ----
+    call    BuildSpritePalettes
+    call    SprUploadPalette
+
+    ; ---- spawn the swarm ----
+    call    SpawnSwarm
+
+    call    Composite                      ; first frame
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail_window:
+    invoke  ExitProcess, 1
+
+; ===========================================================================
+; Composite — one frame: parallax background (2 tile layers, colour-key) onto the
+; back buffer, then the WHOLE sprite swarm over it in one DrawInstanced, then Present.
+; ===========================================================================
+.globl Composite
+Composite:
+    push    rbx
+    push    rsi
+    sub     rsp, 40
+
+    mov     esi, [rip + worldCam]
+
+    ; ---- far layer (slot 0): scroll = cam>>2 ----
+    mov     eax, esi
+    sar     eax, 2
+    mov     ecx, 0
+    mov     edx, eax
+    xor     r8d, r8d
+    call    TileSetScroll
+    mov     ecx, 0
+    mov     ebx, [rip + hLayerRT0]
+    lea     rax, [rip + poolRTV]
+    mov     rdx, [rax + rbx*8]
+    call    TileRenderLayer
+
+    ; ---- near layer (slot 1): scroll = cam ----
+    mov     eax, esi
+    mov     ecx, 1
+    mov     edx, eax
+    xor     r8d, r8d
+    call    TileSetScroll
+    mov     ecx, 1
+    mov     ebx, [rip + hLayerRT1]
+    lea     rax, [rip + poolRTV]
+    mov     rdx, [rax + rbx*8]
+    call    TileRenderLayer
+
+    ; ---- composite the background onto the back buffer (sky clear + colour-key) ----
+    pContext.OMSetRenderTargets(1, pRTV, 0)
+    pContext.ClearRenderTargetView([rip + pRTV], skyCol)
+    mov     ebx, [rip + hLayerRT0]
+    lea     rax, [rip + poolSRV]
+    mov     rcx, [rax + rbx*8]
+    mov     edx, 1
+    call    BlitToBack
+    mov     ebx, [rip + hLayerRT1]
+    lea     rax, [rip + poolSRV]
+    mov     rcx, [rax + rbx*8]
+    mov     edx, 1
+    call    BlitToBack
+
+    ; ---- build + upload the sprite instances, then draw the whole swarm ----
+    call    BuildSwarmInstances
+    call    SprUpload
+
+    ; the sprite pass writes into the back buffer (already holds the background).
+    ; set the 1280x720 backbuffer viewport (BlitToBack left the backbuffer RT bound,
+    ; but DrawSprites re-binds the RT itself; make sure the viewport is the backbuffer's).
+    pContext.RSSetViewports(1, vp)
+    mov     rcx, [rip + pRTV]
+    call    DrawSprites
+
+    pSwap.Present(1, 0)
+
+    add     rsp, 40
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildSwarmInstances — SprClear, then for each swarm sprite SprPush its current
+; pixel position / frame / slot. Positions are fixed-point (.8); convert to pixels.
+; ===========================================================================
+BuildSwarmInstances:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    sub     rsp, 8
+
+    call    SprClear
+
+    mov     r12d, [rip + SWARM_N]
+    xor     r13d, r13d                     ; i
+bsi_loop:
+    cmp     r13d, r12d
+    jge     bsi_done
+    ; screenX = swarmX[i] / 256.0 ; screenY = swarmY[i] / 256.0
+    lea     rax, [rip + swarmX]
+    mov     eax, [rax + r13*4]
+    cvtsi2ss xmm1, eax
+    divss   xmm1, [rip + f256]            ; xmm1 = screenX (pixels)
+    lea     rax, [rip + swarmY]
+    mov     eax, [rax + r13*4]
+    cvtsi2ss xmm2, eax
+    divss   xmm2, [rip + f256]            ; xmm2 = screenY
+    ; frameId = swarmFrame[i] ; paletteSlot = swarmSlot[i]
+    lea     rax, [rip + swarmFrame]
+    mov     ecx, [rax + r13*4]            ; frameId (ecx)
+    lea     rax, [rip + swarmSlot]
+    mov     r8d, [rax + r13*4]            ; paletteSlot (r8d)
+    movss   xmm3, [rip + fAlpha]          ; alpha = 1.0
+    call    SprPush
+    inc     r13d
+    jmp     bsi_loop
+bsi_done:
+    add     rsp, 8
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; rng — a tiny xorshift32 in eax (state in rngState). Clobbers eax,edx.
+; ===========================================================================
+rng:
+    mov     eax, [rip + rngState]
+    mov     edx, eax
+    shl     edx, 13
+    xor     eax, edx
+    mov     edx, eax
+    shr     edx, 17
+    xor     eax, edx
+    mov     edx, eax
+    shl     edx, 5
+    xor     eax, edx
+    mov     [rip + rngState], eax
+    ret
+
+; ===========================================================================
+; SpawnSwarm — randomise each swarm sprite: x in [0,640), y in [0,360), small
+; velocities, frame in 0..2, slot in 0..7.
+; ===========================================================================
+SpawnSwarm:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+
+    mov     r12d, [rip + SWARM_N]
+    xor     r13d, r13d                     ; i
+ss_loop:
+    cmp     r13d, r12d
+    jge     ss_done
+
+    ; x = (rng % 640) << 8
+    call    rng
+    xor     edx, edx
+    mov     ecx, 640
+    div     ecx
+    mov     eax, edx
+    shl     eax, 8
+    lea     rbx, [rip + swarmX]
+    mov     [rbx + r13*4], eax
+    ; y = (rng % 360) << 8
+    call    rng
+    xor     edx, edx
+    mov     ecx, 360
+    div     ecx
+    mov     eax, edx
+    shl     eax, 8
+    lea     rbx, [rip + swarmY]
+    mov     [rbx + r13*4], eax
+    ; vx = (rng % 512) - 256   (fixed-point: +-1 px/frame ish)
+    call    rng
+    xor     edx, edx
+    mov     ecx, 512
+    div     ecx
+    mov     eax, edx
+    sub     eax, 256
+    lea     rbx, [rip + swarmVX]
+    mov     [rbx + r13*4], eax
+    ; vy = (rng % 512) - 256
+    call    rng
+    xor     edx, edx
+    mov     ecx, 512
+    div     ecx
+    mov     eax, edx
+    sub     eax, 256
+    lea     rbx, [rip + swarmVY]
+    mov     [rbx + r13*4], eax
+    ; frame = rng % 3
+    call    rng
+    xor     edx, edx
+    mov     ecx, 3
+    div     ecx
+    lea     rbx, [rip + swarmFrame]
+    mov     [rbx + r13*4], edx
+    ; slot = rng % 8
+    call    rng
+    and     eax, 7
+    lea     rbx, [rip + swarmSlot]
+    mov     [rbx + r13*4], eax
+
+    inc     r13d
+    jmp     ss_loop
+ss_done:
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; MoveSwarm — advance each sprite by its velocity; wrap at the 640x360 field
+; (fixed-point .8: field is 640<<8 / 360<<8).
+; ===========================================================================
+MoveSwarm:
+    push    rbx
+    push    r12
+    push    r13
+
+    mov     r12d, [rip + SWARM_N]
+    xor     r13d, r13d
+ms_loop:
+    cmp     r13d, r12d
+    jge     ms_done
+    ; x += vx ; wrap [0, 640<<8)
+    lea     rbx, [rip + swarmX]
+    mov     eax, [rbx + r13*4]
+    lea     rcx, [rip + swarmVX]
+    add     eax, [rcx + r13*4]
+    ; wrap
+    cmp     eax, 0
+    jge     ms_x_hi
+    add     eax, 163840                    ; 640<<8
+ms_x_hi:
+    cmp     eax, 163840
+    jl      ms_x_ok
+    sub     eax, 163840
+ms_x_ok:
+    mov     [rbx + r13*4], eax
+    ; y += vy ; wrap [0, 360<<8)
+    lea     rbx, [rip + swarmY]
+    mov     eax, [rbx + r13*4]
+    lea     rcx, [rip + swarmVY]
+    add     eax, [rcx + r13*4]
+    cmp     eax, 0
+    jge     ms_y_hi
+    add     eax, 92160                     ; 360<<8
+ms_y_hi:
+    cmp     eax, 92160
+    jl      ms_y_ok
+    sub     eax, 92160
+ms_y_ok:
+    mov     [rbx + r13*4], eax
+    inc     r13d
+    jmp     ms_loop
+ms_done:
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildSpriteFrames — synthesize the 3 sprite frames (16x16 indexed pixels).
+;   sprBall  : a filled disc (radius ~7) of index 1, AA-free.
+;   sprStarF : a 4-point star (a '+' and an 'x' overlap) of index 2.
+;   sprArrow : a right-pointing arrow of index 3.
+; All on index 0 (transparent). The per-sprite palette maps 1..3 to a hue.
+; ===========================================================================
+BuildSpriteFrames:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+
+    ; ---- ball: disc, (x-7.5)^2+(y-7.5)^2 <= 7^2 -> index 1 ----
+    lea     rdi, [rip + sprBall]
+    xor     r12d, r12d                     ; y
+bf_ball_y:
+    cmp     r12d, 16
+    jge     bf_ball_done
+    xor     r13d, r13d                     ; x
+bf_ball_x:
+    cmp     r13d, 16
+    jge     bf_ball_yend
+    ; dx = 2x-15, dy = 2y-15 ; dx*dx + dy*dy <= (2*7)^2 = 196 (scaled by 4 -> 14^2)
+    mov     eax, r13d
+    add     eax, eax
+    sub     eax, 15
+    imul    eax, eax                       ; dx^2*4
+    mov     ebx, r12d
+    add     ebx, ebx
+    sub     ebx, 15
+    imul    ebx, ebx
+    add     eax, ebx
+    cmp     eax, 196                        ; (2*7)^2
+    jg      bf_ball_zero
+    mov     byte ptr [rdi], 1
+    jmp     bf_ball_adv
+bf_ball_zero:
+    mov     byte ptr [rdi], 0
+bf_ball_adv:
+    inc     rdi
+    inc     r13d
+    jmp     bf_ball_x
+bf_ball_yend:
+    inc     r12d
+    jmp     bf_ball_y
+bf_ball_done:
+
+    ; ---- star: a '+' (rows 7,8 / cols 7,8) plus diagonals where x==y or x==15-y ----
+    lea     rdi, [rip + sprStarF]
+    mov     ecx, 256
+    xor     al, al
+bf_star_clr:
+    mov     [rdi], al
+    inc     rdi
+    dec     ecx
+    jnz     bf_star_clr
+    lea     rdi, [rip + sprStarF]
+    xor     r12d, r12d
+bf_star_y:
+    cmp     r12d, 16
+    jge     bf_star_done
+    xor     r13d, r13d
+bf_star_x:
+    cmp     r13d, 16
+    jge     bf_star_yend
+    ; on if col in {7,8} or row in {7,8} or x==y or x==15-y
+    cmp     r13d, 7
+    je      bf_star_on
+    cmp     r13d, 8
+    je      bf_star_on
+    cmp     r12d, 7
+    je      bf_star_on
+    cmp     r12d, 8
+    je      bf_star_on
+    cmp     r13d, r12d
+    je      bf_star_on
+    mov     eax, 15
+    sub     eax, r12d
+    cmp     r13d, eax
+    je      bf_star_on
+    jmp     bf_star_adv
+bf_star_on:
+    mov     byte ptr [rdi], 2
+bf_star_adv:
+    inc     rdi
+    inc     r13d
+    jmp     bf_star_x
+bf_star_yend:
+    inc     r12d
+    jmp     bf_star_y
+bf_star_done:
+
+    ; ---- arrow: a right-pointing arrow. shaft on rows 6..9, cols 1..9; head a
+    ;      triangle widening towards the tip (col 9..14) -> index 3 ----
+    lea     rdi, [rip + sprArrow]
+    mov     ecx, 256
+    xor     al, al
+bf_ar_clr:
+    mov     [rdi], al
+    inc     rdi
+    dec     ecx
+    jnz     bf_ar_clr
+    lea     rdi, [rip + sprArrow]
+    xor     r12d, r12d
+bf_ar_y:
+    cmp     r12d, 16
+    jge     bf_ar_done
+    xor     r13d, r13d
+bf_ar_x:
+    cmp     r13d, 16
+    jge     bf_ar_yend
+    ; shaft: cols 1..9, rows 6..9
+    cmp     r13d, 1
+    jl      bf_ar_off
+    cmp     r13d, 9
+    jg      bf_ar_head
+    cmp     r12d, 6
+    jl      bf_ar_off
+    cmp     r12d, 9
+    jg      bf_ar_off
+    jmp     bf_ar_on
+bf_ar_head:
+    ; head: for col c in 9..14, the arrow spans rows [c-9 .. 15-(c-9)] roughly.
+    ; half-height = 14 - c (so c=9 -> 5, c=14 -> 0). center row 7.5.
+    cmp     r13d, 14
+    jg      bf_ar_off
+    mov     eax, 14
+    sub     eax, r13d                       ; half = 14 - c
+    ; |2y-15| <= 2*half + 1
+    mov     ebx, r12d
+    add     ebx, ebx
+    sub     ebx, 15
+    mov     ecx, ebx
+    sar     ecx, 31
+    xor     ebx, ecx
+    sub     ebx, ecx                        ; |2y-15|
+    mov     ecx, eax
+    add     ecx, ecx
+    inc     ecx                             ; 2*half+1
+    cmp     ebx, ecx
+    jg      bf_ar_off
+    jmp     bf_ar_on
+bf_ar_on:
+    mov     byte ptr [rdi], 3
+    jmp     bf_ar_adv
+bf_ar_off:
+    mov     byte ptr [rdi], 0
+bf_ar_adv:
+    inc     rdi
+    inc     r13d
+    jmp     bf_ar_x
+bf_ar_yend:
+    inc     r12d
+    jmp     bf_ar_y
+bf_ar_done:
+
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildSpritePalettes — 8 per-sprite palette slots. Each slot's colours 1..3 are
+; the three sprite indices (ball uses 1, star 2, arrow 3) in a distinct hue per
+; slot, so the same frame appears in 8 colours across the swarm. Colour 0 unused.
+; ===========================================================================
+BuildSpritePalettes:
+    push    rbx
+    push    r12
+    push    r13
+
+    xor     r12d, r12d                     ; slot 0..7
+bsp_slot:
+    cmp     r12d, 8
+    jge     bsp_done
+    ; pick a base hue per slot from a small table (0x00RRGGBB).
+    lea     rax, [rip + slotHue]
+    mov     r13d, [rax + r12*4]            ; base rgb for this slot
+
+    ; colour 1 (ball) = the base hue.
+    mov     ecx, r12d
+    mov     edx, 1
+    mov     r8d, r13d
+    call    SprSetPalette
+    ; colour 2 (star) = a brighter tint (OR 0x404040).
+    mov     ecx, r12d
+    mov     edx, 2
+    mov     r8d, r13d
+    or      r8d, 0x00808080
+    call    SprSetPalette
+    ; colour 3 (arrow) = a darker shade (>>1 each channel via AND 0x7F7F7F + shift).
+    mov     ecx, r12d
+    mov     edx, 3
+    mov     eax, r13d
+    shr     eax, 1
+    and     eax, 0x007F7F7F
+    mov     r8d, eax
+    call    SprSetPalette
+
+    inc     r12d
+    jmp     bsp_slot
+bsp_done:
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildBgTiles — the 2 background 8x8 tiles (a star, a brick) for the parallax bg.
+; ===========================================================================
+BuildBgTiles:
+    push    rbx
+    push    rdi
+    push    r12
+    push    r13
+
+    ; star tile: a '+' of index 200 on transparent.
+    lea     rdi, [rip + tileStar8]
+    mov     ecx, 64
+    xor     al, al
+bbt_s_clr:
+    mov     [rdi], al
+    inc     rdi
+    dec     ecx
+    jnz     bbt_s_clr
+    lea     rdi, [rip + tileStar8]
+    xor     r12d, r12d
+bbt_s_y:
+    cmp     r12d, 8
+    jge     bbt_s_done
+    xor     r13d, r13d
+bbt_s_x:
+    cmp     r13d, 8
+    jge     bbt_s_ye
+    cmp     r13d, 3
+    je      bbt_s_on
+    cmp     r13d, 4
+    je      bbt_s_on
+    cmp     r12d, 3
+    je      bbt_s_on
+    cmp     r12d, 4
+    je      bbt_s_on
+    jmp     bbt_s_adv
+bbt_s_on:
+    mov     byte ptr [rdi], 200
+bbt_s_adv:
+    inc     rdi
+    inc     r13d
+    jmp     bbt_s_x
+bbt_s_ye:
+    inc     r12d
+    jmp     bbt_s_y
+bbt_s_done:
+
+    ; brick tile: fill 36, mortar 20 on row 0 / col 0.
+    lea     rdi, [rip + tileBrick8]
+    xor     r12d, r12d
+bbt_b_y:
+    cmp     r12d, 8
+    jge     bbt_b_done
+    xor     r13d, r13d
+bbt_b_x:
+    cmp     r13d, 8
+    jge     bbt_b_ye
+    mov     al, 36
+    test    r12d, r12d
+    jz      bbt_b_m
+    test    r13d, r13d
+    jz      bbt_b_m
+    jmp     bbt_b_put
+bbt_b_m:
+    mov     al, 20
+bbt_b_put:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     bbt_b_x
+bbt_b_ye:
+    inc     r12d
+    jmp     bbt_b_y
+bbt_b_done:
+
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildBgMaps — the 2 background tilemaps.
+;   mapFar (16x45)  : sparse stars (value 1) high up.
+;   mapNear (24x45) : a brick ground band (value 2) on the bottom rows.
+; ===========================================================================
+BuildBgMaps:
+    push    rbx
+    push    rdi
+    push    r12
+    push    r13
+
+    ; mapFar: stars on rows 1..12, where (col+row)%4==0.
+    lea     rdi, [rip + mapFar]
+    xor     r12d, r12d
+bgm_f_y:
+    cmp     r12d, 45
+    jge     bgm_f_done
+    xor     r13d, r13d
+bgm_f_x:
+    cmp     r13d, 16
+    jge     bgm_f_ye
+    mov     al, 0
+    cmp     r12d, 1
+    jl      bgm_f_put
+    cmp     r12d, 12
+    jg      bgm_f_put
+    mov     eax, r13d
+    add     eax, r12d
+    and     eax, 3
+    jnz     bgm_f_zero
+    mov     al, 1
+    jmp     bgm_f_put
+bgm_f_zero:
+    mov     al, 0
+bgm_f_put:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     bgm_f_x
+bgm_f_ye:
+    inc     r12d
+    jmp     bgm_f_y
+bgm_f_done:
+
+    ; mapNear: brick band rows 40..44 (the ground).
+    lea     rdi, [rip + mapNear]
+    xor     r12d, r12d
+bgm_n_y:
+    cmp     r12d, 45
+    jge     bgm_n_done
+    xor     r13d, r13d
+bgm_n_x:
+    cmp     r13d, 24
+    jge     bgm_n_ye
+    mov     al, 0
+    cmp     r12d, 40
+    jl      bgm_n_put
+    mov     al, 2
+bgm_n_put:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     bgm_n_x
+bgm_n_ye:
+    inc     r12d
+    jmp     bgm_n_y
+bgm_n_done:
+
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rbx
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 2                            ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                          ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    ; advance the bg camera + move the swarm, render a frame.
+    mov     eax, [rip + worldCam]
+    add     eax, 4
+    cmp     eax, 23040
+    jl      wp_cam_ok
+    sub     eax, 23040
+wp_cam_ok:
+    mov     [rip + worldCam], eax
+    call    MoveSwarm
+    inc     dword ptr [rip + frameNo]
+    call    Composite
+
+    ; dump the BMP once, at frame 2 (the swarm has moved a touch off its spawn grid).
+    mov     eax, [rip + snapDone]
+    test    eax, eax
+    jnz     wp_timer_done
+    mov     ecx, [rip + frameNo]
+    cmp     ecx, 2
+    jl      wp_timer_done
+    lea     rax, [rip + bmpNameG3]
+    mov     [rip + bmpPathPtr], rax
+    call    GpuSnapshot
+    mov     dword ptr [rip + snapDone], 1
+wp_timer_done:
+    xor     eax, eax
+    ret
+
+.balign 16
+.DATA
+.balign 16
+; clear-to-sky colour for the back buffer (a deep dusk blue, rgba floats).
+skyCol     DWORD 0x3D4CCCCD, 0x3D000000, 0x3E000000, 0x3F800000   ; ~(0.05,0.03,0.125,1)
+
+.balign 16
+; 8 base hues for the sprite palette slots (0x00RRGGBB).
+slotHue:
+    DWORD 0x00FF4040          ; 0 red
+    DWORD 0x0040FF40          ; 1 green
+    DWORD 0x004080FF          ; 2 blue
+    DWORD 0x00FFD040          ; 3 yellow/gold
+    DWORD 0x00FF40FF          ; 4 magenta
+    DWORD 0x0040FFFF          ; 5 cyan
+    DWORD 0x00FF8020          ; 6 orange
+    DWORD 0x00FFFFFF          ; 7 white
