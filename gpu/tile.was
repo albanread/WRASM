@@ -1,0 +1,694 @@
+; gpu/tile.was — GPU Canvas G2 "Tile layers + scroll (parallax / overscan)".
+;
+; Built ON TOP of gpu/canvas.was (G0: device/swapchain, the palette LUT textures
+; pTexGlobal/pTexLine + their SRVs, BuildPalettes, the comobj/.Method idioms, the
+; .ASCIISTRING + D3DCompile path) and gpu/blit.was (G1: the buffer pool, the
+; colour-key blit, the blend states). Include AFTER both. (docs/gpucanvas.md §3,4,5
+; + the G2 sprint.)
+;
+; This MIRRORS library/tile.was authoring semantics on the GPU:
+;
+;   * a tile ATLAS — an R8_UINT texture of indexed tiles (256x256 = 32x32 tiles of
+;     8x8), uploaded once. Tiles are indexed pixels, palette-resolved at present
+;     (exactly like G0's index buffer — the indexed soul stays alive).
+;   * a TILEMAP per layer (CPU-side): a small byte array of tile-ids per cell
+;     (0 = empty, k>=1 = the (k-1)-th tile), like library/tile.was's `map`.
+;   * DrawTiles — stamp the tilemap's tiles (read from the atlas) into a layer's
+;     WORLD index buffer: an R8_UINT byte buffer WIDER than the 640x360 view
+;     (TILE_WORLD_W x 360) so there is room to scroll/wrap. Mirrors library/tile.was
+;     DrawTiles, but it bakes the resolved tile *pixels* into the world buffer once
+;     (the scroll then samples that buffer — the overscan model).
+;   * per-layer SCROLL via a constant buffer (scrollX, scrollY, worldW, worldH): the
+;     TILE shader samples the world index buffer at
+;         (scrollX + uv.x*640) wrapped by worldW , (scrollY + uv.y*360) ,
+;     resolves the index through the palettes (G0). Scrolling = updating two
+;     constants — zero redraw (the overscan model). Horizontal map-wrap = the
+;     modulo-worldW on x (a small world scrolls right forever).
+;   * tile index 0 = TRANSPARENT: the tile PS writes the colour KEY (magenta) for
+;     index-0 pixels, so the G1 colour-key blit discards them when compositing the
+;     layer onto the back buffer — the layers behind show through.
+;
+; Compositing order: the layers are composited BACK-to-FRONT (far layer first,
+; near layer last) with the colour-key blit, so a near layer's transparent (index-0)
+; cells reveal the layers behind it. (The G2 brief says "front-to-back"; the
+; colour-key mechanism reveals whatever is already in the dst, so the correct draw
+; order is back-to-front. Flagged for review.)
+;
+; winkb supplied every D3D11 detail (no hand-counted structs):
+;   D3D11_BIND_SHADER_RESOURCE=8, D3D11_BIND_CONSTANT_BUFFER=4,
+;   DXGI_FORMAT_R8_UINT=62, D3D11_USAGE_DEFAULT=0, D3D11_SRV_DIMENSION_TEXTURE2D=4.
+;   D3D11_BUFFER_DESC{ByteWidth@0,Usage@4,BindFlags@8,CPUAccessFlags@12,
+;     MiscFlags@16,StructureByteStride@20} (24 bytes, winkb skel).
+;   D3D11_TEXTURE2D_DESC / D3D11_SUBRESOURCE_DATA / D3D11_SHADER_RESOURCE_VIEW_DESC
+;     reuse the canvas.was field offsets (same winkb skel).
+;
+; Every .DATA block opens with .balign 16 (trap #8).
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The TILE shader — a scroll/wrap variant of G0's LUT background shader.
+;   VS  — fullscreen triangle from SV_VertexID, forwards a 0..1 uv (identical to G0).
+;   PS  — world coords: wx = (scrollX + uv.x*640) wrapped by worldW (HORIZONTAL
+;         map-wrap); wy = scrollY + uv.y*360 (clamped to worldH). Fetch the WORLD
+;         index (integer .Load, NO sampler). Index 0 = TRANSPARENT -> output the
+;         colour KEY (magenta) so the G1 colour-key blit discards it. Else resolve:
+;         low 16 through the per-line palette at the *screen* scanline (so the sky
+;         gradient stays screen-relative), 16..255 through the global 256 palette.
+;         NOTE: the gpu_g2 demo uses only indices 0 and 16..255 (the back-buffer
+;         clear supplies the sky), so the c<16 per-line path is inherited from G0 for
+;         completeness but is NOT exercised by that demo — give a layer indices 1..15
+;         to drive the per-line gradient sky through this shader.
+; tIdx   : Texture2D<uint>  at t0  (R8_UINT, worldW x 360)
+; palGlobal : Texture2D<float4> at t1 (B8G8R8A8_UNORM, 256x1)
+; palLine   : Texture2D<float4> at t2 (B8G8R8A8_UNORM, 16x360)
+; CB (b0): int4 scr = { scrollX, scrollY, worldW, worldH }
+; ---------------------------------------------------------------------------
+tileSrc:
+.ASCIISTRING
+Texture2D<uint> tIdx:register(t0);
+Texture2D<float4> palGlobal:register(t1);
+Texture2D<float4> palLine:register(t2);
+cbuffer TCB:register(b0){int4 scr;};
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO TVS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float4 TPS(VO v):SV_Target{
+int sx=(int)(v.uv.x*640.0);int sy=(int)(v.uv.y*360.0);
+sx=clamp(sx,0,639);sy=clamp(sy,0,359);
+int ww=scr.z;int wh=scr.w;
+int wx=scr.x+sx;wx=wx%ww;if(wx<0)wx+=ww;
+int wy=scr.y+sy;if(wy<0)wy=0;if(wy>=wh)wy=wh-1;
+uint c=tIdx.Load(int3(wx,wy,0));
+if(c==0u){return float4(1.0,0.0,1.0,1.0);}
+float4 col;
+if(c<16u){col=palLine.Load(int3((int)c,sy,0));}else{col=palGlobal.Load(int3((int)c,0,0));}
+return float4(col.rgb,1.0);}
+.ENDASCIISTRING
+tileEnd:
+    BYTE 0
+
+tvsEntry  BYTE "TVS", 0
+tpsEntry  BYTE "TPS", 0
+tileName  BYTE "gputile", 0
+
+.balign 16
+; ---- world / atlas geometry ----
+; The world index buffer is WIDER than the 640 view so a layer can scroll + wrap.
+; 1024 wide gives 128 tiles of 8px across (a generous horizontal world). The scroll
+; shader does NOT wrap at this buffer width — it wraps at each layer's own map period
+; (layerWrapW[slot] = mapW*8, set by DrawTiles), so the buffer width only needs to be
+; >= the largest map period in use (1024 >= 24*8=192). Wrapping at mapW*8 is what
+; makes the parallax seamless for any map width (see layerWrapW).
+.globl TileWorldW
+.globl TileWorldH
+TileWorldW   DWORD 1024
+TileWorldH   DWORD 360
+
+; tile atlas: 256x256 indexed pixels = 32x32 tiles of 8x8 (ATLAS_COLS x ATLAS_ROWS).
+.globl AtlasW
+.globl AtlasH
+AtlasW       DWORD 256
+AtlasH       DWORD 256
+
+.balign 16
+; ---- tile shader COM objects + scalar state ----
+comobj pVSBlobT : ID3DBlob
+comobj pPSBlobT : ID3DBlob
+comobj pAtlasTex : ID3D11Texture2D        ; the 256x256 R8_UINT atlas (unused as SRV
+                                          ;   at present — DrawTiles reads atlasPix on
+                                          ;   the CPU; kept for a later GPU-side stamp)
+
+pTileVS    QWORD ?
+pTilePS    QWORD ?
+pTileCB    QWORD ?                        ; the scroll constant buffer (b0)
+tileSrcLen QWORD ?
+tmpPtrT    QWORD ?
+tmpSizeT   QWORD ?
+
+; the scroll constant-buffer mirror: int4 { scrollX, scrollY, worldW, worldH }.
+.balign 16
+tileCB DWORD 0, 0, 1024, 360
+
+.balign 16
+; ---- per-layer state (fixed capacity = 4 tile layers) ----
+; Each layer owns: a CPU world index buffer (1024x360 = 368640 bytes), a GPU
+; R8_UINT world texture + its SRV, a CPU tilemap (mapW x mapH bytes), and scroll
+; params. A layer is "DrawTiles"d into its world buffer (once / on a tile-bump),
+; then the tile shader samples that texture each frame at the scroll offset.
+; (fixed capacity = 4 tile layer slots.)
+
+; world index textures + SRVs, one per layer slot.
+layerWorldTex QWORD 4 dup(0)              ; ID3D11Texture2D* (R8_UINT 1024x360)
+layerWorldSRV QWORD 4 dup(0)             ; ID3D11ShaderResourceView*
+; the layer RTs (RGBA 640x360) the tile pass renders into — these are G1 pool
+; LAYER handles, allocated by the driver and passed to TileRenderLayer.
+
+.balign 16
+; per-layer CPU world index buffers (1024x360 each). One byte = one resolved tile
+; pixel (an fb index); index 0 = empty/transparent.
+; (each world buffer is 1024*360 = 368640 bytes.)
+layerWorld0 BYTE 368640 dup(0)
+.balign 16
+layerWorld1 BYTE 368640 dup(0)
+.balign 16
+layerWorld2 BYTE 368640 dup(0)
+.balign 16
+layerWorld3 BYTE 368640 dup(0)
+
+.balign 16
+; small lookup of the 4 world-buffer base pointers (filled in TileInit).
+layerWorldPtr QWORD 0, 0, 0, 0
+
+.balign 16
+; per-layer horizontal WRAP WIDTH in pixels (set by DrawTiles = mapW*8). The scroll
+; shader must wrap each layer's sample at its OWN map period, NOT the shared world
+; buffer width — otherwise a map whose pixel-period (mapW*8) does not divide the
+; world buffer width shows a phase JUMP at the x=worldW seam (mid mapW=20 -> 160px,
+; near mapW=24 -> 192px both fail to divide 1024). Wrapping at mapW*8 makes every
+; layer seamless for ANY map width, matching library/tile.was's live source wrap.
+; Defaults to TileWorldW (1024) until a layer is DrawTiles'd.
+layerWrapW    DWORD 1024, 1024, 1024, 1024
+
+.balign 16
+; the tile atlas — 256x256 indexed pixels, one byte per pixel. AddTile writes an
+; 8x8 tile into the cell for its tile-id; DrawTiles reads tiles back out of here.
+.globl atlasPix
+atlasPix    BYTE 65536 dup(0)             ; 256*256
+
+; how many tiles have been added (for AddTile's cursor).
+atlasCount  DWORD 0
+
+.balign 16
+; ---- descriptors --------------------------------------------------------
+; world index texture: 1024x360, R8_UINT, DEFAULT, BIND_SHADER_RESOURCE.
+tdWorld struct D3D11_TEXTURE2D_DESC
+    Width            = 1024
+    Height           = 360
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 62                 ; DXGI_FORMAT_R8_UINT
+    SampleDesc.Count = 1
+    Usage            = 0                  ; D3D11_USAGE_DEFAULT
+    BindFlags        = 8                 ; D3D11_BIND_SHADER_RESOURCE
+ends
+
+; atlas index texture: 256x256, R8_UINT (kept for a future GPU-side stamp).
+tdAtlas struct D3D11_TEXTURE2D_DESC
+    Width            = 256
+    Height           = 256
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 62
+    SampleDesc.Count = 1
+    Usage            = 0
+    BindFlags        = 8
+ends
+
+; SRV for an R8_UINT world / atlas texture (TEXTURE2D, MipLevels patched to 1).
+srvWorld struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 62                    ; R8_UINT
+    ViewDimension = 4                     ; D3D11_SRV_DIMENSION_TEXTURE2D
+ends
+srvAtlas struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 62
+    ViewDimension = 4
+ends
+
+; subresource upload for a world buffer (pSysMem patched; pitch = 1024 for R8).
+sdWorld struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 1024
+ends
+sdAtlas struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 256
+ends
+
+; the scroll constant buffer descriptor (16 bytes = int4, BIND_CONSTANT_BUFFER).
+tcbDesc struct D3D11_BUFFER_DESC
+    ByteWidth = 16
+    Usage     = 0                         ; D3D11_USAGE_DEFAULT
+    BindFlags = 4                         ; D3D11_BIND_CONSTANT_BUFFER
+ends
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; TileInit — compile the tile VS/PS, create the scroll constant buffer, create
+; the 4 per-layer world index textures + their SRVs, create the atlas texture.
+; Returns 0 on success in eax; on D3D failure exits with a small code (like G0/G1).
+; Call AFTER GpuInit + BlitInit (needs pDevice + the pool live).
+; ===========================================================================
+.globl TileInit
+TileInit:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    sub     rsp, 40
+
+    ; SRV anonymous-union MipLevels patch (+12), like G0/G1 (MipLevels=0 fails).
+    mov     dword ptr [rip + srvWorld + 12], 1
+    mov     dword ptr [rip + srvAtlas + 12], 1
+
+    ; fill the world-buffer base-pointer lookup.
+    lea     rax, [rip + layerWorld0]
+    mov     [rip + layerWorldPtr + 0], rax
+    lea     rax, [rip + layerWorld1]
+    mov     [rip + layerWorldPtr + 8], rax
+    lea     rax, [rip + layerWorld2]
+    mov     [rip + layerWorldPtr + 16], rax
+    lea     rax, [rip + layerWorld3]
+    mov     [rip + layerWorldPtr + 24], rax
+
+    ; ---- compile the tile VS/PS ----
+    lea     rax, [rip + tileEnd]
+    lea     rcx, [rip + tileSrc]
+    sub     rax, rcx
+    mov     [rip + tileSrcLen], rax
+    invoke  D3DCompile, tileSrc, [rip + tileSrcLen], tileName, 0, 0, tvsEntry, vsTarget, 0, 0, pVSBlobT, pErrBlob
+    test    eax, eax
+    js      ti_fail_compile
+    invoke  D3DCompile, tileSrc, [rip + tileSrcLen], tileName, 0, 0, tpsEntry, psTarget, 0, 0, pPSBlobT, pErrBlob
+    test    eax, eax
+    js      ti_fail_compile
+
+    pVSBlobT.GetBufferPointer()
+    mov     [rip + tmpPtrT], rax
+    pVSBlobT.GetBufferSize()
+    mov     [rip + tmpSizeT], rax
+    pDevice.CreateVertexShader([rip + tmpPtrT], [rip + tmpSizeT], 0, pTileVS)
+    test    eax, eax
+    js      ti_fail_d3d
+    pPSBlobT.GetBufferPointer()
+    mov     [rip + tmpPtrT], rax
+    pPSBlobT.GetBufferSize()
+    mov     [rip + tmpSizeT], rax
+    pDevice.CreatePixelShader([rip + tmpPtrT], [rip + tmpSizeT], 0, pTilePS)
+    test    eax, eax
+    js      ti_fail_d3d
+
+    ; ---- the scroll constant buffer (16 bytes, seeded from tileCB) ----
+    lea     rax, [rip + tileCB]
+    mov     [rip + tcbInit + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateBuffer(tcbDesc, tcbInit, pTileCB)
+    test    eax, eax
+    js      ti_fail_d3d
+
+    ; ---- the atlas texture (created from atlasPix; SRV optional, kept for later) ----
+    lea     rax, [rip + atlasPix]
+    mov     [rip + sdAtlas + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdAtlas, sdAtlas, pAtlasTex)
+    test    eax, eax
+    js      ti_fail_d3d
+
+    ; ---- the 4 per-layer world index textures + SRVs ----
+    xor     r12d, r12d                    ; slot 0..3
+ti_world_loop:
+    cmp     r12d, 4
+    jge     ti_world_done
+    ; pSysMem = layerWorldPtr[slot]
+    lea     rax, [rip + layerWorldPtr]
+    mov     rax, [rax + r12*8]
+    mov     [rip + sdWorld + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdWorld, sdWorld, tileTexTmp)
+    test    eax, eax
+    js      ti_fail_d3d
+    mov     rax, [rip + tileTexTmp]
+    lea     rdi, [rip + layerWorldTex]
+    mov     [rdi + r12*8], rax
+    pDevice.CreateShaderResourceView([rip + tileTexTmp], srvWorld, tileSRVTmp)
+    test    eax, eax
+    js      ti_fail_d3d
+    mov     rax, [rip + tileSRVTmp]
+    lea     rdi, [rip + layerWorldSRV]
+    mov     [rdi + r12*8], rax
+    inc     r12d
+    jmp     ti_world_loop
+ti_world_done:
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+ti_fail_compile:
+    invoke  ExitProcess, 25
+ti_fail_d3d:
+    invoke  ExitProcess, 23
+
+; ===========================================================================
+; AddTile(rcx=src) — append one 8x8 tile to the atlas. `src` points at 64 bytes
+; (8 rows of 8 indexed pixels, row-major). Tiles are packed into the 32x32 atlas
+; grid left-to-right, top-to-bottom in add order. Returns the new tile-id (0-based)
+; in eax. Mirrors library/tile.was AddTile (append, shared size).
+;   atlas cell (tx,ty) occupies atlasPix[(ty*8+r)*256 + tx*8 + c].
+; ===========================================================================
+.globl AddTile
+AddTile:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    mov     rsi, rcx                      ; src 8x8
+    mov     r12d, [rip + atlasCount]      ; tile-id
+    ; atlas grid is 32 cols: tx = id & 31 ; ty = id >> 5
+    mov     r13d, r12d
+    and     r13d, 31                      ; tx
+    mov     r14d, r12d
+    shr     r14d, 5                       ; ty
+    ; base = (ty*8)*256 + tx*8
+    mov     eax, r14d
+    shl     eax, 3                        ; ty*8 (pixel row)
+    imul    eax, [rip + AtlasW]           ; * atlas row stride (AtlasW)
+    mov     ebx, r13d
+    shl     ebx, 3                        ; tx*8 (pixel col)
+    add     eax, ebx
+    lea     rdi, [rip + atlasPix]
+    add     rdi, rax                      ; dst = top-left of the cell
+    xor     r15d, r15d                    ; row 0..7
+at2_row:
+    cmp     r15d, 8
+    jge     at2_done
+    ; copy 8 bytes: dst + row*256  <- src + row*8
+    mov     rbp, rdi
+    mov     eax, r15d
+    imul    eax, [rip + AtlasW]           ; * atlas row stride
+    add     rbp, rax                      ; dst row
+    mov     rcx, rsi
+    mov     eax, r15d
+    shl     eax, 3
+    add     rcx, rax                      ; src row
+    mov     rax, [rcx]                    ; 8 bytes in one move
+    mov     [rbp], rax
+    inc     r15d
+    jmp     at2_row
+at2_done:
+    inc     r12d
+    mov     [rip + atlasCount], r12d
+    mov     eax, [rip + atlasCount]
+    dec     eax                           ; return the id we just wrote
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; DrawTiles(rcx=slot, rdx=mapPtr, r8d=mapW, r9d=mapH) — stamp a tilemap into the
+; layer `slot`'s WORLD index buffer (1024x360). For each map cell (mx,my) with
+; value k>=1, copy tile (k-1)'s 8x8 indexed pixels from the atlas into the world
+; buffer at (mx*8, my*8). Cell value 0 leaves index 0 (transparent). The map tiles
+; the world: mx ranges 0..(worldW/8 - 1), wrapping the source map by mapW so a
+; small map fills the wide world (the horizontal map-wrap source, baked once here;
+; the live wrap then happens in the scroll shader). Mirrors library/tile.was
+; DrawTiles, but bakes resolved pixels (overscan) rather than redrawing per frame.
+;
+; Records the layer's wrap width = mapW*8 in layerWrapW[slot] so the scroll shader
+; wraps THIS layer at its own map period (seamless for any mapW), not the shared
+; world width. Empty cells (map value 0) are CLEARED to 0 so a re-bake (a tile bump
+; with a different/scrolled map) does not leave stale pixels from a prior bake.
+; Dst row stride is keyed off TileWorldW (the single source of truth for the world
+; width); the atlas stride off AtlasW.
+; ===========================================================================
+.globl DrawTiles
+DrawTiles:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+    sub     rsp, 72                       ; locals: see offsets below
+
+    ; locals on the stack (rsp-relative):
+    ;   [rsp+0]  mapPtr      [rsp+8]  mapW       [rsp+16] mapH
+    ;   [rsp+24] worldDst    [rsp+32] worldCols  [rsp+40] worldRows
+    mov     [rsp + 0], rdx                ; mapPtr
+    mov     [rsp + 8], r8                 ; mapW (qword, low 32 used)
+    mov     [rsp + 16], r9                ; mapH
+
+    ; record this layer's wrap width = mapW*8 (px) for the scroll shader's per-layer
+    ; modulo. layerWrapW[slot] = r8d << 3.
+    mov     eax, r8d
+    shl     eax, 3
+    lea     rbx, [rip + layerWrapW]
+    mov     [rbx + rcx*4], eax
+
+    ; world dst base = layerWorldPtr[slot]
+    lea     rax, [rip + layerWorldPtr]
+    mov     rax, [rax + rcx*8]
+    mov     [rsp + 24], rax
+
+    ; worldCols = worldW/8, worldRows = worldH/8
+    mov     eax, [rip + TileWorldW]
+    shr     eax, 3
+    mov     [rsp + 32], eax               ; worldCols (128)
+    mov     eax, [rip + TileWorldH]
+    shr     eax, 3
+    mov     [rsp + 40], eax               ; worldRows (45)
+
+    ; loop wy = 0 .. worldRows-1
+    xor     r12d, r12d                    ; wy (world tile row)
+dt2_yrow:
+    mov     eax, [rsp + 40]
+    cmp     r12d, eax
+    jge     dt2_done
+    ; my = wy mod mapH (vertical wrap too, so a short map tiles down the world)
+    mov     eax, r12d
+    xor     edx, edx
+    div     dword ptr [rsp + 16]          ; edx = wy mod mapH
+    mov     r13d, edx                     ; my
+    xor     r14d, r14d                    ; wx (world tile col)
+dt2_xcol:
+    mov     eax, [rsp + 32]
+    cmp     r14d, eax
+    jge     dt2_xend
+    ; mx = wx mod mapW (HORIZONTAL map-wrap, baked into the world buffer)
+    mov     eax, r14d
+    xor     edx, edx
+    div     dword ptr [rsp + 8]           ; edx = wx mod mapW
+    mov     r15d, edx                     ; mx
+    ; cell = mapPtr[my*mapW + mx]
+    mov     eax, r13d
+    imul    eax, [rsp + 8]
+    add     eax, r15d
+    mov     rcx, [rsp + 0]
+    movzx   ebp, byte ptr [rcx + rax]     ; cell value k
+
+    ; ---- dst top-left = (wy*8)*TileWorldW + wx*8  (stride keyed off TileWorldW,
+    ;       the single source of truth — loop bounds came from the same global). ----
+    mov     eax, r12d
+    shl     eax, 3                        ; wy*8
+    imul    eax, [rip + TileWorldW]       ; * world row stride
+    mov     ebx, r14d
+    shl     ebx, 3                        ; wx*8
+    add     eax, ebx
+    mov     rdi, [rsp + 24]
+    add     rdi, rax                      ; dst top-left
+
+    test    ebp, ebp
+    jz      dt2_clear                     ; 0 = empty -> clear the cell to 0 (re-bake safe)
+    dec     ebp                           ; tile-id = k-1
+    ; guard tile-id < atlasCount; out-of-range tile -> clear the cell instead of stamp
+    cmp     ebp, [rip + atlasCount]
+    jae     dt2_clear
+    ; ---- stamp tile ebp's 8x8 from the atlas into world at (wx*8, wy*8) ----
+    ; atlas src base: tx=id&31, ty=id>>5 ; srcBase = (ty*8)*AtlasW + tx*8
+    mov     eax, ebp
+    and     eax, 31
+    shl     eax, 3                        ; tx*8
+    mov     ebx, eax
+    mov     eax, ebp
+    shr     eax, 5
+    shl     eax, 3                        ; ty*8 (row)
+    imul    eax, [rip + AtlasW]           ; * atlas row stride
+    add     eax, ebx                      ; atlas offset
+    lea     rsi, [rip + atlasPix]
+    add     rsi, rax                      ; src top-left
+    ; copy 8 rows of 8 bytes (src stride AtlasW, dst stride TileWorldW)
+    xor     ecx, ecx                      ; r (0..7)
+dt2_trow:
+    cmp     ecx, 8
+    jge     dt2_xadv
+    mov     r8, rsi
+    mov     eax, ecx
+    imul    eax, [rip + AtlasW]
+    add     r8, rax                       ; src row
+    mov     r9, rdi
+    mov     eax, ecx
+    imul    eax, [rip + TileWorldW]       ; r*worldStride
+    add     r9, rax                       ; dst row
+    mov     rax, [r8]                     ; 8 bytes
+    mov     [r9], rax
+    inc     ecx
+    jmp     dt2_trow
+    ; ---- empty / out-of-range: clear the 8x8 cell to index 0 (re-bake safe) ----
+dt2_clear:
+    xor     ecx, ecx                      ; r (0..7)
+dt2_crow:
+    cmp     ecx, 8
+    jge     dt2_xadv
+    mov     r9, rdi
+    mov     eax, ecx
+    imul    eax, [rip + TileWorldW]
+    add     r9, rax                       ; dst row
+    xor     rax, rax
+    mov     [r9], rax                     ; 8 zero bytes
+    inc     ecx
+    jmp     dt2_crow
+dt2_xadv:
+    inc     r14d
+    jmp     dt2_xcol
+dt2_xend:
+    inc     r12d
+    jmp     dt2_yrow
+dt2_done:
+    add     rsp, 72
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; TileUpload(rcx=slot) — push the layer `slot`'s CPU world buffer to its GPU
+; R8_UINT world texture (UpdateSubresource, full subresource, srcRowPitch=1024).
+; Call after DrawTiles (a "tile bump" / one-time bake); the per-frame scroll then
+; just samples the texture, no re-upload needed.
+; ===========================================================================
+.globl TileUpload
+TileUpload:
+    push    rbx
+    push    rsi
+    sub     rsp, 40
+    mov     ebx, ecx                      ; slot
+    ; tex = layerWorldTex[slot]
+    lea     rax, [rip + layerWorldTex]
+    mov     rax, [rax + rbx*8]
+    mov     [rip + tileTexTmp], rax
+    ; src = layerWorldPtr[slot]
+    lea     rax, [rip + layerWorldPtr]
+    mov     rsi, [rax + rbx*8]
+    mov     [rip + tileSrcPtr], rsi
+    ; UpdateSubresource(tex, 0, NULL, src, 1024, 0)
+    pContext.UpdateSubresource([rip + tileTexTmp], 0, 0, [rip + tileSrcPtr], 1024, 0)
+    add     rsp, 40
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; TileSetScroll(rcx=slot, edx=scrollX, r8d=scrollY) — update the scroll constants
+; for the upcoming TileRenderLayer of `slot`. worldW = layerWrapW[slot] (the layer's
+; map period, mapW*8), worldH from the global. Scrolling = just calling this each
+; frame; zero redraw (the overscan model). The per-layer worldW makes the horizontal
+; wrap land exactly on the map period, so the scroll is seamless for any map width.
+; (slot is accepted for API symmetry; the scroll CB is shared and re-uploaded per
+;  layer render, so the slot only matters via which world SRV is bound.)
+; ===========================================================================
+.globl TileSetScroll
+TileSetScroll:
+    mov     [rip + tileCB + 0], edx       ; scrollX
+    mov     [rip + tileCB + 4], r8d       ; scrollY
+    ; worldW (scr.z) = THIS layer's wrap width (mapW*8), so the shader wraps on the
+    ; map period — seamless for any mapW, not just widths that divide the buffer.
+    lea     rax, [rip + layerWrapW]
+    mov     eax, [rax + rcx*4]
+    mov     [rip + tileCB + 8], eax       ; worldW = layerWrapW[slot]
+    mov     eax, [rip + TileWorldH]
+    mov     [rip + tileCB + 12], eax      ; worldH
+    ret
+
+; ===========================================================================
+; TileRenderLayer(rcx=slot, rdx=dstRTV) — render layer `slot`'s tiles+scroll into
+; the RGBA layer render target dstRTV (a G1 pool LAYER RTV). Binds the world SRV
+; (t0) + the G0 palette SRVs (t1,t2), uploads the scroll CB (from tileCB, set via
+; TileSetScroll), runs the fullscreen tile pass. Index-0 pixels come out as the
+; magenta key, ready for the colour-key composite.
+; The viewport is set to the 640x360 layer viewport (vpLayer, from blit.was).
+; ===========================================================================
+.globl TileRenderLayer
+TileRenderLayer:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     ebx, ecx                      ; slot
+    mov     rdi, rdx                      ; dstRTV
+
+    ; bind the dst RT FIRST (unbinds any prior RT so its texture is safe to sample)
+    mov     [rip + tileRTVTmp], rdi
+    pContext.OMSetRenderTargets(1, tileRTVTmp, 0)
+    pContext.RSSetViewports(1, vpLayer)
+    ; clear to the colour KEY (magenta) so any pixel the tile pass does not cover
+    ; is also keyed-out (the layer is fully redrawn anyway, but this is tidy).
+    pContext.ClearRenderTargetView([rip + tileRTVTmp], keyClear)
+
+    ; ---- build the SRV array t0=world[slot], t1=palGlobal, t2=palLine ----
+    lea     rax, [rip + layerWorldSRV]
+    mov     rax, [rax + rbx*8]
+    mov     [rip + tileSrvArr + 0], rax
+    mov     rax, [rip + pSRVglobal]
+    mov     [rip + tileSrvArr + 8], rax
+    mov     rax, [rip + pSRVline]
+    mov     [rip + tileSrvArr + 16], rax
+    pContext.PSSetShaderResources(0, 3, tileSrvArr)
+
+    ; ---- upload the scroll CB + bind it at b0 ----
+    pContext.UpdateSubresource([rip + pTileCB], 0, 0, tileCB, 0, 0)
+    mov     rax, [rip + pTileCB]
+    mov     [rip + tileCBArr], rax
+    pContext.PSSetConstantBuffers(0, 1, tileCBArr)
+
+    ; ---- shaders + raster + no blend (opaque write into the layer RT) ----
+    pContext.VSSetShader([rip + pTileVS], 0, 0)
+    pContext.PSSetShader([rip + pTilePS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+    pContext.OMSetBlendState([rip + pBlendOpaque], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(4)    ; TRIANGLELIST
+    pContext.Draw(3, 0)
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+; scratch + per-call cells
+tileTexTmp QWORD ?
+tileSRVTmp QWORD ?
+tileSrcPtr QWORD ?
+tileRTVTmp QWORD ?
+tileSrvArr QWORD 0, 0, 0                   ; the 3 SRV pointers (t0,t1,t2)
+tileCBArr  QWORD 0                         ; single-element CB array for PSSetConstantBuffers
+
+; clear-to-key colour (magenta rgba = 1,0,1,1) for the tile layer RT.
+keyClear   DWORD 0x3F800000, 0, 0x3F800000, 0x3F800000
+
+; init subresource for the scroll constant buffer (pSysMem patched in TileInit).
+tcbInit struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch      = 0
+    SysMemSlicePitch = 0
+ends
