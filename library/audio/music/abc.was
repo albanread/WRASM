@@ -1,0 +1,886 @@
+; ============================================================================
+; abc.was — ABC-notation music parser CORE (offline, hand-written x86-64, WRASM)
+; ============================================================================
+; Reuse:  .include "../library/audio/music/abc.was"   (path relative to YOUR file)
+;
+; Parses ABC text into a flat, time-sorted array of MIDI events (the `Tune`),
+; then dumps the events as raw 20-byte records to a binary file you verify
+; offline (the music-side `WriteWav`).  No synthesis here — just the parse +
+; the timing model + the finalization sort.  Single-pass, char-by-char.
+;
+;   ParseTune(rcx = asciiz textPtr)   parse ABC -> tuneEv / tuneCount / tuneEndMs
+;   WriteTune(rcx = pathPtrW)         dump tuneCount * 20-byte records to a file
+;
+; MidiEvent (20 bytes):  timeMs u32 | status u32 | chan u32 | d1 u32 | d2 u32
+;   offsets:             +0           +4           +8         +12      +16
+; status: NoteOn 0x90 (vel 80), NoteOff 0x80 (vel 0); chan 0.
+;
+; Timing (drift-free): curMs carried as f64; only emitted u32 stamps rounded.
+;   msPerWhole = tsDen * 60000 / bpm
+;   durWholes  = (N/M) * (unitN/unitD)
+;   NoteOn  @ round(curMs);  NoteOff @ round(curMs + durWholes*msPerWhole)
+;   curMs  += durWholes*msPerWhole          (round(x) = floor(x+0.5))
+;
+; --- CURSOR CONVENTION ---
+; The single-pass text cursor lives in the `.DATA` global `txtPtr` (a char*), NOT
+; in a register.  Cursor-advancing helpers (ParseUInt, ParseKey, ParseDuration,
+; ParseNote, SkipSpaces) read it into a local register, advance, and write it
+; back.  This keeps the WRASM contract checker happy — no callee-saved register is
+; abused as a shared mutable cursor — while the advance is plainly visible.
+;
+; --- CORE grammar handled ---
+;   Header (before K:):  M: meter, L: default note length, Q: tempo bpm
+;                        (accepts "120" or "1/4=120" -> takes the number), K: key.
+;   K: ends the header.  Keys: C G D A E B F#  and  F Bb Eb Ab Db Gb  (root letter
+;     + one optional #/b), via the circle of fifths.  Sets per-pitch-class default
+;     accidentals from the key sig.
+;   Notes: accidentals ^ ^^ _ __ = ; letters A-G (oct 4) / a-g (oct 5);
+;     octave marks ' (+12) , (-12), stackable.  MIDI octave: C4 = 60
+;     (midi = (oct+1)*12 + semitone), so an uppercase 'C' -> 60.
+;   Durations rel. to L: bare N -> xN ; / -> /2 ; /M -> /M ; N/M -> xN/M.
+;   Rests z/Z (advance curMs, emit nothing).  Bar line | resets bar accidentals.
+;   Spaces/newlines separate; unknown chars ignored gracefully.
+;
+; --- DEFERRED (no-ops / skipped, NOT implemented) ---
+;   repeats |: :| , ties - , tuplets (p , chords [...] , broken rhythm > < ,
+;   inline fields [K:..] , multi-voice V: , grace {} , %%MIDI , % comments ,
+;   trailing duration dots, minor/mode key qualifiers (only the root letter +
+;   one optional #/b is read for the key signature).
+; ============================================================================
+
+.DATA
+
+; ---- the Tune event array ----
+; 4096 events * 20 bytes = 81920 bytes.  Record: timeMs|status|chan|d1|d2 (u32).
+; NOTE: the dup count must be a literal — the assembler does not fold `4096*20`.
+tuneEv    BYTE 81920 dup(0)
+tuneCount DWORD ?                     ; number of events emitted
+tuneEndMs DWORD ?                     ; max timeMs after finalize
+tuneBpm   DWORD ?                     ; effective bpm used
+
+; ---- working parse state (globals; reset at the top of ParseTune) ----
+txtPtr    QWORD ?                     ; the single-pass text cursor (char*)
+curMs     real8 0.0                   ; running cursor in ms (carried as f64)
+bpmVal    DWORD ?                     ; tempo, beats per minute
+unitN     DWORD ?                     ; default note length numerator   (L:)
+unitD     DWORD ?                     ; default note length denominator
+tsN       DWORD ?                     ; meter numerator    (M:)
+tsD       DWORD ?                     ; meter denominator
+inBody    DWORD ?                     ; 0 = header, 1 = body (set by K:)
+
+; Per-pitch-class state, indexed 0..6 for letters C D E F G A B.
+keyAcc    DWORD 7 dup(0)              ; default accidental from the key signature
+barAcc    DWORD 7 dup(0)             ; current bar accidental override (-2..+2)
+barSet    DWORD 7 dup(0)             ; 1 if an explicit accidental active this bar
+
+; semitone offset within an octave for pitch classes C D E F G A B (0..6)
+semitab   DWORD 0, 2, 4, 5, 7, 9, 11
+
+; pitch-class application order for sharps / flats (C=0 D=1 E=2 F=3 G=4 A=5 B=6)
+sharpOrd  BYTE 3, 0, 4, 1, 5, 2, 6    ; F C G D A E B
+flatOrd   BYTE 6, 2, 5, 1, 4, 0, 3    ; B E A D G C F
+
+; base circle-of-fifths position per letter A..G (major); index = letter - 'A'.
+;   A=3 B=5 C=0 D=2 E=4 F=-1 G=1
+keyFifths BYTE 3, 5, 0, 2, 4, -1, 1
+
+; ---- f64 constants ----
+fHalf     real8 0.5
+f60000    real8 60000.0
+fZero     real8 0.0
+
+; ---- finalize / file-write scratch ----
+ftTemp    BYTE 20 dup(0)             ; scratch record for insertion sort
+twWrote   DWORD ?                     ; bytes-written sink for WriteFile
+twBytes   DWORD ?                     ; byteCount (via memory: invoke clobbers eax)
+
+.CODE
+
+; ----------------------------------------------------------------------------
+; ApplyKey(ecx = sharps): seed keyAcc[0..6] from a key signature.
+;   sharps > 0 -> that many sharps in order F C G D A E B
+;   sharps < 0 -> that many flats  in order B E A D G C F
+; Pitch-class index map (C=0 D=1 E=2 F=3 G=4 A=5 B=6).  No calls -> no frame.
+; ----------------------------------------------------------------------------
+proc ApplyKey in rcx
+    lea     r9, [rip + keyAcc]
+    xor     eax, eax
+    mov     [r9 + 0], eax
+    mov     [r9 + 4], eax
+    mov     [r9 + 8], eax
+    mov     [r9 + 12], eax
+    mov     [r9 + 16], eax
+    mov     [r9 + 20], eax
+    mov     [r9 + 24], eax
+
+    mov     edx, ecx                  ; edx = signed sharp count
+    test    edx, edx
+    jz      ak_done
+    jl      ak_flats
+
+    ; --- sharps in order F C G D A E B ---
+    lea     r10, [rip + sharpOrd]
+    mov     ecx, edx
+    cmp     ecx, 7
+    jbe     ak_s_ok
+    mov     ecx, 7
+ak_s_ok:
+    xor     r8d, r8d
+ak_s_loop:
+    movsx   rax, byte ptr [r10 + r8]
+    mov     dword ptr [r9 + rax*4], 1
+    inc     r8d
+    cmp     r8d, ecx
+    jb      ak_s_loop
+    jmp     ak_done
+
+ak_flats:
+    neg     edx
+    lea     r10, [rip + flatOrd]
+    mov     ecx, edx
+    cmp     ecx, 7
+    jbe     ak_f_ok
+    mov     ecx, 7
+ak_f_ok:
+    xor     r8d, r8d
+ak_f_loop:
+    movsx   rax, byte ptr [r10 + r8]
+    mov     dword ptr [r9 + rax*4], -1
+    inc     r8d
+    cmp     r8d, ecx
+    jb      ak_f_loop
+ak_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; ResetBar: clear the per-bar accidental override tables (barAcc/barSet).
+; ----------------------------------------------------------------------------
+proc ResetBar
+    lea     r9, [rip + barAcc]
+    lea     r10, [rip + barSet]
+    xor     eax, eax
+    mov     ecx, 7
+rb_loop:
+    mov     [r9], eax
+    mov     [r10], eax
+    add     r9, 4
+    add     r10, 4
+    dec     ecx
+    jnz     rb_loop
+endproc
+
+; ----------------------------------------------------------------------------
+; EmitEvent(ecx = timeMs, edx = status, r8d = d1 note, r9d = d2 vel):
+;   append a MidiEvent (chan 0) to tuneEv; bumps tuneCount (capped at 4096).
+; ----------------------------------------------------------------------------
+proc EmitEvent in rcx rdx r8 r9
+    mov     eax, [rip + tuneCount]
+    cmp     eax, 4096
+    jae     ee_done
+    imul    r10d, eax, 20
+    lea     r11, [rip + tuneEv]
+    add     r11, r10
+    mov     [r11 + 0], ecx            ; timeMs
+    mov     [r11 + 4], edx            ; status
+    mov     dword ptr [r11 + 8], 0    ; chan
+    mov     [r11 + 12], r8d           ; d1
+    mov     [r11 + 16], r9d           ; d2
+    inc     eax
+    mov     [rip + tuneCount], eax
+ee_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; SkipSpaces: advance txtPtr past spaces/tabs.  No calls.
+; ----------------------------------------------------------------------------
+proc SkipSpaces uses rsi
+    mov     rsi, [rip + txtPtr]
+ss_loop:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, ' '
+    je      ss_next
+    cmp     al, 9
+    je      ss_next
+    mov     [rip + txtPtr], rsi
+    ret
+ss_next:
+    inc     rsi
+    jmp     ss_loop
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseUInt -> eax = parsed non-negative integer; advances txtPtr past digits.
+; If no digits, returns 0 and leaves txtPtr unmoved.  No calls.
+; ----------------------------------------------------------------------------
+proc ParseUInt uses rsi
+    mov     rsi, [rip + txtPtr]
+    xor     eax, eax
+pu_loop:
+    movzx   ecx, byte ptr [rsi]
+    cmp     cl, '0'
+    jb      pu_done
+    cmp     cl, '9'
+    ja      pu_done
+    imul    eax, eax, 10
+    sub     ecx, '0'
+    add     eax, ecx
+    inc     rsi
+    jmp     pu_loop
+pu_done:
+    mov     [rip + txtPtr], rsi
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseKey: read a key from txtPtr (e.g. "C","G","F","Bb","F#"); compute signed
+; sharp count via circle of fifths and call ApplyKey.  Only the root letter +
+; one optional #/b is honoured (mode/minor DEFERRED).  Calls -> frame.
+; ----------------------------------------------------------------------------
+proc ParseKey uses rsi rbx frame
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    ; uppercase the letter
+    cmp     al, 'a'
+    jb      pk_haveU
+    cmp     al, 'z'
+    ja      pk_haveU
+    sub     al, 32
+pk_haveU:
+    cmp     al, 'A'
+    jb      pk_default
+    cmp     al, 'G'
+    ja      pk_default
+
+    movzx   ecx, al
+    sub     ecx, 'A'                  ; letter index 0..6 (A..G)
+    lea     r9, [rip + keyFifths]
+    movsx   ebx, byte ptr [r9 + rcx]  ; base fifths (signed)
+    inc     rsi                       ; consume root letter
+
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '#'
+    je      pk_sharp
+    cmp     al, 'b'
+    je      pk_flat
+    jmp     pk_apply
+pk_sharp:
+    add     ebx, 7
+    inc     rsi
+    jmp     pk_apply
+pk_flat:
+    sub     ebx, 7
+    inc     rsi
+pk_apply:
+    mov     [rip + txtPtr], rsi
+    mov     ecx, ebx
+    call    ApplyKey
+    ret
+
+pk_default:
+    mov     [rip + txtPtr], rsi
+    xor     ecx, ecx
+    call    ApplyKey
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseDuration -> xmm0 = whole-note duration = (N/M)*(unitN/unitD).
+; Consumes an optional duration suffix at txtPtr: bare N, /, /M, N/M, //.
+; Calls ParseUInt -> frame.
+; ----------------------------------------------------------------------------
+proc ParseDuration uses rsi frame
+    mov     r10d, 1                   ; num
+    mov     r11d, 1                   ; den
+    mov     rsi, [rip + txtPtr]
+
+    ; leading number?
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '0'
+    jb      pd_no_lead
+    cmp     al, '9'
+    ja      pd_no_lead
+    call    ParseUInt                 ; eax = N, txtPtr advanced
+    test    eax, eax
+    jz      pd_after_lead
+    mov     r10d, eax
+pd_after_lead:
+    mov     rsi, [rip + txtPtr]
+pd_no_lead:
+    ; slash?
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '/'
+    jne     pd_compute
+    inc     rsi                       ; consume '/'
+    mov     [rip + txtPtr], rsi
+    mov     r11d, 2                   ; first slash -> /2 baseline
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '0'
+    jb      pd_more_slash
+    cmp     al, '9'
+    ja      pd_more_slash
+    call    ParseUInt                 ; eax = M
+    test    eax, eax
+    jz      pd_compute
+    mov     r11d, eax
+    jmp     pd_compute
+pd_more_slash:
+    mov     rsi, [rip + txtPtr]
+pd_more_loop:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '/'
+    jne     pd_more_done
+    inc     rsi
+    add     r11d, r11d                ; den *= 2
+    jmp     pd_more_loop
+pd_more_done:
+    mov     [rip + txtPtr], rsi
+
+pd_compute:
+    ; durWholes = (num*unitN) / (den*unitD)
+    mov     eax, r10d
+    imul    eax, [rip + unitN]
+    cvtsi2sd xmm0, eax
+    mov     eax, r11d
+    imul    eax, [rip + unitD]
+    cvtsi2sd xmm1, eax
+    divsd   xmm0, xmm1                ; xmm0 = durWholes
+endproc
+
+; ----------------------------------------------------------------------------
+; MsPerWhole -> xmm0 = tsD * 60000 / bpm   (f64).  No frame.
+; ----------------------------------------------------------------------------
+proc MsPerWhole
+    mov     eax, [rip + tsD]
+    cvtsi2sd xmm0, eax
+    mulsd   xmm0, [rip + f60000]
+    mov     eax, [rip + bpmVal]
+    cvtsi2sd xmm1, eax
+    divsd   xmm0, xmm1
+endproc
+
+; ----------------------------------------------------------------------------
+; RoundCurMs -> eax = round(curMs) = floor(curMs + 0.5).  No frame.
+; ----------------------------------------------------------------------------
+proc RoundCurMs
+    movsd   xmm0, [rip + curMs]
+    addsd   xmm0, [rip + fHalf]
+    roundsd xmm0, xmm0, 1             ; floor
+    cvttsd2si eax, xmm0
+endproc
+
+; ----------------------------------------------------------------------------
+; AdvanceCurMs(xmm0 = durWholes): curMs += durWholes * msPerWhole.
+; Calls MsPerWhole -> frame.  durWholes parked in the global fTmp across the call
+; (xmm6+ are callee-saved but `uses` does not track xmm; a global avoids any
+; manual rsp juggling that would break the frame's alignment guarantee).
+; ----------------------------------------------------------------------------
+proc AdvanceCurMs frame
+    movsd   [rip + fTmp], xmm0        ; durWholes
+    call    MsPerWhole                ; xmm0 = msPerWhole
+    mulsd   xmm0, [rip + fTmp]        ; * durWholes = deltaMs
+    movsd   xmm1, [rip + curMs]
+    addsd   xmm1, xmm0
+    movsd   [rip + curMs], xmm1
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseNote: consume accidental(s) + letter + octave marks + duration, compute
+; the MIDI pitch, emit NoteOn @ round(curMs) and NoteOff @ round(curMs+dur),
+; then advance curMs.  Calls -> frame.  Non-volatiles: rbx (pitch), rsi (cursor),
+; r12 (pc index), r13 (onMs).  durWholes parked in fDur across calls.
+; ----------------------------------------------------------------------------
+proc ParseNote uses rbx rsi r12 r13 frame
+    mov     rsi, [rip + txtPtr]
+
+    ; --- accidental prefix: ^ ^^ _ __ = (explicit overrides; persist to bar) ---
+    ; ebx = explicit accidental value; r11d = 1 if an explicit accidental seen.
+    xor     ebx, ebx
+    xor     r11d, r11d
+pn_acc_loop:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '^'
+    je      pn_acc_sharp
+    cmp     al, '_'
+    je      pn_acc_flat
+    cmp     al, '='
+    je      pn_acc_nat
+    jmp     pn_acc_done
+pn_acc_sharp:
+    inc     ebx
+    mov     r11d, 1
+    inc     rsi
+    jmp     pn_acc_loop
+pn_acc_flat:
+    dec     ebx
+    mov     r11d, 1
+    inc     rsi
+    jmp     pn_acc_loop
+pn_acc_nat:
+    xor     ebx, ebx                  ; natural = 0
+    mov     r11d, 1
+    inc     rsi
+pn_acc_done:
+
+    ; --- the note letter ---
+    ; MIDI octave convention: C4 = 60, i.e. midi = (octave+1)*12 + semitone.
+    ; ABC A-G are "octave 4" -> base multiplier 5 (=(4+1)); a-g -> 6.  So C -> 60.
+    movzx   eax, byte ptr [rsi]
+    mov     r8d, 5
+    cmp     al, 'a'
+    jb      pn_upper
+    cmp     al, 'g'
+    ja      pn_bail
+    mov     r8d, 6
+    sub     al, 32                    ; uppercase
+    jmp     pn_have_letter
+pn_upper:
+    cmp     al, 'A'
+    jb      pn_bail
+    cmp     al, 'G'
+    ja      pn_bail
+pn_have_letter:
+    ; pc index = (letter-'A' + 5) mod 7   (A->5 B->6 C->0 D->1 E->2 F->3 G->4)
+    movzx   ecx, al
+    sub     ecx, 'A'
+    add     ecx, 5
+    cmp     ecx, 7
+    jb      pn_pc_ok
+    sub     ecx, 7
+pn_pc_ok:
+    mov     r12d, ecx                 ; pitch-class index
+    inc     rsi                       ; consume letter
+
+    ; --- octave marks ' (+12) and , (-12), stackable ---
+    xor     r13d, r13d
+pn_oct_loop:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 0x27                  ; apostrophe  '
+    je      pn_oct_up
+    cmp     al, 44                    ; comma  ,  (char literal ',' confuses lexer)
+    je      pn_oct_down
+    jmp     pn_oct_done
+pn_oct_up:
+    add     r13d, 12
+    inc     rsi
+    jmp     pn_oct_loop
+pn_oct_down:
+    sub     r13d, 12
+    inc     rsi
+    jmp     pn_oct_loop
+pn_oct_done:
+
+    ; --- resolve the effective accidental for this pitch class ---
+    lea     r9, [rip + barAcc]
+    lea     r10, [rip + barSet]
+    mov     ecx, r12d
+    test    r11d, r11d
+    jz      pn_acc_resolve_bar
+    mov     [r9 + rcx*4], ebx         ; explicit -> barAcc[pc] = ebx
+    mov     dword ptr [r10 + rcx*4], 1
+    mov     eax, ebx
+    jmp     pn_acc_resolved
+pn_acc_resolve_bar:
+    mov     edx, [r10 + rcx*4]
+    test    edx, edx
+    jz      pn_acc_resolve_key
+    mov     eax, [r9 + rcx*4]         ; bar override
+    jmp     pn_acc_resolved
+pn_acc_resolve_key:
+    lea     r11, [rip + keyAcc]
+    mov     eax, [r11 + rcx*4]        ; key default
+pn_acc_resolved:
+    mov     ebx, eax                  ; ebx = effective accidental
+
+    ; --- MIDI pitch = baseOct*12 + semitab[pc] + accidental + octaveShift ---
+    mov     eax, r8d
+    imul    eax, eax, 12
+    lea     r9, [rip + semitab]
+    mov     ecx, r12d
+    add     eax, [r9 + rcx*4]
+    add     eax, ebx
+    add     eax, r13d
+    ; clamp 0..127
+    cmp     eax, 0
+    jge     pn_clamp_hi
+    xor     eax, eax
+pn_clamp_hi:
+    cmp     eax, 127
+    jle     pn_pitch_ok
+    mov     eax, 127
+pn_pitch_ok:
+    mov     ebx, eax                  ; ebx = MIDI pitch
+
+    ; --- duration (writes txtPtr) ---
+    mov     [rip + txtPtr], rsi       ; sync cursor before ParseDuration
+    call    ParseDuration             ; xmm0 = durWholes, txtPtr advanced
+    movsd   [rip + fDur], xmm0        ; stash durWholes
+
+    ; --- NoteOn @ round(curMs) ---
+    call    RoundCurMs                ; eax = onMs
+    mov     r13d, eax
+    mov     ecx, eax                  ; timeMs
+    mov     edx, 0x90                 ; NoteOn
+    mov     r8d, ebx                  ; d1 = pitch
+    mov     r9d, 80                   ; d2 = velocity
+    call    EmitEvent
+
+    ; --- advance curMs by durWholes ---
+    movsd   xmm0, [rip + fDur]
+    call    AdvanceCurMs
+
+    ; --- NoteOff @ round(curMs) ---
+    call    RoundCurMs                ; eax = offMs
+    mov     ecx, eax
+    mov     edx, 0x80                 ; NoteOff
+    mov     r8d, ebx                  ; d1 = pitch
+    xor     r9d, r9d                  ; d2 = 0
+    call    EmitEvent
+
+    mov     rsi, [rip + txtPtr]       ; keep local in sync (txtPtr is authoritative)
+    jmp     pn_ret
+pn_bail:
+    mov     [rip + txtPtr], rsi       ; persist whatever was consumed
+pn_ret:
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseTune(rcx = asciiz textPtr): single-pass char-by-char state machine.
+; Calls everything -> frame.  Cursor lives in txtPtr; rsi is a local view.
+; ----------------------------------------------------------------------------
+proc ParseTune uses rsi rbx frame in rcx
+    mov     [rip + txtPtr], rcx
+
+    ; --- reset working state to defaults ---
+    movsd   xmm0, [rip + fZero]
+    movsd   [rip + curMs], xmm0
+    mov     dword ptr [rip + tuneCount], 0
+    mov     dword ptr [rip + tuneEndMs], 0
+    mov     dword ptr [rip + bpmVal], 120
+    mov     dword ptr [rip + unitN], 1
+    mov     dword ptr [rip + unitD], 8
+    mov     dword ptr [rip + tsN], 4
+    mov     dword ptr [rip + tsD], 4
+    mov     dword ptr [rip + inBody], 0
+    xor     ecx, ecx
+    call    ApplyKey
+    call    ResetBar
+
+pt_loop:
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pt_end
+
+    cmp     dword ptr [rip + inBody], 0
+    jne     pt_body
+
+    ; ---------- HEADER MODE ---------- (rsi at line start)
+    movzx   ebx, byte ptr [rsi + 1]
+    cmp     bl, ':'
+    jne     pt_h_skipline
+
+    cmp     al, 'L'
+    je      pt_h_L
+    cmp     al, 'M'
+    je      pt_h_M
+    cmp     al, 'Q'
+    je      pt_h_Q
+    cmp     al, 'K'
+    je      pt_h_K
+    jmp     pt_h_skipline
+
+pt_h_L:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; N
+    test    eax, eax
+    jnz     pt_h_L_n_ok
+    mov     eax, 1
+pt_h_L_n_ok:
+    mov     [rip + unitN], eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pt_h_L_setd1
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; D
+    test    eax, eax
+    jnz     pt_h_L_d_ok
+    mov     eax, 1
+pt_h_L_d_ok:
+    mov     [rip + unitD], eax
+    jmp     pt_h_skipline
+pt_h_L_setd1:
+    mov     dword ptr [rip + unitD], 1
+    jmp     pt_h_skipline
+
+pt_h_M:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 'C'                   ; "C" / "C|" common/cut -> 4/4
+    jne     pt_h_M_num
+    mov     dword ptr [rip + tsN], 4
+    mov     dword ptr [rip + tsD], 4
+    jmp     pt_h_skipline
+pt_h_M_num:
+    call    ParseUInt                 ; N
+    test    eax, eax
+    jnz     pt_h_M_n_ok
+    mov     eax, 4
+pt_h_M_n_ok:
+    mov     [rip + tsN], eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pt_h_skipline
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; D
+    test    eax, eax
+    jnz     pt_h_M_d_ok
+    mov     eax, 4
+pt_h_M_d_ok:
+    mov     [rip + tsD], eax
+    jmp     pt_h_skipline
+
+pt_h_Q:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; first number
+    mov     ebx, eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pt_h_Q_chkeq
+    inc     rsi                       ; skip "/D"
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; discard denominator
+pt_h_Q_chkeq:
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '='
+    jne     pt_h_Q_use_first
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; bpm after '='
+    test    eax, eax
+    jz      pt_h_Q_use_first
+    mov     [rip + bpmVal], eax
+    jmp     pt_h_skipline
+pt_h_Q_use_first:
+    test    ebx, ebx
+    jz      pt_h_skipline
+    mov     [rip + bpmVal], ebx
+    jmp     pt_h_skipline
+
+pt_h_K:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseKey                  ; sets keyAcc, advances txtPtr
+    mov     dword ptr [rip + inBody], 1
+    call    ResetBar
+    jmp     pt_h_skipline
+
+pt_h_skipline:
+    mov     rsi, [rip + txtPtr]
+pt_h_skip2:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pt_end_sync
+    cmp     al, 10
+    je      pt_h_eol
+    inc     rsi
+    jmp     pt_h_skip2
+pt_h_eol:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+pt_end_sync:
+    mov     [rip + txtPtr], rsi
+    jmp     pt_end
+
+    ; ---------- BODY MODE ----------
+pt_body:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '|'
+    je      pt_b_bar
+    cmp     al, 'z'
+    je      pt_b_rest
+    cmp     al, 'Z'
+    je      pt_b_rest
+    cmp     al, '^'
+    je      pt_b_note
+    cmp     al, '_'
+    je      pt_b_note
+    cmp     al, '='
+    je      pt_b_note
+    cmp     al, 'A'
+    jb      pt_b_skip
+    cmp     al, 'G'
+    jbe     pt_b_note
+    cmp     al, 'a'
+    jb      pt_b_skip
+    cmp     al, 'g'
+    jbe     pt_b_note
+pt_b_skip:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
+pt_b_bar:
+    call    ResetBar
+    inc     rsi
+    movzx   eax, byte ptr [rsi]
+    cmp     al, ':'                   ; |:
+    je      pt_b_bar_eat
+    cmp     al, '|'                   ; ||
+    je      pt_b_bar_eat
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+pt_b_bar_eat:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
+pt_b_rest:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseDuration             ; xmm0 = durWholes
+    call    AdvanceCurMs              ; curMs += durWholes * msPerWhole
+    jmp     pt_loop
+
+pt_b_note:
+    call    ParseNote                 ; emits NoteOn/NoteOff, advances txtPtr+curMs
+    jmp     pt_loop
+
+pt_end:
+    call    FinalizeTune
+endproc
+
+; ----------------------------------------------------------------------------
+; FinalizeTune: stable insertion-sort tuneEv[0..count) by composite key
+;   key = timeMs*16 + priority,  priority NoteOff(1) < NoteOn(4).
+; Then tuneEndMs = max timeMs.  20-byte records moved whole.  Calls helpers ->
+; frame.  Non-volatiles: rbx (base), r12 (i), r13 (key i), r14 (j), r15 (count).
+; ----------------------------------------------------------------------------
+proc FinalizeTune uses rbx r12 r13 r14 r15 frame
+    mov     r15d, [rip + tuneCount]
+    cmp     r15d, 2
+    jb      ft_endms
+    lea     rbx, [rip + tuneEv]
+
+    mov     r12d, 1                   ; i = 1
+ft_outer:
+    cmp     r12d, r15d
+    jae     ft_endms
+
+    imul    eax, r12d, 20
+    lea     r8, [rbx + rax]           ; &rec[i]
+    call    ftKeyOf                   ; rax = key(i)
+    mov     r13, rax                  ; save key(i)
+    ; tempRec = rec[i]
+    imul    eax, r12d, 20
+    lea     rcx, [rbx + rax]
+    lea     rdx, [rip + ftTemp]
+    call    ftCopy20
+
+    mov     r14d, r12d
+    dec     r14d                      ; j = i-1
+ft_inner:
+    cmp     r14d, 0
+    jl      ft_place
+    imul    eax, r14d, 20
+    lea     r8, [rbx + rax]           ; &rec[j]
+    call    ftKeyOf                   ; rax = key(j)
+    cmp     rax, r13
+    jle     ft_place                  ; key(j) <= key(i) -> stable: place after j
+    ; rec[j+1] = rec[j]
+    imul    eax, r14d, 20
+    lea     rcx, [rbx + rax]          ; src = rec[j]
+    add     eax, 20
+    lea     rdx, [rbx + rax]          ; dst = rec[j+1]
+    call    ftCopy20
+    dec     r14d
+    jmp     ft_inner
+ft_place:
+    mov     eax, r14d
+    inc     eax
+    imul    eax, eax, 20
+    lea     rdx, [rbx + rax]          ; dst = rec[j+1]
+    lea     rcx, [rip + ftTemp]
+    call    ftCopy20
+    inc     r12d
+    jmp     ft_outer
+
+ft_endms:
+    xor     r9d, r9d                  ; max
+    mov     ecx, [rip + tuneCount]
+    test    ecx, ecx
+    jz      ft_store_end
+    lea     rbx, [rip + tuneEv]
+    xor     r8d, r8d
+ft_max_loop:
+    imul    eax, r8d, 20
+    mov     edx, [rbx + rax]
+    cmp     edx, r9d
+    jbe     ft_max_next
+    mov     r9d, edx
+ft_max_next:
+    inc     r8d
+    cmp     r8d, ecx
+    jb      ft_max_loop
+ft_store_end:
+    mov     [rip + tuneEndMs], r9d
+    mov     eax, [rip + bpmVal]
+    mov     [rip + tuneBpm], eax
+endproc
+
+; ftKeyOf(r8 = &record) -> rax = timeMs*16 + priority.  No frame (leaf).
+proc ftKeyOf in r8
+    mov     eax, [r8 + 0]             ; timeMs (zero-extended into rax)
+    mov     ecx, [r8 + 4]             ; status
+    mov     edx, 1                    ; default priority (NoteOff / other)
+    cmp     ecx, 0x90
+    jne     fk_have
+    mov     edx, 4                    ; NoteOn
+fk_have:
+    shl     rax, 4                    ; timeMs*16
+    add     rax, rdx
+endproc
+
+; ftCopy20(rcx = src, rdx = dst): copy a 20-byte record.  No frame (leaf).
+proc ftCopy20 in rcx rdx
+    mov     rax, [rcx + 0]
+    mov     [rdx + 0], rax
+    mov     rax, [rcx + 8]
+    mov     [rdx + 8], rax
+    mov     eax, [rcx + 16]
+    mov     [rdx + 16], eax
+endproc
+
+; ----------------------------------------------------------------------------
+; WriteTune(rcx = pathPtrW): dump the first tuneCount events as raw 20-byte
+; records to a binary file (CreateFileW/WriteFile/CloseHandle).  Calls -> frame.
+; ----------------------------------------------------------------------------
+proc WriteTune uses rbx frame in rcx
+    mov     eax, [rip + tuneCount]
+    imul    eax, eax, 20
+    mov     [rip + twBytes], eax      ; byteCount via memory (invoke clobbers eax)
+
+    invoke  CreateFileW, rcx, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     rbx, rax
+
+    invoke  WriteFile, rbx, tuneEv, [rip + twBytes], twWrote, 0
+    invoke  CloseHandle, rbx
+endproc
+
+.DATA
+fTmp      real8 0.0                   ; AdvanceCurMs durWholes park
+fDur      real8 0.0                   ; ParseNote durWholes park
+.CODE

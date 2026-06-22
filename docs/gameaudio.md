@@ -84,6 +84,15 @@ Spiked before writing any synth, and it reshapes the math:
   callee honors them (ours do, by staying in `xmm0..xmm5`).
 - `proc … frame` is required for any proc that contains `invoke`/`call` (aligned shadow
   space); `--check` enforces it. Float args to `invoke` need a `real4`/`real8` annotation.
+- **`dup` count must be a literal** — `BYTE 81920 dup(0)` works, `BYTE 4096*20 dup(0)`
+  does not (no arithmetic folding in the count).
+- **No manual `sub rsp` inside a `frame` proc** ("rsp off the frame level"). To keep an
+  f64 across a `call` in a framed proc, either stay in `xmm0..xmm5` (if the callee
+  honors xmm6+) or park it in a `.DATA` slot — single-threaded code only.
+- **A `','` char literal trips the lexer** ("malformed char literal"); use the numeric
+  ASCII (`44`) instead. (`'\''`-style apostrophe `0x27` is fine.)
+- **Octave/MIDI**: uppercase `A`-`G` use base multiplier **5** (so `C` = MIDI 60 = middle
+  C/C4), lowercase **6** — MIDI's `(octave+1)·12`. Semitones C0 D2 E4 F5 G7 A9 B11.
 
 # sound/ — the SFX synth
 

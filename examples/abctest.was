@@ -1,0 +1,21 @@
+; abctest.was — CORE ABC parser test: parse a C-major scale, dump events.
+;
+;   was examples\abctest.was -o abc.exe   &&   cd /tmp && abc.exe   ; writes tune.bin
+;
+; Parses the tune below (L=1/4, Q=120 -> each quarter note = 500 ms) and dumps
+; the resulting MidiEvent records (20 bytes each) to tune.bin for offline check.
+
+.DATA
+tune  BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "CDEFG", 10, 0
+binName WCHAR "tune.bin", 0
+
+.CODE
+.globl main
+main:
+    lea rcx, [rip + tune]
+    call ParseTune
+    lea rcx, [rip + binName]
+    call WriteTune
+    invoke ExitProcess, 0
+
+.include "../library/audio/music/abc.was"
