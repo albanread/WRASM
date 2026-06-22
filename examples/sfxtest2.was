@@ -1,0 +1,54 @@
+; sfxtest2.was — Sprint 2 audio: render the preset SFX to distinct .wav files.
+;
+;   was examples\sfxtest2.was -o s2.exe   &&   cd /tmp && s2.exe
+;
+; Each preset fills the Effect block and calls Render (sndBuf/sndFrames), then
+; WriteWav streams that buffer out — so the pattern is render -> WriteWav, render
+; -> WriteWav, ...  Presets take the duration in ms (edx); Tone also freq (rcx)
+; and waveform (r8d).  Writes: coin.wav, jump.wav, zap.wav, explode.wav, tone.wav.
+
+.DATA
+nCoin    WCHAR "coin.wav", 0
+nJump    WCHAR "jump.wav", 0
+nZap     WCHAR "zap.wav", 0
+nExplode WCHAR "explode.wav", 0
+nTone    WCHAR "tone.wav", 0
+
+.CODE
+.globl main
+main:
+    ; --- Coin: two sine tones, 500 ms ---
+    mov     edx, 500
+    call    Coin
+    lea     rcx, [rip + nCoin]
+    call    WriteWav
+
+    ; --- Jump: rising sweep 300->600, 400 ms ---
+    mov     edx, 400
+    call    Jump
+    lea     rcx, [rip + nJump]
+    call    WriteWav
+
+    ; --- Zap: falling sweep + noise, 400 ms ---
+    mov     edx, 400
+    call    Zap
+    lea     rcx, [rip + nZap]
+    call    WriteWav
+
+    ; --- Explode: low oscs + sweep + distortion, 800 ms ---
+    mov     edx, 800
+    call    Explode
+    lea     rcx, [rip + nExplode]
+    call    WriteWav
+
+    ; --- Tone: a 660 Hz square (wave=1), 300 ms ---
+    mov     ecx, 660
+    mov     edx, 300
+    mov     r8d, 1
+    call    Tone
+    lea     rcx, [rip + nTone]
+    call    WriteWav
+
+    invoke  ExitProcess, 0
+
+.include "../library/audio/sound/sound.was"
