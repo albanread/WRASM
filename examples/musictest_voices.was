@@ -1,0 +1,15 @@
+; musictest_voices.was — play a 2-voice tune LIVE: melody (piano, ch0) over a
+; bass line (acoustic bass, ch1), via the abc.was parser + the midiOut scheduler.
+;   was examples\musictest_voices.was -o mv.exe  &&  mv.exe   (you should HEAR two parts)
+.DATA
+tune  BYTE "X:1", 10, "T:Two-Voice Demo", 10, "M:4/4", 10, "L:1/4", 10, "Q:120", 10, "%%MIDI program 1 0", 10, "%%MIDI program 2 33", 10, "K:C", 10, "V:1", 10, "C E G E | F A G E | D F A F | G2 E2 |", 10, "V:2", 10, "C,2 G,2 | F,2 C,2 | G,2 D,2 | C,4 |", 10, 0
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tune]
+    call    ParseTune
+    call    MusicInit
+    invoke  Sleep, 8500          ; the tune is ~8 s; let it finish
+    call    MusicShutdown
+    invoke  ExitProcess, 0
+.include "../library/audio/music/abc.was"
