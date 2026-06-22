@@ -16,6 +16,7 @@
 ; (forward references are fine — labels resolve globally.)
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 snapName  WCHAR "snap_00000000.bmp", 0      ; the 8 hex digits at char offset 5 are patched
 snapWrote DWORD ?
 snapSeq   DWORD ?                            ; sequence number — ordered, collision-free

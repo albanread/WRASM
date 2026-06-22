@@ -22,6 +22,7 @@
 ; ============================================================================
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 keyDown   BYTE 256 dup(0)            ; 1 = key currently held (filled by InputKey)
 keyEdge   BYTE 256 dup(0)            ; 1 = pressed this frame (latched by InputPoll)
 keyPrev   BYTE 256 dup(0)            ; last frame's keyDown (for the edge)

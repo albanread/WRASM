@@ -78,13 +78,10 @@ main:
     lea     r8, [rip + GameStep]
     lea     r9, [rip + GameSprites]
     call    GameStart
-    ; --- headless demo so the filmstrip shows real gameplay: force PLAYING and
-    ;     launch the ball, then step + Snapshot a run with nobody at the keyboard.
-    call    DemoLaunch
-    mov     ecx, 90                  ; 90 frames
-    mov     edx, 15                  ; sample every 15 → 6 BMPs
-    call    GameSelfTest
-    call    GameLoop                 ; live window until Esc
+    ; A human plays: open the window straight to the intro screen.  (The headless
+    ; verification filmstrip — `call DemoLaunch` then `GameSelfTest(90,15)` — went
+    ; here; drop those two back in before GameLoop to re-film a run to BMPs.)
+    call    GameLoop                 ; window until Esc — intro -> play -> win/over
     call    MusicShutdown            ; stop + join the soundtrack thread
     call    AudioShutdown            ; join the mixer thread + close the device
     invoke  ExitProcess, 0

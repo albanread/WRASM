@@ -39,6 +39,7 @@
 ; ----------------------------------------------------------------------------
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 
 ; --- device handle ---
 hwo          QWORD  0                     ; HWAVEOUT from waveOutOpen

@@ -37,6 +37,7 @@
 ; ----------------------------------------------------------------------------
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 
 hmo          QWORD  0                     ; HMIDIOUT from midiOutOpen
 gMusicQuit   DWORD  0                     ; scheduler loop stop flag (0 = run)

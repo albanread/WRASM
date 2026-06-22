@@ -19,6 +19,7 @@
 ; ============================================================================
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 .include "sound_data.inc"
 .CODE
 .include "sound_core.was"

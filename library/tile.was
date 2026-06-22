@@ -34,6 +34,7 @@
 ; ============================================================================
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 tilesetTab    BYTE 512 dup(0)        ; 16 slots × {dataPtr Q@0, tileW@8, tileH@12, stride@16, count@20}
 tilePool      BYTE 65536 dup(0)      ; LUT(16) + 4-bit tile data, bump-allocated
 tilePoolNext  QWORD ?                 ; next free byte (lazy-init to tilePool)

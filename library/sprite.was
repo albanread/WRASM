@@ -25,6 +25,7 @@
 ; ============================================================================
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 spriteTab      BYTE 2048 dup(0)       ; 64 slots × {dataPtr Q@0, w@8, h@12, stride@16, frames@20}
 spritePool     BYTE 262144 dup(0)     ; LUT(64) + 4-bit frame data, bump-allocated
 spritePoolNext QWORD ?                 ; next free byte (lazy-init to spritePool)

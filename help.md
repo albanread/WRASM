@@ -88,6 +88,18 @@ These are the dialect's sharp edges. Most were found the hard way; learn them on
 7. **A `','` char literal trips the lexer** ("malformed char literal"). Use the ASCII
    number instead (`44`). An apostrophe literal (`0x27`) is fine.
 
+8. **`.DATA` is byte-packed — no auto-alignment.** `was` emits data exactly where you put
+   it (byte-identical to LLVM-MC), so an **odd-length declaration shifts every following
+   symbol by one byte** — including library globals pulled in by `.include`d modules. If
+   that lands an OS-read structure at an odd address — a WCHAR class name, a `WNDCLASS` —
+   the kernel rejects it: `RegisterClassExW` → `ERROR_NOACCESS`, and the window *silently
+   never opens*. **Align what the OS reads (or SSE touches):** put `.balign 16` at the head
+   of a `.DATA` block — the framework library does this in every module now — or end a
+   game's own `.DATA` with `.balign 16` before its includes. Alignment directives are
+   GAS-style **with the dot**: `.align` / `.balign` / `.p2align`; a bare `align` is parsed
+   as an instruction and errors. *(Symptom: a window that never appears, or a `movaps` #GP
+   on a misaligned `real8` buffer.)*
+
 ## See also
 
 - [docs/macros.md](docs/macros.md) — `invoke` lowering, the `proc` frame layout, the

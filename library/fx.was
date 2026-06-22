@@ -19,6 +19,7 @@
 ; ============================================================================
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 paletteBase   DWORD 256 dup(0)        ; the fade/flash master (SaveBase snapshots palette here)
 
 .CODE

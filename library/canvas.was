@@ -33,6 +33,7 @@
 ; ============================================================================
 
 .DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 .include "gc_font.inc"               ; fontTab: 128 glyphs x 7 bytes (5x7)
 
 fb        BYTE  64000 dup(0)         ; 320x200 index framebuffer (top-down)
