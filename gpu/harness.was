@@ -1,33 +1,39 @@
-; gpu/harness.was — GPU Canvas G4 present-backend / game machine.
+; gpu/harness.was — GPU Canvas G5 game machine, RECONCILED to the library API.
 ;
-; The GPU mirror of library/harness.was: it owns everything identical across GPU
-; games — the window, the WndProc, the fixed-step timer, the message pump — and
-; drives a per-frame loop that calls back into the author's procs. The difference
-; from the CPU harness is the PRESENT: instead of resolve->blit (StretchDIBits),
-; the present is the GPU COMPOSITOR — fx -> tile layers -> sprites -> text -> flip
-; (docs/gpucanvas.md §3 layer stack, §7 the present-backend seam).
+; The GPU mirror of library/harness.was, but with the SAME public symbols and the
+; SAME per-frame contract, so a game retargeting its .include from library/ -> gpu/
+; needs ZERO source changes:
+;   GameStart(rcx=titleW, rdx=init, r8=step, r9=sprites)  window + bring up the GPU + init()
+;   GameLoop()                                            SetTimer + GetMessage pump
+;   GameRun(... same 4 args)                              GameStart + GameLoop
+;   GameFrame                                             one frame (input, step, present)
+;   GameSelfTest(rcx=frames, edx=every)                   headless filmstrip
+;   HWndProc                                              window proc (input + timer)
 ;
-; Mirrors library/harness.was's loop shape exactly:
-;   GpuGameStart(rcx=titleW, rdx=init, r8=step, r9=present) — window + call init()
-;   GpuGameLoop()                       — SetTimer + the GetMessage pump
-;   GpuGameRun(... same 4 args)         — GpuGameStart + GpuGameLoop (the usual entry)
-;   the WndProc's WM_TIMER calls GpuGameFrame:
-;       step()      author: advance state (move sprites, bump scroll/fx time, queue
-;                   sprite + text instances) — the GPU analog of library step+sprites
-;       present()   the author's full compositor (fx -> tiles -> sprites -> text ->
-;                   Present); this is the present-backend seam.
+; Differences from library/harness.was, all INVISIBLE to the game:
+;   * the window is the GPU swapchain size (1280x720, the docs §3 backbuffer); the
+;     game's 640x360 idxBuf is upscaled by the LUT pass, not StretchDIBits.
+;   * GameStart calls GpuInit(hwnd) + BlitInit + TxtInit itself (the library's init()
+;     never created a device; brickout's GameInit must stay device-free), so the
+;     game's init() only does game setup (palette seed, audio, board).
+;   * the per-frame PRESENT is the default GPU compositor: resolve the indexed
+;     background (GpuComposite) -> the queued text instances (TxtUpload + TxtFlush)
+;     -> the author's sprites() callback (r9, queues nothing for brickout) -> flip.
+;     The library passed sprites() as r9 and did the present itself; here too — the
+;     HARNESS owns the present, the game's r9 is the same sprites()-style callback.
+;   * GameFrame clears the per-frame text queue (TxtClear) BEFORE step, so the game's
+;     Text() calls during step accumulate cleanly each frame.
 ;
-; Unlike the CPU harness the window is the GPU's 1280x720 (the swapchain size); the
-; author calls GpuInit/BlitInit/TileInit/SprInit/TxtInit/FxInit from its init().
-;
-; Depends on: gpu/canvas.was (hwnd plumbing is local here; uses ExitProcess only).
-; Include AFTER canvas/blit/tile/sprite/text/fx. Every .DATA opens with .balign 16.
+; Depends on: gpu/canvas.was (GpuInit/GpuComposite/GpuSnapshot, idxBuf, pRTV, vp),
+; gpu/blit.was (BlitInit, pBlendAlpha), gpu/text.was (TxtInit/TxtClear/TxtUpload/
+; TxtFlush), gpu/input.was (InputPoll/InputKey/ActionHit). Include AFTER all of them.
+; Every .DATA opens with .balign 16.
 
 .DATA
 .balign 16
-gpInit     QWORD ?                        ; author callbacks
-gpStep     QWORD ?
-gpPresent  QWORD ?
+gInit     QWORD ?                         ; the author's callbacks
+gStep     QWORD ?
+gSprites  QWORD ?                         ; r9: per-frame sprite/composite callback
 hClassNameG WCHAR "rasm_gpu_game", 0
 hWcG       BYTE  80 dup(0)
 hMsgG      BYTE  48 dup(0)
@@ -40,20 +46,18 @@ hwndSaveG  QWORD ?
 .balign 16
 .CODE
 
-; ---- GpuGameStart(rcx=titleW, rdx=init, r8=step, r9=present): window + init ----
-; Creates the 1280x720 swapchain-sized window, stashes the callbacks, then calls
-; the author's init() (which brings up GpuInit + the layer modules + builds assets).
-.globl GpuGameStart
-GpuGameStart:
+; ---- GameStart(rcx=titleW, rdx=init, r8=step, r9=sprites): window + GPU + init ----
+.globl GameStart
+GameStart:
     push    rbx
     push    rsi
     push    rdi
     push    r12
     sub     rsp, 40
 
-    mov     [rip + gpInit], rdx
-    mov     [rip + gpStep], r8
-    mov     [rip + gpPresent], r9
+    mov     [rip + gInit], rdx
+    mov     [rip + gStep], r8
+    mov     [rip + gSprites], r9
     mov     r12, rcx                      ; titleW
 
     invoke  GetModuleHandleW, 0
@@ -61,7 +65,7 @@ GpuGameStart:
     lea     rdi, [rip + hWcG]
     mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
     mov     dword ptr [rdi + WNDCLASSEXW.style], 3
-    lea     rax, [rip + GpuWndProc]
+    lea     rax, [rip + HWndProc]
     mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
     mov     [rdi + WNDCLASSEXW.hInstance], rsi
     lea     rax, [rip + hClassNameG]
@@ -89,9 +93,17 @@ GpuGameStart:
     test    rax, rax
     jz      gps_fail
 
-    ; the author's init() — brings up the GPU + builds assets (hwnd in rcx).
+    ; ---- bring up the GPU backend ourselves (the library's init() was device-free).
+    ; GpuInit(hwnd) then BlitInit (text needs pBlendAlpha) then TxtInit.
     mov     rcx, [rip + hwndSaveG]
-    mov     rax, [rip + gpInit]
+    call    GpuInit
+    call    BlitInit
+    call    TxtInit
+
+    ; the author's init() — game setup only (palette seed, audio, board). It ignores
+    ; rcx, but we pass the hwnd anyway to match the library's tolerated calling form.
+    mov     rcx, [rip + hwndSaveG]
+    mov     rax, [rip + gInit]
     call    rax
 
     add     rsp, 40
@@ -103,11 +115,14 @@ GpuGameStart:
 gps_fail:
     invoke  ExitProcess, 1
 
-; ---- GpuGameFrame: one frame — author step() then author present() ----
-; Shields all non-volatiles around the callbacks (like library GameFrame), so a
-; register slip in the game can never corrupt the message dispatch.
-.globl GpuGameFrame
-GpuGameFrame:
+; ---- GameFrame: one frame — input, step, the default GPU compositor present ----
+; Shields all non-volatiles around the callbacks (like library GameFrame). Order:
+;   TxtClear (reset the frame's text queue) -> InputPoll -> step() (game logic +
+;   Cls/FillRect into idxBuf + Text queued) -> GpuComposite (resolve the indexed
+;   background into the back buffer) -> TxtUpload+TxtFlush (text over it) ->
+;   sprites() (the author's r9; brickout's is a bare ret) -> Present.
+.globl GameFrame
+GameFrame:
     push    rbx
     push    rsi
     push    rdi
@@ -117,16 +132,29 @@ GpuGameFrame:
     push    r15
     sub     rsp, 8
 
-    mov     rax, [rip + gpStep]
+    call    TxtClear                       ; reset this frame's queued glyphs
+    call    InputPoll                      ; latch key edges + recompute actions
+
+    mov     rax, [rip + gStep]
     test    rax, rax
     jz      gf_present
-    call    rax                           ; author: logic + queue sprites/text
+    call    rax                            ; author: logic + draw into idxBuf + queue Text
 gf_present:
-    mov     rax, [rip + gpPresent]
+    ; ---- default compositor present ----
+    call    GpuComposite                   ; idxBuf -> LUT pass -> back buffer (no flip)
+
+    call    TxtUpload                       ; push queued glyphs to the instance VB
+    pContext.RSSetViewports(1, vp)          ; 1280x720 back-buffer viewport
+    mov     rcx, [rip + pRTV]
+    call    TxtFlush                        ; draw all glyphs over the background
+
+    mov     rax, [rip + gSprites]           ; author: composite sprites (brickout: ret)
     test    rax, rax
-    jz      gf_done
-    call    rax                           ; author: the full GPU compositor + Present
-gf_done:
+    jz      gf_flip
+    call    rax
+gf_flip:
+    pSwap.Present(1, 0)
+
     add     rsp, 8
     pop     r15
     pop     r14
@@ -137,9 +165,9 @@ gf_done:
     pop     rbx
     ret
 
-; ---- GpuGameLoop: SetTimer + the message pump (interactive run) ----
-.globl GpuGameLoop
-GpuGameLoop:
+; ---- GameLoop: SetTimer + the message pump (interactive run) ----
+.globl GameLoop
+GameLoop:
     push    rbx
     sub     rsp, 32
     invoke  SetTimer, [rip + hwndSaveG], 1, 16, 0    ; ~60 fps
@@ -155,7 +183,205 @@ gl_done:
     pop     rbx
     ret
 
-; ---- GpuGameRun(rcx=titleW, rdx=init, r8=step, r9=present): set up then run ----
+; ---- GameRun(rcx=titleW, rdx=init, r8=step, r9=sprites): set up then run ----
+.globl GameRun
+GameRun:
+    push    rbx
+    sub     rsp, 32
+    call    GameStart
+    call    GameLoop
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ---- GameSelfTest(rcx=frames, edx=every): headless — step + sample a filmstrip ----
+.globl GameSelfTest
+GameSelfTest:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    sub     rsp, 8
+    mov     ebx, ecx                       ; frames remaining
+    mov     r13d, edx                      ; sample every N
+    mov     r12d, 1                        ; countdown (sample on the first)
+gst_loop:
+    test    ebx, ebx
+    jz      gst_done
+    call    GameFrame                       ; renders + flips
+    dec     r12d
+    jnz     gst_skip
+    call    Snapshot                        ; sample this frame
+    mov     r12d, r13d
+gst_skip:
+    dec     ebx
+    jmp     gst_loop
+gst_done:
+    add     rsp, 8
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ---- HWndProc: window procedure — input forwarding + the timer frame ----
+.globl HWndProc
+HWndProc:
+    cmp     edx, 2                         ; WM_DESTROY
+    je      hw_destroy
+    cmp     edx, 275                       ; WM_TIMER
+    je      hw_timer
+    cmp     edx, 256                       ; WM_KEYDOWN
+    je      hw_keydn
+    cmp     edx, 257                       ; WM_KEYUP
+    je      hw_keyup
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+hw_keydn:
+    mov     rcx, r8                        ; vk = wParam
+    mov     edx, 1
+    call    InputKey
+    xor     eax, eax
+    ret
+hw_keyup:
+    mov     rcx, r8
+    xor     edx, edx
+    call    InputKey
+    xor     eax, eax
+    ret
+hw_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+hw_timer:
+    ; NOTE: comcall/invoke each emit their own prologue (push rbx; mov rbx,rsp;
+    ; and rsp,-16; sub rsp,N; ...; mov rsp,rbx; pop rbx), so every D3D/Win32 call
+    ; SELF-ALIGNS to 16 and self-allocates shadow space regardless of the caller's
+    ; RSP. The bare `call GameFrame` here is therefore safe for ABI reasons unrelated
+    ; to alignment — no manual push/sub is needed around it either way.
+    call    GameFrame
+    mov     ecx, 7                         ; QUIT action (Esc / stick) -> close
+    call    ActionHit
+    test    eax, eax
+    jz      hw_done
+    invoke  PostQuitMessage, 0
+hw_done:
+    xor     eax, eax
+    ret
+
+; ===========================================================================
+; ===========================================================================
+; LEGACY G4 COMPOSITOR HARNESS (kept for examples/gpu_g4.was — the older contract).
+;
+; The G5 Game* harness above is the LIBRARY contract: it brings up the GPU itself,
+; polls input, queues text, and owns the present (a fixed compositor). The original
+; G4 demo uses a DIFFERENT contract: init() brings up the modules, r9 is the FULL
+; author compositor, and there is no input/text stage. So the Gpu* entry points are
+; preserved verbatim here (their own window class + WndProc), NOT aliased to Game*,
+; because the per-frame behaviour genuinely differs. New games use Game*.
+; ===========================================================================
+; ===========================================================================
+.globl GpuGameStart
+GpuGameStart:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    sub     rsp, 40
+    mov     [rip + gpInitL], rdx
+    mov     [rip + gpStepL], r8
+    mov     [rip + gpPresentL], r9
+    mov     r12, rcx
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + hWcL]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + GpuWndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + hClassNameL]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + hWcL]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, hWcL
+    lea     rdi, [rip + hRectL]
+    mov     dword ptr [rdi + 8], 1280
+    mov     dword ptr [rdi + 12], 720
+    invoke  AdjustWindowRect, hRectL, 0x10CF0000, 0
+    lea     rdi, [rip + hRectL]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + hWinWL], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + hWinHL], eax
+    invoke  CreateWindowExW, 0, hClassNameL, r12, 0x10CF0000, 0x80000000, 0x80000000, [rip + hWinWL], [rip + hWinHL], 0, 0, rsi, 0
+    mov     [rip + hwndSaveG], rax
+    test    rax, rax
+    jz      gpsl_fail
+    mov     rcx, [rip + hwndSaveG]
+    mov     rax, [rip + gpInitL]
+    call    rax
+    add     rsp, 40
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+gpsl_fail:
+    invoke  ExitProcess, 1
+
+.globl GpuGameFrame
+GpuGameFrame:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8
+    mov     rax, [rip + gpStepL]
+    test    rax, rax
+    jz      gfl_present
+    call    rax
+gfl_present:
+    mov     rax, [rip + gpPresentL]
+    test    rax, rax
+    jz      gfl_done
+    call    rax
+gfl_done:
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.globl GpuGameLoop
+GpuGameLoop:
+    push    rbx
+    sub     rsp, 32
+    invoke  SetTimer, [rip + hwndSaveG], 1, 16, 0
+gll_loop:
+    invoke  GetMessageW, hMsgL, 0, 0, 0
+    test    eax, eax
+    jle     gll_done
+    invoke  TranslateMessage, hMsgL
+    invoke  DispatchMessageW, hMsgL
+    jmp     gll_loop
+gll_done:
+    add     rsp, 32
+    pop     rbx
+    ret
+
 .globl GpuGameRun
 GpuGameRun:
     push    rbx
@@ -166,25 +392,32 @@ GpuGameRun:
     pop     rbx
     ret
 
-; ---- GpuWndProc: the window procedure — the timer frame ----
 .globl GpuWndProc
 GpuWndProc:
-    cmp     edx, 2                        ; WM_DESTROY
-    je      gw_destroy
-    cmp     edx, 275                      ; WM_TIMER
-    je      gw_timer
+    cmp     edx, 2
+    je      gwl_destroy
+    cmp     edx, 275
+    je      gwl_timer
     invoke  DefWindowProcW, rcx, rdx, r8, r9
     ret
-gw_destroy:
+gwl_destroy:
     invoke  PostQuitMessage, 0
     xor     eax, eax
     ret
-gw_timer:
-    ; NOTE (16-byte alignment): GpuWndProc is entered by Windows at RSP%16==8 and
-    ; calls GpuGameFrame with NO intervening frame/push, so GpuGameFrame's 7 pushes
-    ; + `sub rsp,8` land step()/present() (and every downstream comobj/SSE call) at
-    ; the ABI-correct RSP%16==8. Do NOT add a push or shadow-space sub here — it
-    ; would silently misalign every D3D/SSE call in the callbacks.
+gwl_timer:
     call    GpuGameFrame
     xor     eax, eax
     ret
+
+.balign 16
+.DATA
+.balign 16
+gpInitL     QWORD ?
+gpStepL     QWORD ?
+gpPresentL  QWORD ?
+hClassNameL WCHAR "rasm_gpu_g4", 0
+hWcL        BYTE  80 dup(0)
+hMsgL       BYTE  48 dup(0)
+hRectL      BYTE  16 dup(0)
+hWinWL      DWORD ?
+hWinHL      DWORD ?

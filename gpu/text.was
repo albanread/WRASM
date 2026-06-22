@@ -75,6 +75,11 @@ VO TXVS(uint vid:SV_VertexID,
   VO o;
   float2 corner=float2((float)(vid&1u),(float)((vid>>1)&1u));
   float2 pos=scr+corner*8.0;
+  // pos is in PHYSICAL canvas px (640x360); 320/180 = PhysW/2 / PhysH/2. The GPU
+  // canvas physical size is fixed at 640x360 (idxBuf, the LUT shader's 640/360, the
+  // FillRect clip constants, this NDC transform all share it). Text x,y arrive
+  // already biased by the draw origin (gpu/canvas.was Text), so a 320x200 LOGICAL
+  // game lands in the centred physical region — same place its fills do.
   o.p=float4(pos.x/320.0-1.0, 1.0-pos.y/180.0, 0.0, 1.0);
   o.atl=atl+corner*8.0;
   o.col=col;

@@ -1,0 +1,254 @@
+; ============================================================================
+; input.was — keyboard + joystick, with reliable predefined game actions
+; ============================================================================
+; Reuse:  .include "../library/input.was"
+;
+; Two layers, exactly as a game wants:
+;   RAW   — scan-code state + edges, and the joystick:
+;     InputKey(rcx=vk, edx=down)     ; call from WndProc on WM_KEYDOWN/UP
+;     InputMouse(rcx=x, edx=y, r8d=buttons)
+;     KeyDown(rcx=vk) -> eax         ; is this key held?
+;     KeyHit(rcx=vk)  -> eax         ; was it pressed THIS frame? (edge)
+;     MouseX / MouseY -> eax
+;   ACTIONS — device-independent, mapped from BOTH keyboard and joystick:
+;     Action(rcx=a)    -> eax        ; held?
+;     ActionHit(rcx=a) -> eax        ; pressed this frame? (edge)
+;     a ∈ { LEFT=0 RIGHT=1 UP=2 DOWN=3 FIRE=4 PAUSE=5 RESTART=6 QUIT=7 }
+;
+; Once per frame the host calls InputPoll (the harness will): it reads the
+; joystick, recomputes the 8 actions from keys+stick, and latches the edges.
+; Default keys: arrows + WASD, Space/Ctrl = fire, P = pause, R = restart, Esc =
+; quit. Joystick: X/Y axes = L/R/U/D, buttons 0/1/6/7 = fire/pause/restart/quit.
+; ============================================================================
+
+.DATA
+.balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
+keyDown   BYTE 256 dup(0)            ; 1 = key currently held (filled by InputKey)
+keyEdge   BYTE 256 dup(0)            ; 1 = pressed this frame (latched by InputPoll)
+keyPrev   BYTE 256 dup(0)            ; last frame's keyDown (for the edge)
+actDown   BYTE 8 dup(0)             ; the 8 predefined actions: held
+actEdge   BYTE 8 dup(0)             ; … pressed this frame
+forceAct  BYTE 8 dup(0)             ; simulated actions (SimAction) — OR'd in by InputPoll
+mouseXv   DWORD ?
+mouseYv   DWORD ?
+mouseBv   DWORD ?
+joyX      DWORD 32768               ; axes (0..65535, centre ~32768); default centred
+joyY      DWORD 32768
+joyBtn    DWORD ?                    ; button bitmask
+joyInfo   BYTE 52 dup(0)            ; JOYINFOEX (dwSize@0, dwFlags@4, X@8, Y@12, buttons@32)
+
+.CODE
+; ---- InputKey(rcx=vk, edx=down): record a key transition (from WndProc) ----
+proc InputKey in rcx rdx
+    cmp     ecx, 256
+    jae     ik_end
+    lea     rax, [rip + keyDown]
+    mov     [rax + rcx], dl           ; keyDown[vk] = (down != 0) ? low bit
+ik_end:
+endproc
+
+; ---- InputMouse(rcx=x, edx=y, r8d=buttons) ----
+proc InputMouse in rcx rdx r8
+    mov     [rip + mouseXv], ecx
+    mov     [rip + mouseYv], edx
+    mov     [rip + mouseBv], r8d
+endproc
+
+; ---- KeyDown / KeyHit / MouseX / MouseY: queries ----
+proc KeyDown in rcx
+    xor     eax, eax
+    cmp     ecx, 256
+    jae     kd_end
+    lea     rdx, [rip + keyDown]
+    movzx   eax, byte ptr [rdx + rcx]
+kd_end:
+endproc
+
+proc KeyHit in rcx
+    xor     eax, eax
+    cmp     ecx, 256
+    jae     kh_end
+    lea     rdx, [rip + keyEdge]
+    movzx   eax, byte ptr [rdx + rcx]
+kh_end:
+endproc
+
+proc MouseX
+    mov     eax, [rip + mouseXv]
+endproc
+proc MouseY
+    mov     eax, [rip + mouseYv]
+endproc
+
+; ---- Action(rcx=a) / ActionHit(rcx=a): the predefined actions ----
+proc Action in rcx
+    xor     eax, eax
+    cmp     ecx, 8
+    jae     ac_end
+    lea     rdx, [rip + actDown]
+    movzx   eax, byte ptr [rdx + rcx]
+ac_end:
+endproc
+
+proc ActionHit in rcx
+    xor     eax, eax
+    cmp     ecx, 8
+    jae     ah_end
+    lea     rdx, [rip + actEdge]
+    movzx   eax, byte ptr [rdx + rcx]
+ah_end:
+endproc
+
+; ---- InputPoll: latch key edges, read the joystick, recompute the 8 actions ----
+proc InputPoll uses rbx rsi rdi frame
+    ; key edges: keyEdge = keyDown & ~keyPrev ; keyPrev = keyDown
+    lea     rsi, [rip + keyDown]
+    lea     rdi, [rip + keyPrev]
+    lea     rbx, [rip + keyEdge]
+    xor     ecx, ecx
+ip_kedge:
+    movzx   eax, byte ptr [rsi + rcx]
+    movzx   edx, byte ptr [rdi + rcx]
+    not     edx
+    and     eax, edx
+    and     eax, 1
+    mov     [rbx + rcx], al
+    movzx   eax, byte ptr [rsi + rcx]
+    mov     [rdi + rcx], al           ; keyPrev = keyDown
+    inc     ecx
+    cmp     ecx, 256
+    jl      ip_kedge
+    ; joystick: JOYINFOEX dwSize=52, dwFlags=JOY_RETURNALL(0xFF)
+    lea     rax, [rip + joyInfo]
+    mov     dword ptr [rax], 52
+    mov     dword ptr [rax + 4], 0xFF
+    invoke  joyGetPosEx, 0, joyInfo
+    mov     dword ptr [rip + joyX], 32768   ; default = centred / no buttons
+    mov     dword ptr [rip + joyY], 32768
+    mov     dword ptr [rip + joyBtn], 0
+    test    eax, eax                  ; non-zero = no joystick → keep defaults
+    jnz     ip_act
+    lea     rax, [rip + joyInfo]
+    mov     edx, [rax + 8]
+    mov     [rip + joyX], edx
+    mov     edx, [rax + 12]
+    mov     [rip + joyY], edx
+    mov     edx, [rax + 32]
+    mov     [rip + joyBtn], edx
+ip_act:
+    ; recompute each action = keyboard OR joystick; edge = new & ~old
+    ; LEFT (0): arrows/A or joyX < 16384
+    mov     ecx, 0x25                 ; VK_LEFT
+    mov     edx, 0x41                 ; 'A'
+    call    ip_keys
+    mov     r8d, eax
+    cmp     dword ptr [rip + joyX], 16384
+    setb    al
+    or      r8b, al
+    xor     ecx, ecx
+    call    ip_set
+    ; RIGHT (1): arrows/D or joyX > 49152
+    mov     ecx, 0x27
+    mov     edx, 0x44
+    call    ip_keys
+    mov     r8d, eax
+    cmp     dword ptr [rip + joyX], 49152
+    seta    al
+    or      r8b, al
+    mov     ecx, 1
+    call    ip_set
+    ; UP (2): arrows/W or joyY < 16384
+    mov     ecx, 0x26
+    mov     edx, 0x57
+    call    ip_keys
+    mov     r8d, eax
+    cmp     dword ptr [rip + joyY], 16384
+    setb    al
+    or      r8b, al
+    mov     ecx, 2
+    call    ip_set
+    ; DOWN (3): arrows/S or joyY > 49152
+    mov     ecx, 0x28
+    mov     edx, 0x53
+    call    ip_keys
+    mov     r8d, eax
+    cmp     dword ptr [rip + joyY], 49152
+    seta    al
+    or      r8b, al
+    mov     ecx, 3
+    call    ip_set
+    ; FIRE (4): Space/Ctrl or joy button 0
+    mov     ecx, 0x20
+    mov     edx, 0x11
+    call    ip_keys
+    mov     r8d, eax
+    test    dword ptr [rip + joyBtn], 1
+    setnz   al
+    or      r8b, al
+    mov     ecx, 4
+    call    ip_set
+    ; PAUSE (5): P or joy button 1
+    mov     ecx, 0x50
+    mov     edx, 0x50
+    call    ip_keys
+    mov     r8d, eax
+    test    dword ptr [rip + joyBtn], 2
+    setnz   al
+    or      r8b, al
+    mov     ecx, 5
+    call    ip_set
+    ; RESTART (6): R or joy button 6
+    mov     ecx, 0x52
+    mov     edx, 0x52
+    call    ip_keys
+    mov     r8d, eax
+    test    dword ptr [rip + joyBtn], 0x40
+    setnz   al
+    or      r8b, al
+    mov     ecx, 6
+    call    ip_set
+    ; QUIT (7): Esc or joy button 7
+    mov     ecx, 0x1B
+    mov     edx, 0x1B
+    call    ip_keys
+    mov     r8d, eax
+    test    dword ptr [rip + joyBtn], 0x80
+    setnz   al
+    or      r8b, al
+    mov     ecx, 7
+    call    ip_set
+endproc
+
+; ---- ip_keys(ecx=vk1, edx=vk2) -> al = keyDown[vk1] | keyDown[vk2] (helper) ----
+proc ip_keys in rcx rdx
+    lea     r8, [rip + keyDown]
+    movzx   eax, byte ptr [r8 + rcx]
+    movzx   r9d, byte ptr [r8 + rdx]
+    or      eax, r9d
+endproc
+
+; ---- SimAction(rcx=action, edx=down): force an action on/off (headless play) ----
+; Lets introspection drive the game: set a core state, step a frame, Snapshot.
+proc SimAction in rcx rdx
+    cmp     ecx, 8
+    jae     sa_end
+    lea     rax, [rip + forceAct]
+    mov     [rax + rcx], dl
+sa_end:
+endproc
+
+; ---- ip_set(ecx=action, r8b=new-down): store actDown, latch actEdge ----
+proc ip_set in rcx r8
+    lea     rax, [rip + forceAct]
+    movzx   edx, byte ptr [rax + rcx]
+    or      r8b, dl                   ; OR in the simulated (forced) action
+    and     r8b, 1
+    lea     rax, [rip + actDown]
+    movzx   edx, byte ptr [rax + rcx]  ; old
+    not     edx
+    mov     r9d, r8d
+    and     r9b, dl                    ; edge = new & ~old
+    mov     [rax + rcx], r8b           ; actDown = new
+    lea     rax, [rip + actEdge]
+    mov     [rax + rcx], r9b           ; actEdge = edge
+endproc

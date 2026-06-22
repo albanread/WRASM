@@ -1,0 +1,18 @@
+; gpu/introspect.was — the GPU canvas's self-portrait, mirroring library/introspect.was.
+;
+;   .include "../gpu/introspect.was"     ; after canvas
+;   call Snapshot                        ; writes the BMP at bmpPathPtr
+;
+; The library introspect resolves the 320x200 CPU framebuffer into a BMP. The GPU
+; backend already owns that machinery in gpu/canvas.was's GpuSnapshot (back buffer
+; -> staging -> 24-bit BMP at bmpPathPtr). This file just exposes it under the
+; library's `Snapshot` name so a game's `.include "../*/introspect.was"` resolves
+; with zero source changes.
+;
+; GameSelfTest (in gpu/harness.was) calls Snapshot to film a headless run.
+
+.CODE
+; ---- Snapshot: dump the current GPU back buffer to bmpPathPtr (= GpuSnapshot) ----
+.globl Snapshot
+Snapshot:
+    jmp     GpuSnapshot

@@ -1,0 +1,685 @@
+; brickout.was — BrickOut, the capstone: a playable game in hand-written WRASM.
+;
+;   was examples\brickout.was -o brickout.exe   &&   brickout.exe
+;     LEFT/RIGHT move the paddle, UP / SPACE launch the ball, Esc quits.
+;
+; A port of NewFB's 01_brickout2.bas CORE to 320x200 on the GamesCanvas framework:
+; main → GameStart(title, GameInit, GameStep, GameSprites) → GameLoop, with all
+; logic in three callbacks and all state in .DATA globals.  Everything is drawn in
+; GameStep with the canvas primitives (Cls + FillRect + Text) — no sprite sheet, so
+; GameSprites is a bare ret.  Integer fixed-point: positions/velocities are scaled
+; by 256 (an 8-bit fraction) so the ball can move at sub-pixel speed; the screen x/y
+; is value>>8.
+;
+; SFX from the synth: in GameInit we AudioInit, then pre-render Zap and Explode once
+; each into their own .DATA buffers (zapBuf / explodeBuf) by ClearEffect → preset →
+; Render → copy sndBuf.  On a brick break we Play(zapBuf,…); on losing the ball we
+; Play(explodeBuf,…).  main calls AudioShutdown after GameLoop returns.
+;
+; DEFERRED (core game first, per the brief): powerups & drops, combos, steel bricks,
+; the win music, the wide-paddle timer.  The grid here is plain breakable bricks.
+
+.DATA
+titleW    WCHAR "RASM — BrickOut", 0
+
+; ---- tunables -------------------------------------------------------------
+; Geometry (screen pixels).  HUD occupies the top 12 rows; the playfield ceiling
+; is at PF_TOP.  All collision is axis-aligned-rectangle overlap.
+; BRICK grid: 8 cols x 5 rows of 36x10, 2px gap → 8*38=304 wide, left margin 8.
+
+; ---- game-state constants (mirrors the source) ----------------------------
+;   0 = intro, 1 = playing, 2 = win, 3 = gameover
+
+; ---- fixed-point state (x256). screen px = value asr 8 ---------------------
+paddleX   DWORD ?                  ; left edge, fixed-point
+ballX     DWORD ?                  ; top-left, fixed-point
+ballY     DWORD ?
+ballDX    DWORD ?                  ; velocity, fixed-point/frame
+ballDY    DWORD ?
+ballStuck DWORD ?                  ; 1 = parked on the paddle, ready to launch
+
+; ---- integer game state ----------------------------------------------------
+score     DWORD ?
+lives     DWORD ?
+bricksLeft DWORD ?
+gameState DWORD ?
+
+; ---- the brick grid: 8 cols x 5 rows = 40 bricks; 1 = alive, 0 = broken ----
+brickAlive DWORD 40 dup(0)
+
+; ---- pre-rendered SFX buffers (1 s stereo f64 each = 88200 reals) ----------
+zapBuf      real8 88200 dup(0.0)
+zapFrames   DWORD ?
+explodeBuf  real8 88200 dup(0.0)
+explodeFrames DWORD ?
+
+; ---- HUD label strings -----------------------------------------------------
+sScore    BYTE "SCORE", 0
+sLives    BYTE "LIVES", 0
+sBrickOut BYTE "BRICKOUT", 0
+sIntro1   BYTE "LEFT/RIGHT MOVE  SPACE LAUNCH", 0
+sIntro2   BYTE "PRESS SPACE TO START", 0
+sOver1    BYTE "GAME OVER", 0
+sOver2    BYTE "PRESS SPACE TO RESTART", 0
+sWin1     BYTE "YOU WIN", 0
+sWin2     BYTE "PRESS SPACE TO PLAY AGAIN", 0
+numBuf    BYTE "0000000", 0        ; scratch for the decimal HUD numbers
+
+; ---- the soundtrack: a looping A-minor chiptune (square lead + synth bass) ----
+; multi-voice ABC; V:1 = GM 80 (square lead), V:2 = GM 38 (synth bass), looped by
+; the midiOut player.  Built by the very ABC grammar this session finished.
+soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=140", 10, "%%MIDI program 1 80", 10, "%%MIDI program 2 38", 10, "K:Am", 10, "V:1", 10, "e2 a2 e2 c2 | d2 f2 e2 d2 | c2 e2 a2 g2 | e2 d2 c4 |", 10, "V:2", 10, "A,2 E,2 A,2 E,2 | D,2 A,2 E,2 E,2 | A,2 E,2 C2 G,2 | A,2 E,2 A,4 |", 10, 0
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + titleW]
+    lea     rdx, [rip + GameInit]
+    lea     r8, [rip + GameStep]
+    lea     r9, [rip + GameSprites]
+    call    GameStart
+    ; A human plays: open the window straight to the intro screen.  (The headless
+    ; verification filmstrip — `call DemoLaunch` then `GameSelfTest(90,15)` — went
+    ; here; drop those two back in before GameLoop to re-film a run to BMPs.)
+    call    GameLoop                 ; window until Esc — intro -> play -> win/over
+    call    MusicShutdown            ; stop + join the soundtrack thread
+    call    AudioShutdown            ; join the mixer thread + close the device
+    invoke  ExitProcess, 0
+
+; ===========================================================================
+; GameInit — audio up, SFX pre-rendered, the board built, the ball parked.
+; ===========================================================================
+GameInit:
+    call    SeedLinePalette          ; every scanline's 0..15 = the global CGA-16
+    call    AudioInit                ; start the waveOut mixer thread
+
+    ; --- pre-render Zap → zapBuf (the brick-break SFX) ---
+    mov     edx, 120                 ; 120 ms
+    call    Zap                      ; fills sndBuf, sets sndFrames
+    lea     rcx, [rip + zapBuf]
+    lea     rdx, [rip + zapFrames]
+    call    CopySfx
+
+    ; --- pre-render Explode → explodeBuf (the lost-ball SFX) ---
+    mov     edx, 400                 ; 400 ms
+    call    Explode
+    lea     rcx, [rip + explodeBuf]
+    lea     rdx, [rip + explodeFrames]
+    call    CopySfx
+
+    ; --- start the looping soundtrack (ABC text -> midiOut scheduler thread) ---
+    mov     dword ptr [rip + gMusicLoop], 1
+    lea     rcx, [rip + soundtrack]
+    call    ParseTune                ; ABC -> the time-sorted tuneEv array
+    call    MusicInit                ; open MIDI_MAPPER + start the player thread
+
+    call    ResetGame
+    ret
+
+; ===========================================================================
+; CopySfx(rcx = dstBuf, rdx = dstFramesPtr): copy the last Render's sndBuf
+; (sndFrames*2 f64 interleaved) into a private buffer and save the frame count.
+; Clamps the copy to the 1 s buffer (88200 reals) so an over-long render can't
+; run off the end.
+; ===========================================================================
+proc CopySfx uses rbx rsi rdi r12 in rcx rdx
+    mov     rdi, rcx                 ; dst
+    mov     rbx, rdx                 ; dstFramesPtr
+    mov     r12d, [rip + sndFrames]
+    mov     [rbx], r12d              ; *dstFramesPtr = sndFrames
+    mov     ecx, r12d
+    add     ecx, ecx                 ; total interleaved samples = frames*2
+    cmp     ecx, 88200               ; clamp to the buffer (1 s stereo)
+    jbe     cs_go
+    mov     ecx, 88200
+cs_go:
+    lea     rsi, [rip + sndBuf]
+    rep     movsq                    ; copy ecx qwords (f64) src→dst
+endproc
+
+; ===========================================================================
+; ResetGame — fresh score/lives, board rebuilt, ball parked, state = INTRO.
+; ===========================================================================
+proc ResetGame frame
+    mov     dword ptr [rip + score], 0
+    mov     dword ptr [rip + lives], 3
+    mov     dword ptr [rip + gameState], 0       ; INTRO
+    ; paddle centred: (320-40)/2 = 140, fixed-point ×256
+    mov     dword ptr [rip + paddleX], 140 * 256
+    call    BuildBricks
+    call    ResetBall
+endproc
+
+; ===========================================================================
+; BuildBricks — all 40 bricks alive; bricksLeft = 40.
+; ===========================================================================
+proc BuildBricks uses rdi
+    lea     rdi, [rip + brickAlive]
+    mov     rax, 0x0000000100000001   ; two DWORD 1s per qword → all 40 alive
+    mov     ecx, 20                    ; 20 qwords = 40 dwords
+    rep     stosq
+    mov     dword ptr [rip + bricksLeft], 40
+endproc
+
+; ===========================================================================
+; ResetBall — park the ball centred on the paddle, give it a launch velocity,
+; mark it stuck (it follows the paddle until launched).
+; ===========================================================================
+proc ResetBall
+    ; ball centred over the paddle: paddleX + (40/2 - 4/2)*256 = paddleX + 18*256
+    mov     eax, [rip + paddleX]
+    add     eax, 18 * 256
+    mov     [rip + ballX], eax
+    mov     dword ptr [rip + ballY], 178 * 256   ; just above the paddle (paddle y=185)
+    mov     dword ptr [rip + ballDX], 2 * 256 + 96   ; ~2.4 px/frame
+    mov     eax, 3 * 256 + 128                       ; ~3.5 px/frame, upward
+    neg     eax
+    mov     [rip + ballDY], eax
+    mov     dword ptr [rip + ballStuck], 1
+    ret
+endproc
+
+; ===========================================================================
+; DemoLaunch — headless kick: force PLAYING and launch the ball, so GameSelfTest
+; films actual gameplay (ball in motion, bricks breaking) and not the intro.
+; ===========================================================================
+proc DemoLaunch
+    mov     dword ptr [rip + gameState], 1       ; PLAYING
+    mov     dword ptr [rip + ballStuck], 0       ; in flight
+    ret
+endproc
+
+; ===========================================================================
+; GameStep — the whole frame: branch on state, update, then draw into fb.
+; ===========================================================================
+GameStep:
+    mov     eax, [rip + gameState]
+    cmp     eax, 1
+    je      gs_playing
+    ; --- INTRO / WIN / GAMEOVER: wait for SPACE (or FIRE action) to advance ---
+    call    WaitAdvance
+    jmp     gs_draw
+gs_playing:
+    call    UpdatePaddle
+    call    UpdateBall
+    ; --- win check: no bricks left → WIN ---
+    mov     eax, [rip + bricksLeft]
+    test    eax, eax
+    jnz     gs_draw
+    mov     dword ptr [rip + gameState], 2       ; WIN
+gs_draw:
+    call    DrawScene
+    ret
+
+; ===========================================================================
+; WaitAdvance — in a non-playing state, SPACE/FIRE moves us on:
+;   INTRO    → PLAYING (ball already parked on the paddle)
+;   WIN      → fresh game
+;   GAMEOVER → fresh game
+; ===========================================================================
+proc WaitAdvance uses rbx frame
+    mov     ecx, 32                  ; VK_SPACE
+    call    KeyHit
+    mov     ebx, eax
+    mov     ecx, 4                   ; FIRE action (Space/Ctrl) edge
+    call    ActionHit
+    or      ebx, eax
+    test    ebx, ebx
+    jz      wa_done
+    mov     eax, [rip + gameState]
+    cmp     eax, 0                   ; INTRO → PLAYING
+    jne     wa_restart
+    mov     dword ptr [rip + gameState], 1
+    jmp     wa_done
+wa_restart:
+    call    ResetGame                ; WIN / GAMEOVER → new game
+wa_done:
+endproc
+
+; ===========================================================================
+; UpdatePaddle — Action LEFT/RIGHT move it; clamp to [0, 320-40] px.
+; ===========================================================================
+proc UpdatePaddle uses rbx frame
+    xor     ecx, ecx                 ; LEFT
+    call    Action
+    test    eax, eax
+    jz      up_right
+    sub     dword ptr [rip + paddleX], 5 * 256   ; 5 px/frame
+up_right:
+    mov     ecx, 1                   ; RIGHT
+    call    Action
+    test    eax, eax
+    jz      up_clamp
+    add     dword ptr [rip + paddleX], 5 * 256
+up_clamp:
+    mov     eax, [rip + paddleX]     ; clamp left ≥ 0
+    test    eax, eax
+    jns     up_hi
+    xor     eax, eax
+up_hi:
+    cmp     eax, 280 * 256           ; clamp right ≤ (320-40)*256
+    jle     up_store
+    mov     eax, 280 * 256
+up_store:
+    mov     [rip + paddleX], eax
+endproc
+
+; ===========================================================================
+; UpdateBall — the heart: launch handling, integrate, wall/paddle/brick
+; collision, lose-the-ball.  Fixed-point throughout (×256).
+; ===========================================================================
+proc UpdateBall uses rbx rsi rdi r12 r13 r14 r15 frame
+    ; --- parked? follow the paddle; launch on UP / SPACE / FIRE ---
+    mov     eax, [rip + ballStuck]
+    test    eax, eax
+    jz      ub_move
+    mov     eax, [rip + paddleX]     ; keep it centred on the paddle
+    add     eax, 18 * 256
+    mov     [rip + ballX], eax
+    mov     dword ptr [rip + ballY], 178 * 256
+    mov     ecx, 2                   ; UP action
+    call    Action
+    mov     ebx, eax
+    mov     ecx, 32                  ; SPACE
+    call    KeyHit
+    or      ebx, eax
+    mov     ecx, 4                   ; FIRE
+    call    Action
+    or      ebx, eax
+    test    ebx, ebx
+    jz      ub_done
+    mov     dword ptr [rip + ballStuck], 0
+    jmp     ub_done
+
+ub_move:
+    ; integrate position
+    mov     eax, [rip + ballDX]
+    add     [rip + ballX], eax
+    mov     eax, [rip + ballDY]
+    add     [rip + ballY], eax
+
+    ; --- left wall (x ≤ 0): clamp, dx = +|dx| ---
+    mov     eax, [rip + ballX]
+    test    eax, eax
+    jns     ub_wr
+    xor     eax, eax
+    mov     [rip + ballX], eax
+    mov     eax, [rip + ballDX]
+    call    AbsEax
+    mov     [rip + ballDX], eax
+    jmp     ub_ceil
+ub_wr:
+    ; --- right wall (x ≥ (320-4)*256 = 316*256): clamp, dx = -|dx| ---
+    cmp     eax, 316 * 256
+    jl      ub_ceil
+    mov     dword ptr [rip + ballX], 316 * 256
+    mov     eax, [rip + ballDX]
+    call    AbsEax
+    neg     eax
+    mov     [rip + ballDX], eax
+ub_ceil:
+    ; --- ceiling (y ≤ PF_TOP = 20*256): clamp, dy = +|dy| ---
+    mov     eax, [rip + ballY]
+    cmp     eax, 20 * 256
+    jge     ub_floor
+    mov     dword ptr [rip + ballY], 20 * 256
+    mov     eax, [rip + ballDY]
+    call    AbsEax
+    mov     [rip + ballDY], eax
+ub_floor:
+    ; --- missed the ball (y > 200*256): lose a life, Explode, re-park or game over ---
+    mov     eax, [rip + ballY]
+    cmp     eax, 200 * 256
+    jle     ub_paddle
+    dec     dword ptr [rip + lives]
+    lea     rcx, [rip + explodeBuf]          ; SFX: lose the ball
+    mov     edx, [rip + explodeFrames]
+    call    Play
+    mov     eax, [rip + lives]
+    test    eax, eax
+    jg      ub_repark
+    mov     dword ptr [rip + gameState], 3   ; GAMEOVER
+    jmp     ub_done
+ub_repark:
+    call    ResetBall
+    jmp     ub_done
+
+ub_paddle:
+    ; --- paddle collision (only when moving down) ---
+    ; paddle rect: x in [paddleXpx, paddleXpx+40), y in [185,190)
+    mov     eax, [rip + ballDY]
+    test    eax, eax
+    jle     ub_bricks                ; moving up → no paddle bounce
+    ; ball screen px
+    mov     r14d, [rip + ballX]
+    sar     r14d, 8                  ; ballPX
+    mov     r15d, [rip + ballY]
+    sar     r15d, 8                  ; ballPY
+    mov     ebx, [rip + paddleX]
+    sar     ebx, 8                   ; paddlePX
+    ; horizontal overlap: ballPX+4 > paddlePX  &&  ballPX < paddlePX+40
+    mov     eax, r14d
+    add     eax, 4
+    cmp     eax, ebx
+    jle     ub_bricks
+    mov     eax, ebx
+    add     eax, 40
+    cmp     r14d, eax
+    jge     ub_bricks
+    ; vertical: ballPY+4 ≥ 185  &&  ballPY ≤ 190
+    mov     eax, r15d
+    add     eax, 4
+    cmp     eax, 185
+    jl      ub_bricks
+    cmp     r15d, 190
+    jg      ub_bricks
+    ; bounce up; angle from where it hit: dx = (ballCenter - paddleCenter)*scale
+    mov     dword ptr [rip + ballY], 181 * 256   ; sit on top of the paddle
+    mov     eax, [rip + ballDY]
+    call    AbsEax
+    neg     eax
+    mov     [rip + ballDY], eax
+    ; hit = (ballCenter - paddleCenter); ballCenter=ballPX+2, paddleCenter=paddlePX+20
+    mov     eax, r14d
+    add     eax, 2
+    mov     edx, ebx
+    add     edx, 20
+    sub     eax, edx                 ; offset in px, range about [-22,22]
+    ; ballDX = offset * 28  (≈ 0.11 px/frame per px of offset, ×256/… tuned)
+    imul    eax, eax, 28
+    mov     [rip + ballDX], eax
+    jmp     ub_done
+
+ub_bricks:
+    ; --- brick collision: scan the grid, break ONE brick per frame (like source) ---
+    ; brick i = row*8+col.  rect: x = 8 + col*38, y = 24 + row*12, w=36, h=10.
+    mov     r14d, [rip + ballX]
+    sar     r14d, 8                  ; ballPX
+    mov     r15d, [rip + ballY]
+    sar     r15d, 8                  ; ballPY
+    lea     r13, [rip + brickAlive]
+    xor     r12d, r12d               ; brick index i = 0
+ub_bscan:
+    cmp     r12d, 40
+    jge     ub_store
+    mov     eax, [r13 + r12*4]
+    test    eax, eax
+    jz      ub_bnext                 ; already broken
+    ; col = i & 7, row = i >> 3
+    mov     ebx, r12d
+    and     ebx, 7                   ; col
+    mov     esi, r12d
+    sar     esi, 3                   ; row
+    ; brick x = 8 + col*38 ; y = 24 + row*12
+    imul    ebx, ebx, 38
+    add     ebx, 8                   ; brickX (esi-free: ebx = brickX)
+    imul    esi, esi, 12
+    add     esi, 24                  ; brickY
+    ; overlap test (AABB): ballPX+4 > brickX && ballPX < brickX+36
+    mov     eax, r14d
+    add     eax, 4
+    cmp     eax, ebx
+    jle     ub_bnext
+    mov     eax, ebx
+    add     eax, 36
+    cmp     r14d, eax
+    jge     ub_bnext
+    ; ballPY+4 > brickY && ballPY < brickY+10
+    mov     eax, r15d
+    add     eax, 4
+    cmp     eax, esi
+    jle     ub_bnext
+    mov     eax, esi
+    add     eax, 10
+    cmp     r15d, eax
+    jge     ub_bnext
+    ; --- hit! break the brick ---
+    mov     dword ptr [r13 + r12*4], 0
+    dec     dword ptr [rip + bricksLeft]
+    add     dword ptr [rip + score], 10
+    ; bounce axis from the PREVIOUS position (source's rule): prevPX = ballPX - dxpx.
+    ; if the ball was horizontally clear of the brick last frame it entered from a
+    ; side → flip dx; otherwise it came from top/bottom → flip dy.  (ebx = brickX.)
+    mov     edi, [rip + ballDX]
+    sar     edi, 8                   ; dx in px
+    mov     eax, r14d
+    sub     eax, edi                 ; prevPX = ballPX - dxpx
+    ; horizontally clear?  prevPX+4 ≤ brickX  OR  prevPX ≥ brickX+36 → flip dx
+    mov     edx, eax
+    add     edx, 4
+    cmp     edx, ebx
+    jle     ub_flipx
+    mov     edx, ebx
+    add     edx, 36
+    cmp     eax, edx
+    jge     ub_flipx
+    ; came from top/bottom → flip dy
+    mov     eax, [rip + ballDY]
+    neg     eax
+    mov     [rip + ballDY], eax
+    jmp     ub_brkfx
+ub_flipx:
+    mov     eax, [rip + ballDX]
+    neg     eax
+    mov     [rip + ballDX], eax
+ub_brkfx:
+    ; SFX: brick break
+    lea     rcx, [rip + zapBuf]
+    mov     edx, [rip + zapFrames]
+    call    Play
+    jmp     ub_store                 ; one brick per frame, then stop scanning
+ub_bnext:
+    inc     r12d
+    jmp     ub_bscan
+
+ub_store:
+ub_done:
+endproc
+
+; ===========================================================================
+; AbsEax — eax = |eax|.  Leaf helper (no frame).
+; ===========================================================================
+proc AbsEax
+    mov     edx, eax
+    sar     edx, 31
+    xor     eax, edx
+    sub     eax, edx
+    ret
+endproc
+
+; ===========================================================================
+; DrawScene — Cls then HUD, bricks, paddle, ball, and any state banner.
+; ===========================================================================
+proc DrawScene uses rbx rsi rdi r12 r13 frame
+    xor     ecx, ecx                 ; black background
+    call    Cls
+
+    ; --- HUD bar (dark blue strip across the top) ---
+    xor     ecx, ecx
+    xor     edx, edx
+    mov     r8d, 320
+    mov     r9d, 12
+    mov     r10b, 1                  ; colour 1 = blue
+    call    FillRect
+    ; "SCORE" label + number
+    mov     ecx, 2
+    mov     edx, 3
+    mov     r8b, 15                  ; white
+    lea     r9, [rip + sScore]
+    call    Text
+    mov     ecx, [rip + score]
+    mov     edx, 38                  ; pen x
+    call    DrawNum
+    ; "LIVES" label + number
+    mov     ecx, 120
+    mov     edx, 3
+    mov     r8b, 15
+    lea     r9, [rip + sLives]
+    call    Text
+    mov     ecx, [rip + lives]
+    mov     edx, 156
+    call    DrawNum
+    ; title at the right
+    mov     ecx, 250
+    mov     edx, 3
+    mov     r8b, 14                  ; yellow
+    lea     r9, [rip + sBrickOut]
+    call    Text
+
+    ; --- bricks: 8 cols x 5 rows, colour by row ---
+    lea     r13, [rip + brickAlive]
+    xor     r12d, r12d               ; i
+db_brick:
+    cmp     r12d, 40
+    jge     db_paddle
+    mov     eax, [r13 + r12*4]
+    test    eax, eax
+    jz      db_bnext
+    mov     ebx, r12d
+    and     ebx, 7                   ; col
+    mov     esi, r12d
+    sar     esi, 3                   ; row
+    ; x = 8 + col*38 ; y = 24 + row*12
+    imul    ebx, ebx, 38
+    add     ebx, 8                   ; x
+    mov     edi, esi
+    imul    edi, edi, 12
+    add     edi, 24                  ; y
+    ; colour from the row: rows 0,1 red(12); 2,3 yellow(14); 4 green(10)
+    mov     r10d, 12
+    cmp     esi, 2
+    jl      db_fill
+    mov     r10d, 14
+    cmp     esi, 4
+    jl      db_fill
+    mov     r10d, 10
+db_fill:
+    mov     ecx, ebx                 ; x
+    mov     edx, edi                 ; y
+    mov     r8d, 36                  ; w
+    mov     r9d, 10                  ; h
+    call    FillRect
+db_bnext:
+    inc     r12d
+    jmp     db_brick
+
+db_paddle:
+    ; --- paddle (cyan), y=185, w=40, h=5 ---
+    mov     ecx, [rip + paddleX]
+    sar     ecx, 8
+    mov     edx, 185
+    mov     r8d, 40
+    mov     r9d, 5
+    mov     r10b, 11                 ; light cyan
+    call    FillRect
+
+    ; --- ball (white 4x4) ---
+    mov     ecx, [rip + ballX]
+    sar     ecx, 8
+    mov     edx, [rip + ballY]
+    sar     edx, 8
+    mov     r8d, 4
+    mov     r9d, 4
+    mov     r10b, 15
+    call    FillRect
+
+    ; --- state banners ---
+    mov     eax, [rip + gameState]
+    cmp     eax, 0
+    je      db_intro
+    cmp     eax, 2
+    je      db_win
+    cmp     eax, 3
+    je      db_over
+    jmp     db_done
+db_intro:
+    mov     ecx, 50
+    mov     edx, 150
+    mov     r8b, 11
+    lea     r9, [rip + sIntro1]
+    call    Text
+    mov     ecx, 72
+    mov     edx, 165
+    mov     r8b, 14
+    lea     r9, [rip + sIntro2]
+    call    Text
+    jmp     db_done
+db_win:
+    mov     ecx, 130
+    mov     edx, 95
+    mov     r8b, 10
+    lea     r9, [rip + sWin1]
+    call    Text
+    mov     ecx, 80
+    mov     edx, 110
+    mov     r8b, 15
+    lea     r9, [rip + sWin2]
+    call    Text
+    jmp     db_done
+db_over:
+    mov     ecx, 124
+    mov     edx, 95
+    mov     r8b, 12
+    lea     r9, [rip + sOver1]
+    call    Text
+    mov     ecx, 88
+    mov     edx, 110
+    mov     r8b, 15
+    lea     r9, [rip + sOver2]
+    call    Text
+db_done:
+endproc
+
+; ===========================================================================
+; DrawNum(ecx = value, edx = penX) — render an unsigned int as decimal Text in
+; white at HUD row y=3.  Builds digits into numBuf (right-aligned, then skips
+; leading zeros).
+; ===========================================================================
+proc DrawNum uses rbx rsi rdi r12 r13 frame in rcx rdx
+    mov     r12d, edx                ; penX
+    mov     eax, ecx                 ; value
+    lea     rdi, [rip + numBuf]
+    ; write 7 digits right-to-left into numBuf[0..6], numBuf[7]=0 already
+    mov     ebx, 10                  ; divisor
+    mov     r13d, 6                  ; index (last char)
+dn_div:
+    xor     edx, edx
+    div     ebx                      ; eax / 10, edx = remainder
+    add     dl, 48                   ; → ASCII
+    mov     ecx, r13d
+    mov     [rdi + rcx], dl
+    dec     r13d
+    test    eax, eax
+    jnz     dn_div
+    ; first significant char is at r13+1
+    inc     r13d
+    lea     rsi, [rdi + r13]         ; → first digit
+    ; Text(penX, 3, white, rsi)
+    mov     ecx, r12d
+    mov     edx, 3
+    mov     r8b, 15
+    mov     r9, rsi
+    call    Text
+endproc
+
+; ===========================================================================
+; GameSprites — no sprite sheet; everything is primitives in GameStep.
+; ===========================================================================
+GameSprites:
+    ret
+
+; ---- G5: the SAME game, retargeted from library/ (CPU) to gpu/ (D3D11). ONLY these
+; .include lines changed — the game body above is byte-for-byte the original
+; brickout.was. The GPU canvas presents a 320x200 LOGICAL surface (CanvasW/CanvasH =
+; 320/200, exactly the library values) centred in its 640x360 physical idxBuf via a
+; draw origin, so brickout's hardcoded 320x200 coordinates render unchanged. The GPU
+; stack adds blit + text under canvas (the indexed LUT background + the instanced text
+; layer), and the harness owns the GPU compositor present. Audio includes stay CPU-side.
+.include "../gpu/canvas.was"               ; idxBuf + palette LUTs + indexed primitives (320x200 logical)
+.include "../gpu/blit.was"                 ; blend states (the text layer needs pBlendAlpha)
+.include "../gpu/text.was"                 ; the instanced 5x7 text layer (Text -> DrawText)
+.include "../gpu/input.was"                ; keyboard + actions (arrows / Esc=quit)
+.include "../gpu/harness.was"              ; window + loop + GPU compositor present
+.include "../gpu/introspect.was"           ; Snapshot (= GpuSnapshot, the filmstrip)
+.include "../library/audio/sound/sound.was" ; the synth + the live waveOut mixer
+.include "../library/audio/music/abc.was"   ; the ABC parser + the midiOut player

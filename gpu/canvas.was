@@ -11,7 +11,7 @@
 ;   GpuInit(hwnd in rcx)              — device/swapchain/textures/shader; palettes
 ;   GpuPresent                        — upload idxBuf, draw the fullscreen LUT pass, Present
 ;   GpuSnapshot                       — backbuffer -> staging -> 24-bit BMP "gpu_g0.bmp"
-;   CanvasW / CanvasH                 — DWORD 640 / 360
+;   CanvasW / CanvasH                 — DWORD 320 / 200 (LOGICAL; physical idxBuf is 640x360)
 ;
 ; Built by adapting examples/mandel_gpu.was — same comobj / .Method COM idioms,
 ; same .ASCIISTRING + D3DCompile, same struct..ends descriptors, same invoke ABI.
@@ -56,10 +56,28 @@ srcName   BYTE "gpucanvas", 0
 
 .balign 16
 ; ---- public canvas geometry (games read these, never hardcode) ----
+; PARITY: the CPU canvas (library/canvas.was) is a 320x200 logical surface. The GPU
+; canvas mirrors that LOGICAL size — CanvasW/CanvasH = 320/200, byte-for-byte the
+; library values — even though the PHYSICAL index buffer is 640x360 (idxBuf, the LUT
+; textures, the line palette all stay 640x360). A draw ORIGIN (canvasOX/canvasOY,
+; default 160,80) biases every primitive + Text so the 320x200 logical region is
+; CENTRED in the 640x360 physical buffer. A 320x200-hardcoded game (e.g. brickout)
+; therefore retargets library/ -> gpu/ with ZERO source changes and renders centred,
+; not corner-stuck. Full-screen games call CanvasSetOrigin(0,0) and read CanvasW/H.
 .globl CanvasW
 .globl CanvasH
-CanvasW   DWORD 640
-CanvasH   DWORD 360
+CanvasW   DWORD 320
+CanvasH   DWORD 200
+
+; ---- draw origin: added to every primitive's x,y (and Text's). Default centres a
+; 320x200 logical surface in the 640x360 physical idxBuf. PhysW/PhysH are the real
+; index-buffer extents the primitives clip to. ----
+.globl canvasOX
+.globl canvasOY
+canvasOX  DWORD 160
+canvasOY  DWORD 80
+PhysW     DWORD 640
+PhysH     DWORD 360
 
 ; ---- the index buffer the game draws into (640x360, one byte = one index) ----
 .globl idxBuf
@@ -550,11 +568,19 @@ bp_cga:
     dec     ecx
     jnz     bp_cga
 
-    ; ---- global[16..255] = ramp. For index i (16..255), t=i-16 (0..239):
+    ; ---- global[16..255] = a smooth colour ramp. For index i (16..255), t=i-16:
     ;        R = t                 (0..239)
     ;        G = (t*2) & 0xFF
     ;        B = 255 - t           (255..16)
     ;      packed 0xFF<R><G><B>. ----
+    ; PARITY CAVEAT: library/canvas.was defaults palette[16..255] to BLACK (DWORD 240
+    ; dup(0)). This ramp is a DEMO palette the earlier sprints (gpu_g2/g3 tiles use
+    ; indices 36/80/120/160/200 and rely on it for recognizable colours) — it is NOT
+    ; library-parity. The low 16 (0..15) ARE library-parity (CGA-16 = cgaTable). A
+    ; library-retargeted game that draws with indices 16..255 would see ramp colours
+    ; on GPU but black on CPU; a game wanting CPU-identical high colours must seed
+    ; palGlobalData[16..255] itself. brickout uses only indices 0,1,10,11,12,14,15
+    ; (all <16, fully library-parity), so this caveat does not affect the G5 game.
     mov     ecx, 16                          ; index i
 bp_ramp:
     cmp     ecx, 256
@@ -655,6 +681,561 @@ bp_line_done:
     pop     r12
     pop     rdi
     pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; ===========================================================================
+; IMMEDIATE-MODE INDEXED PRIMITIVES (G5 parity layer)
+;
+; These mirror library/canvas.was EXACTLY — same arg registers, same clip rules,
+; same colour-index semantics — but write into the GPU index buffer idxBuf
+; (640x360 PHYSICAL, stride 640) instead of the CPU fb (320x200, stride 320).
+; GpuPresent uploads idxBuf and the LUT pixel shader resolves each index through the
+; palette textures, so the indexed soul is identical; only the resolve moved to the GPU.
+;
+; COORDINATE SPACE: the public canvas is a 320x200 LOGICAL surface (CanvasW/CanvasH),
+; identical to library/canvas.was. Every primitive adds the draw ORIGIN (canvasOX/
+; canvasOY, default 160,80) to its x,y so the logical surface is CENTRED in the
+; 640x360 physical idxBuf — a 320x200-hardcoded game (brickout) draws unchanged and
+; lands centred. The clip bounds below are PHYSICAL (640x360), applied AFTER the bias.
+; A game retargeting library/ -> gpu/ gets the same primitives with zero source changes.
+; ===========================================================================
+; ===========================================================================
+
+; ---- CanvasSetOrigin(ecx=ox, edx=oy): set the draw origin (the bias added to
+; every primitive's x,y). Default is (160,80) — a 320x200 logical surface centred
+; in the 640x360 physical idxBuf. Full-screen 640x360 games call (0,0). ----
+.globl CanvasSetOrigin
+proc CanvasSetOrigin in rcx rdx
+    mov     [rip + canvasOX], ecx
+    mov     [rip + canvasOY], edx
+endproc
+
+; ---- Cls(cl = index): fill the index buffer ----
+; Cls fills the WHOLE physical buffer (origin-independent) — like the library Cls
+; which fills the whole 320x200 fb. The background is uniform, so no bias is needed.
+.globl Cls
+proc Cls uses rdi in rcx
+    lea     rdi, [rip + idxBuf]
+    mov     al, cl
+    mov     ecx, 230400                   ; 640*360
+    rep     stosb
+endproc
+
+; ---- Pset(ecx=x, edx=y, r8b=index): one bounds-checked pixel ----
+.globl Pset
+proc Pset in rcx rdx r8
+    add     ecx, [rip + canvasOX]         ; logical -> physical (draw origin)
+    add     edx, [rip + canvasOY]
+    cmp     ecx, 640                      ; unsigned: a negative x wraps high -> rejected
+    jae     ps_done
+    cmp     edx, 360
+    jae     ps_done
+    mov     eax, edx
+    imul    eax, eax, 640
+    add     eax, ecx
+    lea     r9, [rip + idxBuf]
+    mov     [r9 + rax], r8b
+ps_done:
+endproc
+
+; ---- Pget(ecx=x, edx=y) -> eax = index (0 if off-screen) ----
+.globl Pget
+proc Pget in rcx rdx
+    add     ecx, [rip + canvasOX]         ; logical -> physical (draw origin)
+    add     edx, [rip + canvasOY]
+    xor     eax, eax
+    cmp     ecx, 640
+    jae     pg_done
+    cmp     edx, 360
+    jae     pg_done
+    mov     eax, edx
+    imul    eax, eax, 640
+    add     eax, ecx
+    lea     r8, [rip + idxBuf]
+    movzx   eax, byte ptr [r8 + rax]
+pg_done:
+endproc
+
+; ---- HLine(ecx=x, edx=y, r8d=len, r9b=index): clipped horizontal run ----
+.globl HLine
+proc HLine uses rdi in rcx rdx r8 r9
+    add     ecx, [rip + canvasOX]         ; logical -> physical (draw origin)
+    add     edx, [rip + canvasOY]
+    cmp     edx, 360
+    jae     hl_done
+    test    ecx, ecx
+    jns     hl_xpos
+    add     r8d, ecx
+    xor     ecx, ecx
+hl_xpos:
+    mov     eax, ecx
+    add     eax, r8d
+    cmp     eax, 640
+    jle     hl_go
+    mov     r8d, 640
+    sub     r8d, ecx
+hl_go:
+    test    r8d, r8d
+    jle     hl_done
+    mov     eax, edx
+    imul    eax, eax, 640
+    add     eax, ecx
+    lea     rdi, [rip + idxBuf]
+    add     rdi, rax
+    mov     al, r9b
+    mov     ecx, r8d
+    rep     stosb
+hl_done:
+endproc
+
+; ---- VLine(ecx=x, edx=y, r8d=len, r9b=index): clipped vertical run ----
+.globl VLine
+proc VLine uses rdi in rcx rdx r8 r9
+    add     ecx, [rip + canvasOX]         ; logical -> physical (draw origin)
+    add     edx, [rip + canvasOY]
+    cmp     ecx, 640
+    jae     vl_done
+    test    edx, edx
+    jns     vl_ypos
+    add     r8d, edx
+    xor     edx, edx
+vl_ypos:
+    mov     eax, edx
+    add     eax, r8d
+    cmp     eax, 360
+    jle     vl_go
+    mov     r8d, 360
+    sub     r8d, edx
+vl_go:
+    test    r8d, r8d
+    jle     vl_done
+    mov     eax, edx
+    imul    eax, eax, 640
+    add     eax, ecx
+    lea     rdi, [rip + idxBuf]
+    add     rdi, rax
+vl_loop:
+    mov     [rdi], r9b
+    add     rdi, 640
+    dec     r8d
+    jnz     vl_loop
+vl_done:
+endproc
+
+; ---- FillRect(ecx=x, edx=y, r8d=w, r9d=h, r10b=index) ----
+.globl FillRect
+proc FillRect uses rbx rsi rdi in rcx rdx r8 r9 r10
+    add     ecx, [rip + canvasOX]         ; logical -> physical (draw origin)
+    add     edx, [rip + canvasOY]
+    test    ecx, ecx                      ; clip the left edge: x<0 -> shorten w, clamp x=0
+    jns     fr_xok
+    add     r8d, ecx
+    xor     ecx, ecx
+fr_xok:
+    mov     ebx, edx                      ; y (row counter)
+fr_row:
+    test    r9d, r9d
+    jle     fr_done
+    cmp     ebx, 360
+    jae     fr_next                       ; row off-screen -> skip (still advance)
+    mov     eax, ebx
+    imul    eax, eax, 640
+    add     eax, ecx
+    lea     rdi, [rip + idxBuf]
+    add     rdi, rax
+    mov     esi, r8d                      ; w
+    mov     edx, ecx                      ; x (for clip)
+fr_col:
+    test    esi, esi
+    jle     fr_next
+    cmp     edx, 640
+    jae     fr_next
+    mov     [rdi], r10b
+    inc     rdi
+    inc     edx
+    dec     esi
+    jmp     fr_col
+fr_next:
+    inc     ebx
+    dec     r9d
+    jmp     fr_row
+fr_done:
+endproc
+
+; ---- Rect(ecx=x, edx=y, r8d=w, r9d=h, r10b=index): 1px outline ----
+.globl Rect
+proc Rect uses rbx rsi rdi r12 r13 frame in rcx rdx r8 r9 r10
+    test    r8d, r8d
+    jle     rc_done
+    test    r9d, r9d
+    jle     rc_done
+    mov     esi, ecx
+    mov     edi, edx
+    mov     ebx, r8d
+    mov     r12d, r9d
+    mov     r13b, r10b
+    mov     ecx, esi                      ; top
+    mov     edx, edi
+    mov     r8d, ebx
+    movzx   r9d, r13b
+    call    HLine
+    mov     ecx, esi                      ; bottom
+    mov     edx, edi
+    add     edx, r12d
+    dec     edx
+    mov     r8d, ebx
+    movzx   r9d, r13b
+    call    HLine
+    mov     ecx, esi                      ; left
+    mov     edx, edi
+    mov     r8d, r12d
+    movzx   r9d, r13b
+    call    VLine
+    mov     ecx, esi                      ; right
+    add     ecx, ebx
+    dec     ecx
+    mov     edx, edi
+    mov     r8d, r12d
+    movzx   r9d, r13b
+    call    VLine
+rc_done:
+endproc
+
+; ---- Line(ecx=x0, edx=y0, r8d=x1, r9d=y1, r10b=index): Bresenham ----
+.globl Line
+proc Line uses rbx rsi rdi r12 r13 in rcx rdx r8 r9 r10
+    add     ecx, [rip + canvasOX]         ; logical -> physical (draw origin) — both endpoints
+    add     edx, [rip + canvasOY]
+    add     r8d, [rip + canvasOX]
+    add     r9d, [rip + canvasOY]
+    mov     eax, r8d
+    sub     eax, ecx
+    mov     r11d, eax
+    sar     r11d, 31
+    xor     edi, edi
+    test    eax, eax
+    setg    dil
+    add     edi, r11d                     ; sx
+    xor     eax, r11d
+    sub     eax, r11d
+    mov     ebx, eax                      ; dx = |dx|
+    mov     eax, r9d
+    sub     eax, edx
+    mov     r11d, eax
+    sar     r11d, 31
+    xor     r12d, r12d
+    test    eax, eax
+    setg    r12b
+    add     r12d, r11d                    ; sy
+    xor     eax, r11d
+    sub     eax, r11d
+    neg     eax
+    mov     esi, eax                      ; dy = -|dy|
+    mov     r11d, ebx
+    add     r11d, esi                     ; err
+    lea     r13, [rip + idxBuf]
+ln_loop:
+    cmp     ecx, 640
+    jae     ln_nopl
+    cmp     edx, 360
+    jae     ln_nopl
+    mov     eax, edx
+    imul    eax, eax, 640
+    add     eax, ecx
+    mov     [r13 + rax], r10b
+ln_nopl:
+    cmp     ecx, r8d
+    jne     ln_step
+    cmp     edx, r9d
+    je      ln_end
+ln_step:
+    mov     eax, r11d
+    add     eax, eax
+    cmp     eax, esi
+    jl      ln_chky
+    add     r11d, esi
+    add     ecx, edi
+ln_chky:
+    cmp     eax, ebx
+    jg      ln_loop
+    add     r11d, ebx
+    add     edx, r12d
+    jmp     ln_loop
+ln_end:
+endproc
+
+; ---- Circle(ecx=cx, edx=cy, r8d=r, r9b=index): midpoint outline ----
+.globl Circle
+proc Circle uses rbx rsi rdi r12 r13 r14 frame in rcx rdx r8 r9
+    mov     esi, ecx
+    mov     edi, edx
+    mov     r12b, r9b
+    mov     ebx, r8d
+    neg     ebx
+    xor     r13d, r13d
+    mov     r14d, 2
+    mov     eax, r8d
+    add     eax, eax
+    sub     r14d, eax
+ci_loop:
+    mov     ecx, esi
+    sub     ecx, ebx
+    mov     edx, edi
+    add     edx, r13d
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi
+    sub     ecx, r13d
+    mov     edx, edi
+    sub     edx, ebx
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi
+    add     ecx, ebx
+    mov     edx, edi
+    sub     edx, r13d
+    movzx   r8d, r12b
+    call    Pset
+    mov     ecx, esi
+    add     ecx, r13d
+    mov     edx, edi
+    add     edx, ebx
+    movzx   r8d, r12b
+    call    Pset
+    mov     eax, r14d
+    cmp     eax, r13d
+    jg      ci_chkx
+    inc     r13d
+    mov     r9d, r13d
+    add     r9d, r9d
+    inc     r9d
+    add     r14d, r9d
+ci_chkx:
+    cmp     eax, ebx
+    jg      ci_stepx
+    cmp     r14d, r13d
+    jle     ci_until
+ci_stepx:
+    inc     ebx
+    mov     r9d, ebx
+    add     r9d, r9d
+    inc     r9d
+    add     r14d, r9d
+ci_until:
+    test    ebx, ebx
+    js      ci_loop
+endproc
+
+; ---- Disc(ecx=cx, edx=cy, r8d=r, r9b=index): filled, span per row ----
+.globl Disc
+proc Disc uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx r8 r9
+    mov     esi, ecx
+    mov     edi, edx
+    mov     ebx, r8d
+    mov     r12b, r9b
+    mov     r14d, r8d
+    imul    r14d, r14d
+    mov     r13d, ebx
+    neg     r13d
+di_row:
+    cmp     r13d, ebx
+    jg      di_done
+    mov     eax, r13d
+    imul    eax, eax
+    mov     r11d, r14d
+    sub     r11d, eax
+    xor     r15d, r15d
+di_sqrt:
+    mov     eax, r15d
+    inc     eax
+    imul    eax, eax
+    cmp     eax, r11d
+    jg      di_span
+    inc     r15d
+    jmp     di_sqrt
+di_span:
+    mov     ecx, esi
+    sub     ecx, r15d
+    mov     edx, edi
+    add     edx, r13d
+    mov     r8d, r15d
+    add     r8d, r8d
+    inc     r8d
+    movzx   r9d, r12b
+    call    HLine
+    inc     r13d
+    jmp     di_row
+di_done:
+endproc
+
+; ---- FillCircle = Disc alias (library spells it Disc; some games say FillCircle) ----
+.globl FillCircle
+FillCircle:
+    jmp     Disc
+
+; ===========================================================================
+; Text(ecx=x, edx=y, r8b=index, r9=asciiz) — the 4-arg COLOUR-CARRYING Text that
+; library/canvas.was exports. The GPU text layer (gpu/text.was) splits this into
+; TxtSetColour(rgb) + DrawText(x,y,str); the library carries the colour inline as a
+; palette INDEX. So: map the index through cgaTable (the same 16 the LUT uses for
+; the low range) to an 0x00RRGGBB, set the text colour, then append the glyphs.
+; Indices >=16 fall back to the global colour (black after BuildPalettes) from
+; palGlobalData. The glyphs are QUEUED (one DrawInstanced in TxtFlush, driven by the
+; harness present). x,y are in the LOGICAL canvas (320x200); the draw origin biases
+; them into the 640x360 physical space, identical to the primitives.
+;
+; LOW-INDEX RESOLVE (parity note): the indexed BACKGROUND resolves index 0..15 through
+; palLineData (per-scanline, seeded from cgaTable by SeedLinePalette). Text bakes its
+; colour ONCE per call from cgaTable directly (a glyph spans 7 rows, so there is no
+; single scanline to resolve through — the library Text likewise bakes one colour per
+; call). While palLineData == cgaTable (the seeded default, brickout's case) text and
+; fills are identical. A game that pokes palLineData via SetLineColour AFTER seeding
+; would see its fills change but text in that index stay cgaTable — matching the
+; library only up to its own single-colour-per-call text model. brickout never calls
+; SetLineColour, so this is invisible here.
+; ===========================================================================
+.globl Text
+Text:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+    mov     edi, ecx                      ; x
+    add     edi, [rip + canvasOX]         ; logical -> physical (draw origin), same as the
+    mov     esi, edx                      ; y    primitives, so text tracks the fills
+    add     esi, [rip + canvasOY]
+    mov     rbx, r9                       ; string
+    ; ---- colour index -> 0x00RRGGBB ----
+    movzx   ecx, r8b                      ; index
+    cmp     ecx, 16
+    jae     tx_global
+    ; low 16: cgaTable[index] is 0xFFRRGGBB -> mask off A.
+    lea     rax, [rip + cgaTable]
+    mov     ecx, [rax + rcx*4]
+    and     ecx, 0x00FFFFFF
+    jmp     tx_setcol
+tx_global:
+    ; >=16: palGlobalData[index] is 0xAARRGGBB (BGRA in memory) -> mask off A.
+    lea     rax, [rip + palGlobalData]
+    mov     ecx, [rax + rcx*4]
+    and     ecx, 0x00FFFFFF
+tx_setcol:
+    call    TxtSetColour                  ; ecx = 0x00RRGGBB
+    mov     ecx, edi                      ; x
+    mov     edx, esi                      ; y
+    mov     r8, rbx                       ; string
+    call    DrawText
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; SeedLinePalette — set every scanline's 16-colour row in palLineData to the
+; global CGA-16 (cgaTable). Mirrors library SeedLinePalette (which copies
+; palette[0..15] into every linePal row). Then re-upload palLineData to the GPU
+; so the change is visible this frame.
+; ===========================================================================
+.globl SeedLinePalette
+proc SeedLinePalette uses rsi rdi r12 frame
+    lea     rdi, [rip + palLineData]
+    xor     r12d, r12d                    ; row 0..359
+sl_row:
+    lea     rsi, [rip + cgaTable]         ; copy cgaTable[0..15] (0xFFRRGGBB = BGRA)
+    mov     ecx, 16
+sl_col:
+    mov     eax, [rsi]
+    mov     [rdi], eax
+    add     rsi, 4
+    add     rdi, 4
+    dec     ecx
+    jnz     sl_col
+    inc     r12d
+    cmp     r12d, 360
+    jl      sl_row
+    call    UploadLinePalette
+endproc
+
+; ===========================================================================
+; SetLineColour(ecx=y, edx=index, r8d=rgb) — poke one per-line palette entry, then
+; re-upload. rgb is 0x00RRGGBB; palLineData wants 0xFFRRGGBB (BGRA, A=FF). Mirrors
+; library SetLineColour (linePal[y*16+index] = rgb).
+; ===========================================================================
+.globl SetLineColour
+proc SetLineColour uses rdi frame in rcx rdx r8
+    mov     eax, ecx
+    shl     eax, 4                        ; y*16
+    add     eax, edx                      ; + index
+    lea     rdi, [rip + palLineData]
+    or      r8d, 0xFF000000               ; force opaque alpha
+    mov     [rdi + rax*4], r8d
+    call    UploadLinePalette
+endproc
+
+; ---- UploadLinePalette: push palLineData to the per-line palette texture ----
+; (UpdateSubresource: full subresource, box=NULL, srcRowPitch=64 = 16*4, depth=0.)
+UploadLinePalette:
+    push    rbx
+    sub     rsp, 32
+    pContext.UpdateSubresource([rip + pTexLine], 0, 0, palLineData, 64, 0)
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; CyclePalette(ecx=lo, edx=hi) — rotate palGlobalData[lo..hi] up by one, then
+; re-upload the global palette. Mirrors library CyclePalette.
+; ===========================================================================
+.globl CyclePalette
+proc CyclePalette uses rbx frame in rcx rdx
+    lea     r8, [rip + palGlobalData]
+    mov     ebx, [r8 + rcx*4]             ; tmp = global[lo]
+cp_loop:
+    cmp     ecx, edx
+    jge     cp_last
+    mov     r9d, [r8 + rcx*4 + 4]
+    mov     [r8 + rcx*4], r9d
+    inc     ecx
+    jmp     cp_loop
+cp_last:
+    mov     [r8 + rcx*4], ebx             ; global[hi] = tmp
+    pContext.UpdateSubresource([rip + pTexGlobal], 0, 0, palGlobalData, 1024, 0)
+endproc
+
+; ===========================================================================
+; GpuComposite — upload idxBuf, run the fullscreen LUT pass into the back buffer,
+; and STOP (no Present). The harness draws text ON TOP, then flips. This is
+; GpuPresent split so the text layer can composite over the resolved background.
+; ===========================================================================
+.globl GpuComposite
+GpuComposite:
+    push    rbx
+    sub     rsp, 32
+
+    pContext.UpdateSubresource([rip + pTexIdx], 0, 0, idxBuf, 640, 0)
+
+    pContext.OMSetRenderTargets(1, pRTV, 0)
+    pContext.ClearRenderTargetView([rip + pRTV], clearCol)
+    pContext.RSSetViewports(1, vp)
+    pContext.RSSetState([rip + pRast])
+    pContext.VSSetShader([rip + pVS], 0, 0)
+    pContext.PSSetShader([rip + pPS], 0, 0)
+
+    mov     rax, [rip + pSRVidx]
+    mov     [rip + srvArray + 0], rax
+    mov     rax, [rip + pSRVglobal]
+    mov     [rip + srvArray + 8], rax
+    mov     rax, [rip + pSRVline]
+    mov     [rip + srvArray + 16], rax
+    pContext.PSSetShaderResources(0, 3, srvArray)
+
+    pContext.IASetPrimitiveTopology(4)
+    pContext.Draw(3, 0)
+
+    add     rsp, 32
     pop     rbx
     ret
 
