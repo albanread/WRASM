@@ -13,6 +13,38 @@ use std::process::ExitCode;
 use rasm::{assemble, write_coff, write_pe};
 use winkb::Kb;
 
+const HELP: &str = "\
+was — assemble WRASM (a Windows x86-64 assembly dialect) to a PE .exe or COFF object.
+
+USAGE
+  was <input.was> -o <out.exe|out.obj>   assemble (.exe = self-contained PE, else COFF)
+  was <input.was> --emit-asm             print the lowered rasm text, then stop
+  was <input.was> --check                semantic check only (diagnostics, no output)
+  was <input.was> -o x.exe --entry NAME  set the PE entry symbol (default: main)
+  was -h | --help                        this help
+
+The knowledge DB ($WINKB_DB, else E:\\windows_api\\windows_api.db) resolves `invoke`
+signatures, Windows constants, struct fields, and `sizeof`.
+
+THE WRASM DIALECT — Intel/MASM-compatible, with exceptions
+  Intel syntax (`mov dst, src`; `[rip + label]`) plus MASM-style macros: `invoke`,
+  `proc`/`endproc` (with `uses`/`in`/`out`/`frame` contract checks), `struct`/`ends`,
+  `comcall`, `sizeof`, `.include`. Data: BYTE WORD DWORD QWORD WCHAR, and real4/real8
+  (`x real8 440.0` -> IEEE bits), with `N dup(v)`. Everything lowers to *visible*
+  instructions -- nothing is hidden (see `--emit-asm`).
+
+  Exceptions that bite (the full reference is help.md):
+    * `invoke` uses rax/eax as scratch to stage stack args -- never pass an `invoke`
+      argument that lives in rax/eax; route it through memory or another register.
+    * xmm0-5 are volatile, xmm6-15 are callee-saved. The `uses` contract tracks GP
+      registers ONLY, not xmm -- save xmm6+ yourself if a proc touches them.
+    * a `proc` that contains `invoke`/`call` must declare `frame` (aligned shadow space).
+    * float args to `invoke` need a real4/real8 annotation: `invoke f, real8 [rip+x]`.
+    * `dup` count must be a literal: `BYTE 64 dup(0)`, not `BYTE 8*8 dup(0)`.
+    * no manual `sub rsp` inside a `frame` proc -- use a memory slot or xmm0-5.
+    * a `','` char literal trips the lexer -- use the ASCII number (44) instead.
+";
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -52,10 +84,7 @@ fn run() -> anyhow::Result<()> {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!(
-                    "usage: was <input.asm> [-o <out.obj|out.exe>] [--entry NAME] [--emit-asm]\n\
-                     (a .exe output is a self-contained PE; otherwise a COFF object)"
-                );
+                print!("{HELP}");
                 return Ok(());
             }
             other => {
@@ -66,7 +95,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     let Some(input) = input else {
-        anyhow::bail!("no input file\nusage: was <input.asm> [-o <output.obj>] [--emit-asm]");
+        anyhow::bail!("no input file — try `was --help`");
     };
 
     let db = std::env::var("WINKB_DB")
