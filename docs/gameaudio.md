@@ -52,6 +52,24 @@ Nothing built yet — design ahead of the next phase. Every piece maps to existi
 
 ---
 
+## Toolchain reality (verified, day 1)
+
+Spiked before writing any synth, and it reshapes the math:
+- **SSE f64 works** — `movsd`/`addsd`/`mulsd`/`divsd`/`sqrtsd`/`roundsd`/`cvtsi2sd`/
+  `cvttsd2si` all encode + run.
+- **`real4`/`real8` data literals** now parse (`freq real8 440.0` → IEEE-754 bits) —
+  added to `was`, so audio constants are readable, not hand-computed hex.
+- **No libm**: the `windows_api` DB has *no* `sin`/`cos`/`pow`/`tanh`/`floor`/`sqrt`, so
+  we can't `invoke` them. Instead:
+  - **sine** ← a precomputed `library/audio/sound/sinetab.inc` (1024 × f64,
+    `sin(2π·i/1024)`), indexed by phase (`i = (phase/2π)*1024 & 1023`) — no runtime
+    `sin`. Square/saw/triangle/pulse are pure SSE arithmetic; noise from the LCG.
+  - **floor/round** → `roundsd`/`cvttsd2si`; **sqrt** → `sqrtsd`; **pow** (echo
+    `decay^e`) → repeated multiply; **tanh** (distortion) → a polynomial, or deferred.
+
+  Better than libm: fully self-contained, deterministic, transparent — no CRT
+  dependency, the classic wavetable-synth approach.
+
 # sound/ — the SFX synth
 
 A sound is an **offline render** into a float PCM buffer, then written to `.wav` or
