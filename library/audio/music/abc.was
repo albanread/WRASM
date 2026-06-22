@@ -41,11 +41,16 @@
 ;   Rests z/Z (advance curMs, emit nothing).  Bar line | resets bar accidentals.
 ;   Spaces/newlines separate; unknown chars ignored gracefully.
 ;
+; --- IMPLEMENTED beyond the monophonic core ---
+;   multi-voice V: (header decl + body switch + inline [V:n]) — voices play
+;     SIMULTANEOUSLY, each with its own running clock (see abc_voice.was);
+;   per-voice instruments via %%MIDI program <prog> / <chan> <prog> (emits a
+;     0xC0 ProgramChange);  % line comments and %% stylesheet lines (skipped).
+;
 ; --- DEFERRED (no-ops / skipped, NOT implemented) ---
 ;   repeats |: :| , ties - , tuplets (p , chords [...] , broken rhythm > < ,
-;   inline fields [K:..] , multi-voice V: , grace {} , %%MIDI , % comments ,
-;   trailing duration dots, minor/mode key qualifiers (only the root letter +
-;   one optional #/b is read for the key signature).
+;   inline fields [K:..] , grace {} , trailing duration dots, minor/mode key
+;   qualifiers (only the root letter + one optional #/b is read for the key sig).
 ; ============================================================================
 
 .DATA
@@ -53,6 +58,7 @@
 .CODE
 .include "abc_scan.was"
 .include "abc_note.was"
+.include "abc_voice.was"
 .include "abc_parse.was"
 .include "abc_finalize.was"
 .include "abc_play.was"

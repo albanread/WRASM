@@ -1,0 +1,233 @@
+; abc_voice.was — multi-voice / per-voice-instrument / comment helpers.
+; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included
+; in the shell BEFORE abc_parse.was so ParseTune can call these.
+;
+; THE SIMULTANEITY MODEL ------------------------------------------------------
+; Voices play AT THE SAME TIME, not one after another.  Each voice owns its own
+; running cursor vCurMs[slot], all starting at 0.  The global `curMs` is only the
+; ACTIVE voice's working time.  SwitchVoice is the hinge:
+;   * before leaving the current voice it SAVES curMs into vCurMs[curVoice];
+;   * after selecting the new slot it LOADS curMs from vCurMs[slot].
+; So when voice 2 begins, curMs is restored to voice 2's own clock (0 at the
+; start of the tune) — it does NOT continue from where voice 1 left off.  That is
+; exactly what makes the two melodies overlap in time instead of concatenating.
+;
+; Array indexing: slot = (1-based voice number) - 1, clamped to 0..15.
+;   vCurMs   is f64  -> byte offset = slot*8  (computed: lea/imul, no literal)
+;   vChan/vProgram are DWORD -> byte offset = slot*4
+; (trap #5: a `dup` count must be a literal — the arrays use `16 dup(...)`.)
+
+; ----------------------------------------------------------------------------
+; SwitchVoice(ecx = 1-based voice number): make that voice active.
+;   1. save the active voice's clock:  vCurMs[curVoice] = curMs
+;   2. curVoice = slot ;  curChan = vChan[slot]
+;   3. load the entering voice's clock: curMs = vCurMs[slot]
+;   4. ResetBar  (fresh bar-accidental context for the voice)
+; Clamp ecx to 1..16.  Calls ResetBar -> frame.  rbx holds slot across the call.
+; ----------------------------------------------------------------------------
+proc SwitchVoice uses rbx frame in rcx
+    ; clamp ecx to 1..16
+    cmp     ecx, 1
+    jge     sv_lo_ok
+    mov     ecx, 1
+sv_lo_ok:
+    cmp     ecx, 16
+    jle     sv_hi_ok
+    mov     ecx, 16
+sv_hi_ok:
+    dec     ecx                       ; slot = number - 1  (0..15)
+    mov     ebx, ecx                  ; rbx = slot (survives ResetBar)
+
+    ; (1) save the leaving voice's clock: vCurMs[curVoice] = curMs
+    mov     eax, [rip + curVoice]
+    lea     r10, [rip + vCurMs]
+    movsd   xmm0, [rip + curMs]
+    movsd   [r10 + rax*8], xmm0       ; rax = old slot, *8 for f64
+
+    ; (2) select the new slot
+    mov     [rip + curVoice], ebx
+    lea     r10, [rip + vChan]
+    mov     eax, [r10 + rbx*4]        ; vChan[slot] (*4 for DWORD)
+    mov     [rip + curChan], eax
+
+    ; (3) load the entering voice's clock: curMs = vCurMs[slot]
+    lea     r10, [rip + vCurMs]
+    movsd   xmm0, [r10 + rbx*8]       ; *8 for f64
+    movsd   [rip + curMs], xmm0
+
+    ; (4) fresh bar-accidental context
+    call    ResetBar
+endproc
+
+; ----------------------------------------------------------------------------
+; SetupVoiceHeader(ecx = 1-based voice number): register a voice declared by a
+; header `V:` line (before K:).  Sets vChan[slot] = slot (the natural mapping;
+; already the ParseTune default, made explicit here).  Clamp + slot like above.
+; Leaf (no calls) -> no frame.
+; ----------------------------------------------------------------------------
+proc SetupVoiceHeader in rcx
+    cmp     ecx, 1
+    jge     svh_lo_ok
+    mov     ecx, 1
+svh_lo_ok:
+    cmp     ecx, 16
+    jle     svh_hi_ok
+    mov     ecx, 16
+svh_hi_ok:
+    dec     ecx                       ; slot
+    lea     r10, [rip + vChan]
+    mov     [r10 + rcx*4], ecx        ; vChan[slot] = slot
+endproc
+
+; ----------------------------------------------------------------------------
+; EmitProgramChange(ecx = slot 0..15, edx = program 0..127): record a MIDI
+; ProgramChange (status 0xC0) for that voice's channel at time 0.  Sets
+; vProgram[slot] = program, then emits the event with chan = vChan[slot] by
+; temporarily pointing curChan at it (EmitEvent stamps curChan), restoring the
+; active channel afterwards so an in-body %%MIDI does not hijack the cursor.
+; Time is round(vCurMs[slot]) — normally 0.  Calls EmitEvent -> frame.
+;   rbx = slot, r12 = program, r13 = saved curChan.
+; ----------------------------------------------------------------------------
+proc EmitProgramChange uses rbx r12 r13 frame in rcx rdx
+    mov     ebx, ecx                  ; slot
+    mov     r12d, edx                 ; program
+
+    ; clamp program to 0..127 (defensive; midiOut reads one data byte)
+    cmp     r12d, 0
+    jge     epc_lo_ok
+    xor     r12d, r12d
+epc_lo_ok:
+    cmp     r12d, 127
+    jle     epc_hi_ok
+    mov     r12d, 127
+epc_hi_ok:
+    ; vProgram[slot] = program
+    lea     r10, [rip + vProgram]
+    mov     [r10 + rbx*4], r12d
+
+    ; save active channel, point curChan at this voice's channel
+    mov     r13d, [rip + curChan]
+    lea     r10, [rip + vChan]
+    mov     eax, [r10 + rbx*4]        ; vChan[slot]
+    mov     [rip + curChan], eax
+
+    ; timeMs: the slot copy vCurMs[slot] is only refreshed on a voice SWITCH, so
+    ; for the voice that is active RIGHT NOW it is stale (its live clock is the
+    ; global curMs).  So: if slot == curVoice use round(curMs); else the slot.
+    mov     eax, [rip + curVoice]
+    cmp     ebx, eax
+    jne     epc_slot_time
+    call    RoundCurMs                ; eax = round(curMs) — live active-voice clock
+    jmp     epc_have_time
+epc_slot_time:
+    lea     r10, [rip + vCurMs]
+    movsd   xmm0, [r10 + rbx*8]
+    addsd   xmm0, [rip + fHalf]
+    roundsd xmm0, xmm0, 1             ; floor
+    cvttsd2si eax, xmm0
+epc_have_time:
+    mov     ecx, eax                  ; timeMs
+    mov     edx, 0xC0                 ; ProgramChange
+    mov     r8d, r12d                 ; d1 = program
+    xor     r9d, r9d                  ; d2 = 0 (ignored by the device for 0xC0)
+    call    EmitEvent
+
+    ; restore the active channel
+    mov     [rip + curChan], r13d
+endproc
+
+; ----------------------------------------------------------------------------
+; SkipToEol: advance txtPtr to the char AFTER the next newline (or to the NUL
+; terminator).  Used to swallow the tail of V: / %%MIDI / comment lines.  No
+; calls -> no frame.
+; ----------------------------------------------------------------------------
+proc SkipToEol uses rsi
+    mov     rsi, [rip + txtPtr]
+ste_loop:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      ste_done                  ; NUL -> stop here (do NOT step past it)
+    cmp     al, 10
+    je      ste_nl
+    inc     rsi
+    jmp     ste_loop
+ste_nl:
+    inc     rsi                       ; step past the '\n'
+ste_done:
+    mov     [rip + txtPtr], rsi
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseMidiDirective: txtPtr is positioned just AFTER the "%%MIDI" token (the
+; caller matched it).  Handle:
+;     %%MIDI program <prog>            -> current voice
+;     %%MIDI program <chan> <prog>     -> 1-based voice/chan, then program
+; Anything else after %%MIDI is ignored.  Always consumes the whole line.
+;   rbx = slot, r12 = first uint (chan-or-prog).  Calls -> frame.
+; ----------------------------------------------------------------------------
+proc ParseMidiDirective uses rsi rbx r12 frame
+    call    SkipSpaces
+    mov     rsi, [rip + txtPtr]
+
+    ; expect the word "program" (only the leading 'p' is checked — the only
+    ; %%MIDI directive this parser handles).  Other %%MIDI lines just skip.
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 'p'
+    jne     pmd_skip
+    ; walk past the alphabetic keyword "program"
+pmd_word_loop:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 'a'
+    jb      pmd_word_chkU
+    cmp     al, 'z'
+    jbe     pmd_word_next
+pmd_word_chkU:
+    cmp     al, 'A'
+    jb      pmd_word_done
+    cmp     al, 'Z'
+    ja      pmd_word_done
+pmd_word_next:
+    inc     rsi
+    jmp     pmd_word_loop
+pmd_word_done:
+    mov     [rip + txtPtr], rsi
+
+    call    SkipSpaces
+    call    ParseUInt                 ; first number
+    mov     r12d, eax                 ; first = chan-or-prog
+
+    ; is there a SECOND number on the line? (separated by spaces)
+    call    SkipSpaces
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '0'
+    jb      pmd_one                   ; no second number -> one-arg form
+    cmp     al, '9'
+    ja      pmd_one
+
+    ; --- two-arg form: r12 = 1-based chan/voice, second = program ---
+    call    ParseUInt                 ; second = program
+    mov     edx, eax                  ; program
+    mov     ecx, r12d                 ; 1-based voice/chan
+    cmp     ecx, 1                    ; -> slot (clamp 1..16)
+    jge     pmd_two_lo
+    mov     ecx, 1
+pmd_two_lo:
+    cmp     ecx, 16
+    jle     pmd_two_hi
+    mov     ecx, 16
+pmd_two_hi:
+    dec     ecx                       ; slot = number-1
+    call    EmitProgramChange         ; (ecx = slot, edx = program)
+    jmp     pmd_skip
+
+pmd_one:
+    ; --- one-arg form: program for the CURRENT voice (curVoice) ---
+    mov     edx, r12d                 ; program
+    mov     ecx, [rip + curVoice]     ; current slot
+    call    EmitProgramChange
+    jmp     pmd_skip
+
+pmd_skip:
+    call    SkipToEol
+endproc

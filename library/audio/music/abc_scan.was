@@ -76,7 +76,8 @@ endproc
 
 ; ----------------------------------------------------------------------------
 ; EmitEvent(ecx = timeMs, edx = status, r8d = d1 note, r9d = d2 vel):
-;   append a MidiEvent (chan 0) to tuneEv; bumps tuneCount (capped at 4096).
+;   append a MidiEvent on the ACTIVE channel (curChan) to tuneEv; bumps
+;   tuneCount (capped at 4096).  curChan is set by SwitchVoice / the V: dispatch.
 ; ----------------------------------------------------------------------------
 proc EmitEvent in rcx rdx r8 r9
     mov     eax, [rip + tuneCount]
@@ -87,7 +88,8 @@ proc EmitEvent in rcx rdx r8 r9
     add     r11, r10
     mov     [r11 + 0], ecx            ; timeMs
     mov     [r11 + 4], edx            ; status
-    mov     dword ptr [r11 + 8], 0    ; chan
+    mov     r10d, [rip + curChan]     ; active channel (was hardcoded 0)
+    mov     [r11 + 8], r10d           ; chan
     mov     [r11 + 12], r8d           ; d1
     mov     [r11 + 16], r9d           ; d2
     inc     eax

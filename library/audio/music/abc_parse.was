@@ -18,6 +18,24 @@ proc ParseTune uses rsi rbx frame in rcx
     mov     dword ptr [rip + tsN], 4
     mov     dword ptr [rip + tsD], 4
     mov     dword ptr [rip + inBody], 0
+
+    ; --- reset per-voice state: active voice 0, vChan[i]=i, clocks/programs 0 ---
+    mov     dword ptr [rip + curVoice], 0
+    mov     dword ptr [rip + curChan], 0
+    lea     r8,  [rip + vChan]
+    lea     r9,  [rip + vProgram]
+    lea     r10, [rip + vCurMs]
+    movsd   xmm0, [rip + fZero]
+    xor     ecx, ecx                  ; i = 0
+pt_vinit:
+    mov     [r8 + rcx*4], ecx         ; vChan[i] = i
+    mov     dword ptr [r9 + rcx*4], 0 ; vProgram[i] = 0
+    movsd   [r10 + rcx*8], xmm0       ; vCurMs[i] = 0.0
+    inc     ecx
+    cmp     ecx, 16
+    jb      pt_vinit
+    ; (curMs already 0 above; that IS voice 0's clock)
+
     xor     ecx, ecx
     call    ApplyKey
     call    ResetBar
@@ -32,6 +50,11 @@ pt_loop:
     jne     pt_body
 
     ; ---------- HEADER MODE ---------- (rsi at line start)
+    ; '%' lines (comments / %%MIDI) are handled BEFORE the "X:" field test,
+    ; since they have no ':' in column 2.
+    cmp     al, '%'
+    je      pt_pct                    ; shared %/%%MIDI/comment handler
+
     movzx   ebx, byte ptr [rsi + 1]
     cmp     bl, ':'
     jne     pt_h_skipline
@@ -44,6 +67,18 @@ pt_loop:
     je      pt_h_Q
     cmp     al, 'K'
     je      pt_h_K
+    cmp     al, 'V'
+    je      pt_h_V
+    jmp     pt_h_skipline
+
+pt_h_V:
+    ; header voice declaration: "V:<n> ..." — register the slot, skip the line.
+    add     rsi, 2                    ; past "V:"
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; eax = 1-based voice number
+    mov     ecx, eax
+    call    SetupVoiceHeader
     jmp     pt_h_skipline
 
 pt_h_L:
@@ -164,8 +199,59 @@ pt_end_sync:
     mov     [rip + txtPtr], rsi
     jmp     pt_end
 
+    ; ---------- shared '%' handler (header AND body) ----------
+    ; rsi points at the first '%'.  Cases:
+    ;   "%%MIDI " -> ParseMidiDirective   (consumes the whole line)
+    ;   "%%..."   -> stylesheet line, skip to EOL
+    ;   "%..."    -> ordinary comment, skip to EOL
+pt_pct:
+    movzx   eax, byte ptr [rsi + 1]
+    cmp     al, '%'
+    jne     pt_pct_comment            ; single '%' -> comment
+
+    ; "%%" — is it exactly "%%MIDI" followed by space/tab/EOL/NUL?
+    movzx   eax, byte ptr [rsi + 2]
+    cmp     al, 'M'
+    jne     pt_pct_comment
+    movzx   eax, byte ptr [rsi + 3]
+    cmp     al, 'I'
+    jne     pt_pct_comment
+    movzx   eax, byte ptr [rsi + 4]
+    cmp     al, 'D'
+    jne     pt_pct_comment
+    movzx   eax, byte ptr [rsi + 5]
+    cmp     al, 'I'
+    jne     pt_pct_comment
+    movzx   eax, byte ptr [rsi + 6]   ; delimiter after "%%MIDI"
+    cmp     al, ' '
+    je      pt_pct_midi
+    cmp     al, 9                      ; tab
+    je      pt_pct_midi
+    ; not the MIDI directive (e.g. "%%MIDIxxx") -> treat as a stylesheet line
+    jmp     pt_pct_comment
+
+pt_pct_midi:
+    add     rsi, 6                     ; past "%%MIDI"
+    mov     [rip + txtPtr], rsi
+    call    ParseMidiDirective         ; consumes through EOL
+    jmp     pt_loop
+
+pt_pct_comment:
+    mov     [rip + txtPtr], rsi
+    call    SkipToEol
+    jmp     pt_loop
+
     ; ---------- BODY MODE ----------
 pt_body:
+    ; '%' lines/comments first (same handler as the header)
+    cmp     al, '%'
+    je      pt_pct
+    ; inline voice switch  [V:n]  (mid-stream)
+    cmp     al, '['
+    je      pt_b_inlineV
+    ; a 'V' at line/token start followed by ':' is a voice-switch line
+    cmp     al, 'V'
+    je      pt_b_V
     movzx   eax, byte ptr [rsi]
     cmp     al, '|'
     je      pt_b_bar
@@ -189,6 +275,52 @@ pt_body:
     jbe     pt_b_note
 pt_b_skip:
     inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
+pt_b_V:
+    ; "V:<n>" voice-switch line.  If not actually followed by ':', it's not a
+    ; voice field — fall back to the generic skip (V is not a note letter).
+    movzx   eax, byte ptr [rsi + 1]
+    cmp     al, ':'
+    jne     pt_b_skip
+    add     rsi, 2                    ; past "V:"
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; eax = 1-based voice number
+    mov     ecx, eax
+    call    SwitchVoice               ; save old clock, load this voice's clock
+    call    SkipToEol                 ; rest of the line (name=/clef=) ignored
+    jmp     pt_loop
+
+pt_b_inlineV:
+    ; inline voice switch  [V:n]  — only if it's "[V:"; otherwise skip the '['.
+    movzx   eax, byte ptr [rsi + 1]
+    cmp     al, 'V'
+    jne     pt_b_skip
+    movzx   eax, byte ptr [rsi + 2]
+    cmp     al, ':'
+    jne     pt_b_skip
+    add     rsi, 3                    ; past "[V:"
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; eax = 1-based voice number
+    mov     ecx, eax
+    call    SwitchVoice
+    ; consume through the matching ']'
+    mov     rsi, [rip + txtPtr]
+pt_b_inlineV_eat:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pt_b_inlineV_done         ; NUL -> stop
+    cmp     al, ']'
+    je      pt_b_inlineV_close
+    cmp     al, 10                    ; newline ends it too (malformed input)
+    je      pt_b_inlineV_done
+    inc     rsi
+    jmp     pt_b_inlineV_eat
+pt_b_inlineV_close:
+    inc     rsi                       ; step past ']'
+pt_b_inlineV_done:
     mov     [rip + txtPtr], rsi
     jmp     pt_loop
 

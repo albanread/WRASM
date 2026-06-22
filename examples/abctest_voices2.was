@@ -1,0 +1,15 @@
+; abctest_voices2.was — in-body %%MIDI program change must time from the live cursor.
+; V:1 plays C D E F (4 quarters @ 0..1500, curMs=2000), THEN a mid-body
+; "%%MIDI program 40" must stamp its 0xC0 at 2000 (so it applies to G, not C-F).
+.DATA
+tune  BYTE "X:1", 10, "M:4/4", 10, "L:1/4", 10, "Q:120", 10, "K:C", 10, "V:1", 10, "C D E F |", 10, "%%MIDI program 40", 10, "G |", 10, 0
+binName WCHAR "tune_v2.bin", 0
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tune]
+    call    ParseTune
+    lea     rcx, [rip + binName]
+    call    WriteTune
+    invoke  ExitProcess, 0
+.include "../library/audio/music/abc.was"

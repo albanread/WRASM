@@ -20,6 +20,17 @@ tsN       DWORD ?                     ; meter numerator    (M:)
 tsD       DWORD ?                     ; meter denominator
 inBody    DWORD ?                     ; 0 = header, 1 = body (set by K:)
 
+; ---- per-voice state (MAXVOICE = 16, one per MIDI channel) ----
+; Voices play SIMULTANEOUSLY: each has its OWN running time starting at 0.
+; The global curMs is just the ACTIVE voice's working time; SwitchVoice
+; saves curMs into the leaving voice's slot and loads the entering voice's.
+; Index the f64 array by slot*8, the DWORD arrays by slot*4 (slot = number-1).
+vCurMs    real8 16 dup(0.0)           ; per-voice running cursor in ms (f64)
+vChan     DWORD 16 dup(0)             ; per-voice MIDI channel (default i)
+vProgram  DWORD 16 dup(0)             ; per-voice program (instrument)
+curVoice  DWORD 0                     ; active voice slot (0-based)
+curChan   DWORD 0                     ; active channel (what EmitEvent stamps)
+
 ; Per-pitch-class state, indexed 0..6 for letters C D E F G A B.
 keyAcc    DWORD 7 dup(0)              ; default accidental from the key signature
 barAcc    DWORD 7 dup(0)             ; current bar accidental override (-2..+2)

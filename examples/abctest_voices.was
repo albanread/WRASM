@@ -1,0 +1,24 @@
+; abctest_voices.was — multi-voice / per-voice-instrument / comment test.
+;
+;   was examples\abctest_voices.was -o abcv.exe   &&   abcv.exe   ; writes tune_voices.bin
+;
+; Two voices that play SIMULTANEOUSLY:
+;   V:1  ch0  piano (program 0)   — 4 quarter notes  C D E F   @ 0/500/1000/1500 ms
+;   V:2  ch1  bass  (program 32)  — 2 half  notes  C, G,     @ 0/1000 ms
+; L:1/4 Q:120 -> a quarter = 500 ms.  Each %%MIDI program emits one 0xC0 event.
+; A '%' line is a comment (must be skipped, not parsed as a note/field).
+
+.DATA
+tune  BYTE "X:1", 10, "% two simultaneous voices: melody + bass", 10, "M:4/4", 10, "L:1/4", 10, "Q:120", 10, "%%MIDI program 1 0", 10, "%%MIDI program 2 32", 10, "K:C", 10, "V:1", 10, "C D E F |", 10, "V:2", 10, "C,2 G,2 |", 10, 0
+binName WCHAR "tune_voices.bin", 0
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tune]
+    call    ParseTune
+    lea     rcx, [rip + binName]
+    call    WriteTune
+    invoke  ExitProcess, 0
+
+.include "../library/audio/music/abc.was"
