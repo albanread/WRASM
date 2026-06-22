@@ -84,14 +84,29 @@ fn run() -> anyhow::Result<()> {
             Some(l) => {
                 println!("inst struct {}        ; {} bytes — fill in, drop unused lines", l.name, l.size);
                 for f in &l.fields {
-                    let sub = kb.layout(short(&f.type_name))?;
-                    match sub {
-                        // A genuine nested struct: expand its leaves with dotted
-                        // paths. Single-field handle/BOOL wrappers stay as one leaf.
+                    // Strip an array `[N]`/`[]` or pointer `*` decoration before the
+                    // layout lookup — `short()` only drops the namespace, so without
+                    // this an array-of-struct field (e.g. RenderTarget[]) never resolves
+                    // and falls through to a bare leaf.
+                    let is_array = f.type_name.contains('[');
+                    let bare = match f.type_name.find('[') {
+                        Some(i) => &f.type_name[..i],
+                        None => f.type_name.as_str(),
+                    };
+                    let base = short(bare.trim_end_matches('*').trim());
+                    match kb.layout(base)? {
+                        // A genuine nested struct/union (or an array of one): expand its
+                        // leaves. An array expands element [0] -> `field[0].sub`; the rest
+                        // follow at +sizeof each. Single-field handle/BOOL wrappers stay one leaf.
                         Some(s) if s.fields.len() > 1 => {
+                            let head = if is_array { format!("{}[0]", f.name) } else { f.name.clone() };
                             for sf in &s.fields {
-                                let path = format!("{}.{}", f.name, sf.name);
+                                let path = format!("{}.{}", head, sf.name);
                                 println!("    {:<28} = 0   ; {}", path, sf.type_name);
+                            }
+                            if is_array {
+                                let elem = kb.sizeof(base)?.unwrap_or(0);
+                                println!("    ; ^ {}[0]; further elements at +{} bytes each", f.name, elem);
                             }
                         }
                         _ => println!("    {:<28} = 0   ; {}", f.name, f.type_name),
