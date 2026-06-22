@@ -1,0 +1,116 @@
+; sound_osc.was — NextSigned (LCG noise) + WaveSample (the six waveforms).
+; Part of the sound.was shell (.CODE).
+; ----------------------------------------------------------------------------
+; NextSigned() -> xmm0 = LCG noise in [-1, 1).
+;   state = state*1103515245 + 12345  (mod 2^32, the natural 32-bit wrap)
+;   xmm0  = ((state>>16) & 0x7FFF) / 16384 - 1
+; Leaf (no call) -> no frame.  Touches eax/edx (volatile) + xmm0..xmm1.
+; ----------------------------------------------------------------------------
+proc NextSigned
+    mov     eax, [rip + lcgState]
+    imul    eax, [rip + lcgMul]        ; state * 1103515245  (32-bit wrap)
+    add     eax, 12345                 ; + 12345
+    mov     [rip + lcgState], eax      ; store new state
+    shr     eax, 16                    ; state >> 16
+    and     eax, 0x7FFF                ; & 0x7FFF  -> [0, 32767]
+    cvtsi2sd xmm0, eax                 ; -> f64
+    mulsd   xmm0, [rip + cInv16384]    ; / 16384   -> [0, ~2)
+    subsd   xmm0, [rip + cOne]         ; - 1       -> [-1, 1)
+    ret
+endproc
+
+; ----------------------------------------------------------------------------
+; WaveSample(eax = wave, xmm0 = phase radians, xmm1 = pulseWidth) -> xmm0
+;
+; wave: 0 sine  1 square  2 saw  3 triangle  4 pulse  5 noise   (doc's table)
+;   sine:     sineTab[(phase/2pi)*1024 & 1023]
+;   square:   rem(phase,2pi) < pi ? 1 : -1
+;   saw:      n=phase/2pi;  2*(n - floor(n+0.5))
+;   triangle: t=rem(phase/2pi,1);  4*abs(t-0.5) - 1
+;   pulse:    t=rem(phase,2pi)/2pi;  t < pw ? 1 : -1
+;   noise:    NextSigned()  (ignores phase)
+; rem(x,m)=x-m*floor(x/m), floor via `roundsd ...,1` (round toward -inf).
+;
+; Calls NextSigned for the noise case -> needs `frame`.  Stays in xmm0..xmm5.
+; ----------------------------------------------------------------------------
+proc WaveSample frame
+    cmp     eax, 1
+    je      ws_square
+    cmp     eax, 2
+    je      ws_saw
+    cmp     eax, 3
+    je      ws_tri
+    cmp     eax, 4
+    je      ws_pulse
+    cmp     eax, 5
+    je      ws_noise
+    ; --- 0: sine via wavetable.  idx = trunc(phase/2pi*1024) & 1023 ---
+ws_sine:
+    mulsd   xmm0, [rip + cInv2Pi]      ; phase / 2pi  (cycles)
+    mulsd   xmm0, [rip + c1024]        ; * 1024
+    cvttsd2si rax, xmm0               ; trunc -> int (can be negative)
+    and     rax, 1023                  ; & 1023 (wrap; AND of 2's-comp is fine)
+    lea     r9, [rip + sineTab]
+    movsd   xmm0, [r9 + rax*8]
+    ret
+
+ws_square:
+    ; rem(phase, 2pi):  r = phase - 2pi*floor(phase/2pi)
+    movsd   xmm2, xmm0
+    mulsd   xmm2, [rip + cInv2Pi]      ; phase/2pi
+    roundsd xmm2, xmm2, 1              ; floor()
+    mulsd   xmm2, [rip + c2Pi]         ; 2pi*floor
+    movsd   xmm3, xmm0
+    subsd   xmm3, xmm2                 ; rem in [0, 2pi)
+    comisd  xmm3, [rip + cPi]          ; rem < pi ?
+    jb      ws_one
+    movsd   xmm0, [rip + cNeg1]
+    ret
+ws_one:
+    movsd   xmm0, [rip + cOne]
+    ret
+
+ws_saw:
+    ; n = phase/2pi;  2*(n - floor(n+0.5))
+    mulsd   xmm0, [rip + cInv2Pi]      ; n
+    movsd   xmm2, xmm0
+    addsd   xmm2, [rip + cHalfF]       ; n + 0.5
+    roundsd xmm2, xmm2, 1              ; floor(n+0.5)
+    subsd   xmm0, xmm2                 ; n - floor(n+0.5)  in [-0.5,0.5)
+    mulsd   xmm0, [rip + cTwo]         ; * 2  -> [-1,1)
+    ret
+
+ws_tri:
+    ; t = rem(n, 1) with n = phase/2pi;  4*abs(t-0.5) - 1
+    mulsd   xmm0, [rip + cInv2Pi]      ; n = phase/2pi
+    movsd   xmm2, xmm0
+    roundsd xmm2, xmm2, 1              ; floor(n)   (m=1 -> rem = n - floor(n))
+    subsd   xmm0, xmm2                 ; t = rem(n,1) in [0,1)
+    subsd   xmm0, [rip + cHalfF]       ; t - 0.5
+    ; abs: clear the sign bit by max(x,-x)
+    movsd   xmm3, xmm0
+    xorps   xmm4, xmm4
+    subsd   xmm4, xmm3                 ; -x
+    maxsd   xmm0, xmm4                 ; abs(t-0.5)
+    mulsd   xmm0, [rip + cFour]        ; *4
+    subsd   xmm0, [rip + cOne]         ; -1  -> [-1,1]
+    ret
+
+ws_pulse:
+    ; t = rem(phase,2pi)/2pi;  t < pw ? 1 : -1
+    movsd   xmm2, xmm0
+    mulsd   xmm2, [rip + cInv2Pi]      ; phase/2pi
+    roundsd xmm2, xmm2, 1              ; floor
+    mulsd   xmm2, [rip + c2Pi]         ; 2pi*floor
+    subsd   xmm0, xmm2                 ; rem(phase,2pi) in [0,2pi)
+    mulsd   xmm0, [rip + cInv2Pi]      ; / 2pi -> t in [0,1)
+    comisd  xmm0, xmm1                 ; t < pw ?
+    jb      ws_one
+    movsd   xmm0, [rip + cNeg1]
+    ret
+
+ws_noise:
+    call    NextSigned                 ; -> xmm0 in [-1,1)
+    ret
+endproc
+

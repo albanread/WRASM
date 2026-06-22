@@ -1,0 +1,228 @@
+; sound_core.was — Adsr envelope, Beep, WriteWav (the Sprint-1 core).
+; Part of the sound.was shell (.CODE).
+
+; ----------------------------------------------------------------------------
+; Adsr(xmm0 = t seconds, xmm1 = duration seconds) -> xmm0 = envelope in [0,1]
+;
+; attack 0->1 over cAtk, decay 1->cSus over cDec, sustain cSus until (dur-cRel),
+; release cSus->0 over cRel.  Every stage guards against a zero (or negative)
+; length, and t is clamped to [0, dur].  No inner calls -> no frame needed.
+;
+; XMM discipline (Win64): xmm0..xmm5 are VOLATILE, xmm6..xmm15 are callee-saved.
+; This proc touches only xmm0..xmm5 so it needs to save nothing — and a caller may
+; safely keep its own state in xmm6..xmm15 across a `call Adsr`. (Inputs ride in
+; xmm0/xmm1, which the gp-register contract doesn't track, so there's no `in`.)
+; ----------------------------------------------------------------------------
+proc Adsr
+    ; clamp t to [0, dur]:  if t < 0 -> 0 ;  if t > dur -> dur
+    xorps   xmm2, xmm2
+    maxsd   xmm0, xmm2                 ; t = max(t, 0)
+    minsd   xmm0, xmm1                 ; t = min(t, dur)
+
+    ; --- attack: t < cAtk -> env = t / cAtk ---
+    movsd   xmm3, [rip + cAtk]
+    comisd  xmm0, xmm3
+    jae     ad_decay                  ; t >= cAtk -> past attack
+    comisd  xmm3, xmm2                ; cAtk <= 0 ? (zero-length stage guard)
+    jbe     ad_full                   ; -> env = 1.0 (instant)
+    divsd   xmm0, xmm3                ; env = t / cAtk   (xmm0 = t, in place)
+    ret
+
+ad_full:
+    movsd   xmm0, [rip + cOne]
+    ret
+
+ad_decay:
+    ; --- release: t >= dur - cRel -> env = cSus * (dur - t) / cRel ---
+    movsd   xmm5, xmm1                 ; dur
+    subsd   xmm5, [rip + cRel]         ; relStart = dur - cRel
+    comisd  xmm0, xmm5
+    jb      ad_notrel
+    movsd   xmm5, [rip + cRel]
+    comisd  xmm5, xmm2                 ; cRel <= 0 ? guard
+    jbe     ad_silent                 ; -> env = 0 (instant cut)
+    movsd   xmm4, xmm1                 ; dur
+    subsd   xmm4, xmm0                 ; dur - t   (>= 0 since t<=dur)
+    divsd   xmm4, xmm5                 ; (dur - t)/cRel  in [0,1]
+    mulsd   xmm4, [rip + cSus]         ; * sustain
+    movsd   xmm0, xmm4
+    ret
+
+ad_silent:
+    xorps   xmm0, xmm0
+    ret
+
+ad_notrel:
+    ; --- decay: t < cAtk + cDec -> env = 1 + (cSus - 1) * (t - cAtk) / cDec ---
+    movsd   xmm5, xmm3                 ; cAtk
+    addsd   xmm5, [rip + cDec]         ; decEnd = cAtk + cDec
+    comisd  xmm0, xmm5
+    jae     ad_sustain
+    movsd   xmm5, [rip + cDec]
+    comisd  xmm5, xmm2                 ; cDec <= 0 ? guard -> straight to sustain
+    jbe     ad_sustain
+    movsd   xmm4, xmm0
+    subsd   xmm4, xmm3                 ; t - cAtk
+    divsd   xmm4, xmm5                 ; (t - cAtk)/cDec  in [0,1)
+    movsd   xmm5, [rip + cSus]
+    subsd   xmm5, [rip + cOne]         ; (cSus - 1)
+    mulsd   xmm4, xmm5                 ; (cSus-1)*frac
+    addsd   xmm4, [rip + cOne]         ; 1 + ...
+    movsd   xmm0, xmm4
+    ret
+
+ad_sustain:
+    movsd   xmm0, [rip + cSus]
+endproc
+
+; ----------------------------------------------------------------------------
+; Beep(rcx = freqHz, edx = durationMs): render an ADSR'd sine into sndBuf.
+;
+;   frames = 44100 * durationMs / 1000           (stored in sndFrames)
+;   per frame f:  t = f/44100
+;                 idx = trunc(phase * 1024) & 1023 ;  s = sineTab[idx]
+;                 s *= Adsr(t, dur) * 0.5         ; headroom
+;                 sndBuf[f*2+0] = sndBuf[f*2+1] = s
+;                 phase += freq/44100
+;
+; Calls Adsr -> needs `frame` (aligned shadow space).  Non-volatiles used: rbx
+; (sndBuf base), r12 (frame index f), r13 (frame total).  Loop-invariant f64
+; state lives in xmm9 (dur), xmm10 (phase increment), xmm11 (phase accumulator):
+; these are non-volatile in Win64 AND Adsr (our proc) only touches xmm0..xmm7,
+; so they survive the call.
+; ----------------------------------------------------------------------------
+proc Beep uses rbx r12 r13 frame in rcx rdx
+    ; frames = 44100 * durationMs / 1000   (capture freq first — div trashes ecx)
+    mov     r8d, ecx                   ; r8d = freqHz (saved across the divide)
+    mov     eax, 44100
+    mul     edx                        ; edx:eax = 44100 * durationMs (unsigned)
+    mov     ecx, 1000
+    xor     edx, edx                   ; clear high dividend before div
+    div     ecx                        ; eax = frames
+    mov     r13d, eax                  ; r13 = frame total
+    mov     [rip + sndFrames], eax
+    test    eax, eax
+    jz      bp_done                    ; zero-length -> nothing to render
+
+    ; dur (seconds) = frames / 44100   -> xmm9 (loop invariant)
+    cvtsi2sd xmm9, r13d
+    divsd   xmm9, [rip + cSR]
+
+    ; phase increment = freq / 44100   -> xmm10 (loop invariant)
+    cvtsi2sd xmm10, r8d
+    divsd   xmm10, [rip + cSR]
+
+    xorps   xmm11, xmm11               ; phase accumulator = 0.0
+    lea     rbx, [rip + sndBuf]        ; output base
+    xor     r12d, r12d                 ; f = 0
+
+bp_loop:
+    ; --- sine via the wavetable:  idx = trunc(phase * 1024) & 1023 ---
+    movsd   xmm0, xmm11
+    mulsd   xmm0, [rip + c1024]        ; phase * 1024
+    cvttsd2si rax, xmm0               ; trunc -> integer
+    and     rax, 1023                  ; & 1023 (wrap)
+    lea     r9, [rip + sineTab]
+    movsd   xmm1, [r9 + rax*8]         ; s = sineTab[idx]
+
+    ; --- envelope:  Adsr(t = f/44100, dur) ; result *= 0.5 then * s ---
+    cvtsi2sd xmm0, r12d                ; f
+    divsd   xmm0, [rip + cSR]          ; t = f / 44100   (Adsr arg: xmm0)
+    ; Adsr takes xmm0=t, xmm1=dur and returns env in xmm0; it clobbers xmm0..7.
+    ; Stash s in xmm8 (non-volatile, untouched by Adsr) across the call.
+    movsd   xmm8, xmm1                 ; s -> xmm8 (survives Adsr)
+    movsd   xmm1, xmm9                 ; dur -> Adsr arg xmm1
+    call    Adsr                       ; xmm0 = env
+    mulsd   xmm0, xmm8                 ; env * s
+    mulsd   xmm0, [rip + cHalf]        ; * 0.5 headroom -> final sample
+
+    ; --- write to both channels: sndBuf[f*2+0], sndBuf[f*2+1] ---
+    mov     eax, r12d
+    add     eax, eax                   ; f*2
+    movsd   [rbx + rax*8], xmm0        ; L
+    movsd   [rbx + rax*8 + 8], xmm0    ; R
+
+    ; --- advance phase, next frame ---
+    addsd   xmm11, xmm10               ; phase += inc
+    inc     r12d
+    cmp     r12d, r13d
+    jb      bp_loop
+bp_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; WriteWav(rcx = pathPtrW): write the first sndFrames frames of sndBuf to a
+; 44.1 kHz / 16-bit / stereo .wav at the given wide path.
+;
+; Patches the two size fields in wavHdr, writes the 44-byte header, then streams
+; the PCM: each f64 sample s -> i16 = round(clamp(s,-1,1) * 32767), little-endian,
+; staged in wavStage (8192 samples) and flushed per block.  Calls CreateFileW /
+; WriteFile / CloseHandle -> needs `frame`.  Non-volatiles: rbx (file handle),
+; rsi (sndBuf read ptr), rdi (stage write ptr), r12 (samples remaining),
+; r13 (samples in current stage block).
+; ----------------------------------------------------------------------------
+proc WriteWav uses rbx rsi rdi r12 r13 frame in rcx rdx
+    ; --- patch the header size fields ---
+    mov     eax, [rip + sndFrames]
+    shl     eax, 2                     ; dataBytes = frames * 4  (2ch * 2 bytes)
+    mov     r10d, eax                  ; dataBytes
+    lea     r11, [rip + wavHdr]
+    mov     [r11 + 40], eax            ; data chunk size  @ offset 40
+    add     eax, 36                    ; riffSize = 36 + dataBytes
+    mov     [r11 + 4], eax             ; @ offset 4
+
+    ; --- create the file ---  CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    invoke  CreateFileW, rcx, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     rbx, rax                   ; file handle
+
+    ; --- write the 44-byte header ---
+    invoke  WriteFile, rbx, wavHdr, 44, wavWrote, 0
+
+    ; --- stream the PCM:  totalSamples = sndFrames * 2 (interleaved) ---
+    mov     r12d, [rip + sndFrames]
+    add     r12d, r12d                 ; r12 = samples remaining (L+R)
+    test    r12d, r12d
+    jz      ww_close
+    lea     rsi, [rip + sndBuf]        ; f64 read pointer
+
+ww_block:
+    lea     rdi, [rip + wavStage]      ; i16 write pointer (block start)
+    xor     r13d, r13d                 ; samples in this block
+ww_conv:
+    ; clamp s to [-1, 1]
+    movsd   xmm0, [rsi]
+    movsd   xmm1, [rip + cOne]
+    minsd   xmm0, xmm1                 ; min(s, 1)
+    movsd   xmm2, [rip + cOne]
+    xorps   xmm3, xmm3
+    subsd   xmm3, xmm2                 ; -1.0
+    maxsd   xmm0, xmm3                 ; max(., -1)
+    ; i16 = round(s * 32767)  (cvtsd2si rounds to nearest, banker's; fine here)
+    mulsd   xmm0, [rip + cI16Max]
+    cvtsd2si eax, xmm0                ; -> rounded int32 in eax
+    mov     [rdi], ax                  ; store i16 (little-endian)
+    add     rsi, 8                     ; next f64 sample
+    add     rdi, 2                     ; next i16 slot
+    inc     r13d
+    dec     r12d
+    jz      ww_flush                   ; no more samples -> flush partial block
+    cmp     r13d, 8192                 ; block full?
+    jb      ww_conv
+ww_flush:
+    ; WriteFile(handle, wavStage, r13*2 bytes, &wavWrote, 0).  byteCount goes via
+    ; memory (wavBytes) — `invoke` clobbers eax/rax marshaling the stack args.
+    mov     eax, r13d
+    add     eax, eax                   ; byteCount = samples * 2
+    mov     [rip + wavBytes], eax
+    invoke  WriteFile, rbx, wavStage, [rip + wavBytes], wavWrote, 0
+    test    r12d, r12d
+    jnz     ww_block                   ; more samples remain -> next block
+
+ww_close:
+    invoke  CloseHandle, rbx
+endproc
+
+; ============================================================================
+; Sprint 2 — waveforms, the effect renderer, and the preset SFX factories.
+; ============================================================================
+

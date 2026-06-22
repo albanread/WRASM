@@ -1,0 +1,228 @@
+; sound_presets.was — ClearEffect + Coin/Jump/Zap/Explode/Tone factories.
+; Part of the sound.was shell (.CODE).
+; ----------------------------------------------------------------------------
+; ClearEffect(xmm0 = dur seconds): reset the Effect to fresh defaults —
+; duration=dur, oscCount=0, default ADSR (0.01/0.1/0.7/0.2), no sweep/noise/
+; distortion/echo.  Also zeroes the 4 oscillators' wave/freq/amp/phase/pw so a
+; preset that adds fewer than 4 leaves no stale data.  Leaf -> no frame.
+; ----------------------------------------------------------------------------
+proc ClearEffect
+    movsd   [rip + fxDur], xmm0
+    xor     eax, eax
+    mov     [rip + fxOscCount], eax
+    ; zero the 4 oscillators (4 * 40 = 160 bytes = 20 qwords)
+    lea     r9, [rip + fxOsc]
+    xorps   xmm1, xmm1
+    mov     ecx, 20
+ce_zosc:
+    movsd   [r9], xmm1
+    add     r9, 8
+    dec     ecx
+    jnz     ce_zosc
+    ; default ADSR 0.01/0.1/0.7/0.2 (the cAtk/cDec/cSus/cRel match attack/decay
+    ; but sustain/release differ from Beep's; use explicit defaults)
+    movsd   xmm1, [rip + cAtk]            ; 0.01
+    movsd   [rip + fxAtk], xmm1
+    movsd   xmm1, [rip + fxDecDflt]       ; 0.1
+    movsd   [rip + fxDec], xmm1
+    movsd   xmm1, [rip + fxSusDflt]       ; 0.7
+    movsd   [rip + fxSus], xmm1
+    movsd   xmm1, [rip + fxRelDflt]       ; 0.2
+    movsd   [rip + fxRel], xmm1
+    ; clear sweep / noise / distortion / echo
+    xorps   xmm1, xmm1
+    movsd   [rip + fxSweepStart], xmm1
+    movsd   [rip + fxSweepEnd], xmm1
+    movsd   [rip + fxNoiseMix], xmm1
+    movsd   [rip + fxDistortion], xmm1
+    mov     [rip + fxEchoCount], eax
+    movsd   [rip + fxEchoDelay], xmm1
+    movsd   [rip + fxEchoDecay], xmm1
+    ret
+endproc
+
+; ----------------------------------------------------------------------------
+; Coin(edx = durMs): two sine tones (987.77 x0.5, 1318.51 x0.3).
+; ADSR 0.01/0.1/0.3/0.15.  Frames -> WriteWav by the caller.
+; Calls ClearEffect/Render -> frame.
+; ----------------------------------------------------------------------------
+proc Coin frame in rdx
+    ; dur seconds = durMs / 1000
+    cvtsi2sd xmm0, edx
+    divsd   xmm0, [rip + cThousand]
+    call    ClearEffect
+    ; osc0: sine @ 987.77 x 0.5, phase 0, pw 0.5
+    lea     r9, [rip + fxOsc]
+    mov     dword ptr [r9 + 0], 0        ; wave = sine
+    movsd   xmm0, [rip + kCoinF0]
+    movsd   [r9 + 8], xmm0               ; freq
+    movsd   xmm0, [rip + kCoinA0]
+    movsd   [r9 + 16], xmm0              ; amp
+    xorps   xmm0, xmm0
+    movsd   [r9 + 24], xmm0              ; phase
+    movsd   xmm0, [rip + kDfltPw]
+    movsd   [r9 + 32], xmm0              ; pw
+    ; osc1: sine @ 1318.51 x 0.3
+    mov     dword ptr [r9 + 40], 0       ; wave = sine
+    movsd   xmm0, [rip + kCoinF1]
+    movsd   [r9 + 48], xmm0
+    movsd   xmm0, [rip + kCoinA1]
+    movsd   [r9 + 56], xmm0
+    xorps   xmm0, xmm0
+    movsd   [r9 + 64], xmm0
+    movsd   xmm0, [rip + kDfltPw]
+    movsd   [r9 + 72], xmm0
+    mov     dword ptr [rip + fxOscCount], 2
+    ; ADSR
+    movsd   xmm0, [rip + kCoinAtk]
+    movsd   [rip + fxAtk], xmm0
+    movsd   xmm0, [rip + kCoinDec]
+    movsd   [rip + fxDec], xmm0
+    movsd   xmm0, [rip + kCoinSus]
+    movsd   [rip + fxSus], xmm0
+    movsd   xmm0, [rip + kCoinRel]
+    movsd   [rip + fxRel], xmm0
+    call    Render
+endproc
+
+; ----------------------------------------------------------------------------
+; Jump(edx = durMs): rising pitch sweep 300 -> 600 Hz, no oscillators.
+; ADSR 0.01/0.05/0.5/0.1.  Character: early freq < late freq (rising).
+; ----------------------------------------------------------------------------
+proc Jump frame in rdx
+    cvtsi2sd xmm0, edx
+    divsd   xmm0, [rip + cThousand]
+    call    ClearEffect
+    movsd   xmm0, [rip + kJumpS0]
+    movsd   [rip + fxSweepStart], xmm0
+    movsd   xmm0, [rip + kJumpS1]
+    movsd   [rip + fxSweepEnd], xmm0
+    movsd   xmm0, [rip + kJumpAtk]
+    movsd   [rip + fxAtk], xmm0
+    movsd   xmm0, [rip + kJumpDec]
+    movsd   [rip + fxDec], xmm0
+    movsd   xmm0, [rip + kJumpSus]
+    movsd   [rip + fxSus], xmm0
+    movsd   xmm0, [rip + kJumpRel]
+    movsd   [rip + fxRel], xmm0
+    call    Render
+endproc
+
+; ----------------------------------------------------------------------------
+; Zap(edx = durMs): falling sweep 1000 -> 100 Hz + noiseMix 0.2 (noisy).
+; ADSR 0.01/0.05/0.3/0.08.
+; ----------------------------------------------------------------------------
+proc Zap frame in rdx
+    cvtsi2sd xmm0, edx
+    divsd   xmm0, [rip + cThousand]
+    call    ClearEffect
+    movsd   xmm0, [rip + kZapS0]
+    movsd   [rip + fxSweepStart], xmm0
+    movsd   xmm0, [rip + kZapS1]
+    movsd   [rip + fxSweepEnd], xmm0
+    movsd   xmm0, [rip + kZapNm]
+    movsd   [rip + fxNoiseMix], xmm0
+    movsd   xmm0, [rip + kZapAtk]
+    movsd   [rip + fxAtk], xmm0
+    movsd   xmm0, [rip + kZapDec]
+    movsd   [rip + fxDec], xmm0
+    movsd   xmm0, [rip + kZapSus]
+    movsd   [rip + fxSus], xmm0
+    movsd   xmm0, [rip + kZapRel]
+    movsd   [rip + fxRel], xmm0
+    call    Render
+endproc
+
+; ----------------------------------------------------------------------------
+; Explode(edx = durMs): two low oscs (sine 58 x0.95, triangle 86 x0.28) +
+; sweep 135 -> 32 + noiseMix 0.09 + distortion 0.08.  ADSR 0.0015/0.14/0/0.10.
+; ----------------------------------------------------------------------------
+proc Explode frame in rdx
+    cvtsi2sd xmm0, edx
+    divsd   xmm0, [rip + cThousand]
+    call    ClearEffect
+    ; osc0: sine @ 58 x 0.95
+    lea     r9, [rip + fxOsc]
+    mov     dword ptr [r9 + 0], 0        ; sine
+    movsd   xmm0, [rip + kExpF0]
+    movsd   [r9 + 8], xmm0
+    movsd   xmm0, [rip + kExpA0]
+    movsd   [r9 + 16], xmm0
+    xorps   xmm0, xmm0
+    movsd   [r9 + 24], xmm0
+    movsd   xmm0, [rip + kDfltPw]
+    movsd   [r9 + 32], xmm0
+    ; osc1: triangle (wave=3) @ 86 x 0.28
+    mov     dword ptr [r9 + 40], 3       ; triangle
+    movsd   xmm0, [rip + kExpF1]
+    movsd   [r9 + 48], xmm0
+    movsd   xmm0, [rip + kExpA1]
+    movsd   [r9 + 56], xmm0
+    xorps   xmm0, xmm0
+    movsd   [r9 + 64], xmm0
+    movsd   xmm0, [rip + kDfltPw]
+    movsd   [r9 + 72], xmm0
+    mov     dword ptr [rip + fxOscCount], 2
+    ; sweep / noise / distortion
+    movsd   xmm0, [rip + kExpS0]
+    movsd   [rip + fxSweepStart], xmm0
+    movsd   xmm0, [rip + kExpS1]
+    movsd   [rip + fxSweepEnd], xmm0
+    movsd   xmm0, [rip + kExpNm]
+    movsd   [rip + fxNoiseMix], xmm0
+    movsd   xmm0, [rip + kExpDist]
+    movsd   [rip + fxDistortion], xmm0
+    ; ADSR
+    movsd   xmm0, [rip + kExpAtk]
+    movsd   [rip + fxAtk], xmm0
+    movsd   xmm0, [rip + kExpDec]
+    movsd   [rip + fxDec], xmm0
+    movsd   xmm0, [rip + kExpSus]
+    movsd   [rip + fxSus], xmm0
+    movsd   xmm0, [rip + kExpRel]
+    movsd   [rip + fxRel], xmm0
+    call    Render
+endproc
+
+; ----------------------------------------------------------------------------
+; Tone(rcx = freq Hz, edx = durMs, r8d = wave): a single oscillator of the given
+; wave @ freq x 0.75; pulseWidth = (wave==4 ? 0.25 : 0.5).  ADSR 0.01/0.05/0.8/0.1.
+; ----------------------------------------------------------------------------
+proc Tone frame in rcx rdx r8
+    ; stash freq (rcx) and wave (r8d); ClearEffect/Render clobber volatiles.
+    cvtsi2sd xmm0, ecx
+    movsd   [rip + toneFreq], xmm0       ; freq as f64
+    mov     [rip + toneWave], r8d        ; wave
+    cvtsi2sd xmm0, edx
+    divsd   xmm0, [rip + cThousand]
+    call    ClearEffect
+    ; osc0: wave @ freq x 0.75
+    lea     r9, [rip + fxOsc]
+    mov     eax, [rip + toneWave]
+    mov     [r9 + 0], eax                ; wave
+    movsd   xmm0, [rip + toneFreq]
+    movsd   [r9 + 8], xmm0               ; freq
+    movsd   xmm0, [rip + kToneAmp]
+    movsd   [r9 + 16], xmm0              ; amp 0.75
+    xorps   xmm0, xmm0
+    movsd   [r9 + 24], xmm0              ; phase
+    ; pulseWidth: 0.25 if wave==4 (pulse) else 0.5
+    movsd   xmm0, [rip + kTonePw]
+    cmp     dword ptr [rip + toneWave], 4
+    jne     to_pw
+    movsd   xmm0, [rip + kTonePwP]
+to_pw:
+    movsd   [r9 + 32], xmm0
+    mov     dword ptr [rip + fxOscCount], 1
+    ; ADSR
+    movsd   xmm0, [rip + kToneAtk]
+    movsd   [rip + fxAtk], xmm0
+    movsd   xmm0, [rip + kToneDec]
+    movsd   [rip + fxDec], xmm0
+    movsd   xmm0, [rip + kToneSus]
+    movsd   [rip + fxSus], xmm0
+    movsd   xmm0, [rip + kToneRel]
+    movsd   [rip + fxRel], xmm0
+    call    Render
+endproc
+
