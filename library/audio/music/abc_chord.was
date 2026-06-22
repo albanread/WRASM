@@ -1,0 +1,120 @@
+; abc_chord.was — ParseChord: a chord [CEG] = several notes struck together,
+; sharing ONE onset and ONE duration (hence ONE offset).  The harmony layer.
+; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included
+; in the shell BEFORE abc_parse.was so the body '[' dispatch can call it.
+;
+; THE CHORD TIMING MODEL ------------------------------------------------------
+; A chord is N pitches that all start at the SAME moment and all stop at the
+; SAME moment.  So:
+;   * onMs   = round(curMs)            — captured ONCE, before any note.
+;   * every chord note emits NoteOn @ onMs (curMs is NOT advanced per note).
+;   * the duration AFTER the ']' applies to the whole chord; AdvanceCurMs is
+;     called EXACTLY ONCE, so curMs moves forward by one note-length total.
+;   * offMs  = round(curMs)            — captured ONCE, after the single advance.
+;   * every chord note emits NoteOff @ offMs.
+; Contrast a melody, where each note advances curMs.  That single advance is the
+; whole point: the chord occupies one slot in time, not N stacked slots.
+; ----------------------------------------------------------------------------
+; ParseChord: txtPtr is positioned JUST PAST the opening '['.
+;   1. onMs = round(curMs).
+;   2. loop over note tokens: SkipSpaces; ']' -> stop; else ParseNotePitch,
+;      emit NoteOn(onMs,pitch,80), store pitch in chPitch[] (cap 8, extras kept
+;      in the chord's TIMING but their pitches dropped from the off-list).
+;      Inner per-note durations (e.g. [C2EG]) are NOT honoured — ParseNotePitch
+;      stops at the digit and any inner duration is skipped as a non-note char;
+;      only the post-']' duration applies to every chord note.
+;   3. consume the ']'.
+;   4. ParseDuration (the duration after ']') -> durWholes.
+;   5. AdvanceCurMs(durWholes) ONCE; offMs = round(curMs).
+;   6. for each stored pitch: emit NoteOff(offMs,pitch,0).
+; Calls everything -> frame.  Non-volatiles:
+;   rbx = stored-pitch count, r12 = onMs, r13 = offMs, r14 = loop index.
+; ----------------------------------------------------------------------------
+proc ParseChord uses rbx r12 r13 r14 frame
+    ; (1) shared onset for every note in the chord
+    call    RoundCurMs                ; eax = round(curMs)
+    mov     r12d, eax                 ; r12 = onMs
+    xor     ebx, ebx                  ; rbx = count of stored pitches
+
+pc_note_loop:
+    call    SkipSpaces
+    mov     r10, [rip + txtPtr]
+    movzx   eax, byte ptr [r10]
+    test    al, al
+    jz      pc_close_missing          ; NUL -> malformed, stop (no ']')
+    cmp     al, 10                    ; newline -> malformed, stop
+    je      pc_close_missing
+    cmp     al, ']'
+    je      pc_close                  ; end of chord
+
+    call    ParseNotePitch            ; eax = pitch, or -1 if not a note letter
+    cmp     eax, -1
+    je      pc_skip_one               ; non-letter inside [] -> re-dispatch / step
+
+    ; cap at 8: drop the extra note ENTIRELY (no NoteOn either) so a note never
+    ; sounds without a matching NoteOff — no stuck notes on a >8-note chord.
+    cmp     ebx, 8
+    jae     pc_note_loop
+    ; store the pitch FIRST, while it is still in eax — do NOT depend on a volatile
+    ; (r8) surviving the EmitEvent call.
+    lea     r10, [rip + chPitch]
+    mov     [r10 + rbx*4], eax        ; chPitch[count] = pitch
+    ; emit NoteOn(onMs, pitch, 80)
+    mov     r8d, eax                  ; d1 = pitch
+    mov     ecx, r12d                 ; timeMs = onMs
+    mov     edx, 0x90                 ; NoteOn
+    mov     r9d, 80                   ; d2 = velocity
+    call    EmitEvent
+    inc     ebx                       ; count++ (a NoteOff slot is now reserved)
+    jmp     pc_note_loop
+
+pc_skip_one:
+    ; ParseNotePitch returns -1 on a non-letter, but it may have ALREADY advanced
+    ; txtPtr (it commits any accidentals it consumed before the non-letter).  So
+    ; re-read and re-dispatch the terminator rather than blindly stepping — else an
+    ; accidental right before ']' (e.g. [C^]) would skip the ']' and swallow the
+    ; rest of the line, and one at the buffer end would step past the NUL.
+    mov     r10, [rip + txtPtr]
+    movzx   eax, byte ptr [r10]
+    test    al, al
+    jz      pc_close_missing          ; NUL -> close (no ']')
+    cmp     al, 10
+    je      pc_close_missing          ; newline -> close
+    cmp     al, ']'
+    je      pc_close                  ; the terminator -> close normally
+    inc     r10                       ; genuine junk (e.g. a digit) -> step over it
+    mov     [rip + txtPtr], r10
+    jmp     pc_note_loop
+
+pc_close:
+    ; (3) consume the ']'
+    mov     r10, [rip + txtPtr]
+    inc     r10
+    mov     [rip + txtPtr], r10
+pc_close_missing:
+    ; (4) duration AFTER ']' applies to the whole chord
+    call    ParseDuration             ; xmm0 = durWholes, txtPtr advanced
+    movsd   [rip + fChDur], xmm0      ; stash across AdvanceCurMs / RoundCurMs
+
+    ; (5) advance curMs ONCE; capture the shared offset
+    movsd   xmm0, [rip + fChDur]
+    call    AdvanceCurMs              ; curMs += durWholes * msPerWhole
+    call    RoundCurMs                ; eax = round(curMs)
+    mov     r13d, eax                 ; r13 = offMs
+
+    ; (6) NoteOff(offMs, pitch, 0) for every stored pitch
+    xor     r14d, r14d                ; index = 0
+pc_off_loop:
+    cmp     r14d, ebx
+    jae     pc_done
+    lea     r10, [rip + chPitch]
+    mov     r8d, [r10 + r14*4]        ; d1 = pitch[index]
+    mov     ecx, r13d                 ; timeMs = offMs
+    mov     edx, 0x80                 ; NoteOff
+    xor     r9d, r9d                  ; d2 = 0
+    call    EmitEvent
+    inc     r14d
+    jmp     pc_off_loop
+
+pc_done:
+endproc

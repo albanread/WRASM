@@ -1,0 +1,25 @@
+; abctest_chords.was — chord parser test (Sprint M-B).
+;
+;   was examples\abctest_chords.was -o abc_chords.exe  &&  abc_chords.exe
+;   (writes tune_chords.bin — verify offline with the 20-byte record struct)
+;
+; L=1/4, Q=120 -> each quarter = 500 ms.  Three chords sharing one onset each:
+;   [CEG]2  half note  (2 quarters = 1000 ms)  C/E/G = 60/64/67
+;   [FAc]2  half note  (1000 ms)               F/A/c = 65/69/72
+;   [GBd]4  whole note (4 quarters = 2000 ms)  G/B/d = 67/71/74
+; Expected: 9 NoteOn + 9 NoteOff = 18 events; tuneEndMs = 4000.
+
+.DATA
+tune  BYTE "X:1", 10, "M:4/4", 10, "L:1/4", 10, "Q:120", 10, "K:C", 10, "[CEG]2 [FAc]2 | [GBd]4 |", 10, 0
+binName WCHAR "tune_chords.bin", 0
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tune]
+    call    ParseTune
+    lea     rcx, [rip + binName]
+    call    WriteTune
+    invoke  ExitProcess, 0
+
+.include "../library/audio/music/abc.was"

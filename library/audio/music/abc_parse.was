@@ -246,9 +246,10 @@ pt_body:
     ; '%' lines/comments first (same handler as the header)
     cmp     al, '%'
     je      pt_pct
-    ; inline voice switch  [V:n]  (mid-stream)
+    ; '[' opens a chord [CEG], an inline voice switch [V:n], or an inline field
+    ; [K:..]/[L:..]/etc.  Dispatch on the char after '['.
     cmp     al, '['
-    je      pt_b_inlineV
+    je      pt_b_lbrack
     ; a 'V' at line/token start followed by ':' is a voice-switch line
     cmp     al, 'V'
     je      pt_b_V
@@ -291,6 +292,61 @@ pt_b_V:
     mov     ecx, eax
     call    SwitchVoice               ; save old clock, load this voice's clock
     call    SkipToEol                 ; rest of the line (name=/clef=) ignored
+    jmp     pt_loop
+
+pt_b_lbrack:
+    ; Peek the char after '['.
+    ;   accidental (^ _ =) or a note letter (A-G / a-g)  -> chord  [CEG]
+    ;   'V' then ':'                                     -> inline voice switch
+    ;   otherwise (a field letter K/L/M/Q then ':', etc) -> inline field, ignored
+    ;     (consume through ']' so we don't mis-eat it as a chord or crash; full
+    ;      inline-field handling is deferred to M-C).
+    movzx   eax, byte ptr [rsi + 1]
+    cmp     al, '^'
+    je      pt_b_chord
+    cmp     al, '_'
+    je      pt_b_chord
+    cmp     al, '='
+    je      pt_b_chord
+    cmp     al, 'A'
+    jb      pt_b_lbrack_other
+    cmp     al, 'G'
+    jbe     pt_b_chord
+    cmp     al, 'a'
+    jb      pt_b_lbrack_other
+    cmp     al, 'g'
+    jbe     pt_b_chord
+pt_b_lbrack_other:
+    ; not a note start: voice switch [V:..] or an inline field [X:..]
+    cmp     al, 'V'
+    je      pt_b_inlineV
+    jmp     pt_b_inlinefield          ; any other [X:..] -> skip through ']'
+
+pt_b_chord:
+    add     rsi, 1                    ; past '['
+    mov     [rip + txtPtr], rsi
+    call    ParseChord                ; emits NoteOns/NoteOffs, advances txtPtr+curMs
+    jmp     pt_loop
+
+pt_b_inlinefield:
+    ; an inline field [K:..]/[L:..]/[M:..]/[Q:..] etc — deferred (M-C).  Just eat
+    ; from '[' through the matching ']' (or EOL/NUL) without parsing it.
+    mov     rsi, [rip + txtPtr]
+    inc     rsi                       ; past '['
+pt_b_inlinefield_eat:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pt_b_inlinefield_done     ; NUL -> stop
+    cmp     al, ']'
+    je      pt_b_inlinefield_close
+    cmp     al, 10                    ; newline ends it too (malformed input)
+    je      pt_b_inlinefield_done
+    inc     rsi
+    jmp     pt_b_inlinefield_eat
+pt_b_inlinefield_close:
+    inc     rsi                       ; step past ']'
+pt_b_inlinefield_done:
+    mov     [rip + txtPtr], rsi
     jmp     pt_loop
 
 pt_b_inlineV:

@@ -45,10 +45,12 @@
 ;   multi-voice V: (header decl + body switch + inline [V:n]) — voices play
 ;     SIMULTANEOUSLY, each with its own running clock (see abc_voice.was);
 ;   per-voice instruments via %%MIDI program <prog> / <chan> <prog> (emits a
-;     0xC0 ProgramChange);  % line comments and %% stylesheet lines (skipped).
+;     0xC0 ProgramChange);  % line comments and %% stylesheet lines (skipped);
+;   chords [CEG] — N notes share one onset + one duration + one offset, with the
+;     duration taken from AFTER the ']' (see abc_chord.was).
 ;
 ; --- DEFERRED (no-ops / skipped, NOT implemented) ---
-;   repeats |: :| , ties - , tuplets (p , chords [...] , broken rhythm > < ,
+;   repeats |: :| , ties - , tuplets (p , broken rhythm > < ,
 ;   inline fields [K:..] , grace {} , trailing duration dots, minor/mode key
 ;   qualifiers (only the root letter + one optional #/b is read for the key sig).
 ; ============================================================================
@@ -59,6 +61,7 @@
 .include "abc_scan.was"
 .include "abc_note.was"
 .include "abc_voice.was"
+.include "abc_chord.was"
 .include "abc_parse.was"
 .include "abc_finalize.was"
 .include "abc_play.was"

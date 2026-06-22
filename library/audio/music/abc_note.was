@@ -1,42 +1,51 @@
-; abc_note.was — ParseNote: one note token -> pitch (key+accidentals+octave) + duration.
+; abc_note.was — ParseNotePitch (one note token -> MIDI pitch) + ParseNote.
 ; Part of the abc.was shell (.CODE).
 ; ----------------------------------------------------------------------------
-; ParseNote: consume accidental(s) + letter + octave marks + duration, compute
-; the MIDI pitch, emit NoteOn @ round(curMs) and NoteOff @ round(curMs+dur),
-; then advance curMs.  Calls -> frame.  Non-volatiles: rbx (pitch), rsi (cursor),
-; r12 (pc index), r13 (onMs).  durWholes parked in fDur across calls.
+; ParseNotePitch -> eax = MIDI pitch (0..127).
+;   Consumes ONE note token's accidental(s) + letter + octave marks from txtPtr,
+;   resolves the effective accidental (explicit -> sets barAcc/barSet[pc]; else a
+;   bar override; else the key default), computes the clamped MIDI pitch, and
+;   advances txtPtr PAST the token but NOT past any duration.  This is the pitch
+;   half of a note token, factored out so chords can reuse it (each chord note is
+;   one pitch token; the chord's single duration is parsed once after the ']').
+;   Leaf (no calls) -> no frame.  Returns 0..127 in eax; on a non-letter it returns
+;   -1 (0xFFFFFFFF).  NOTE: it commits any accidentals it consumed before the
+;   non-letter, so on a -1 return txtPtr may have ADVANCED past ^/_/= — a caller
+;   that "steps one char" on -1 must first re-check for terminators (ParseChord does).
+;   Non-volatile use: rsi (cursor).  Bar-accidental persistence is IDENTICAL to
+;   the pre-refactor ParseNote.
 ; ----------------------------------------------------------------------------
-proc ParseNote uses rbx rsi r12 r13 frame
+proc ParseNotePitch uses rbx rsi r12 r13 out rax
     mov     rsi, [rip + txtPtr]
 
     ; --- accidental prefix: ^ ^^ _ __ = (explicit overrides; persist to bar) ---
     ; ebx = explicit accidental value; r11d = 1 if an explicit accidental seen.
     xor     ebx, ebx
     xor     r11d, r11d
-pn_acc_loop:
+pnp_acc_loop:
     movzx   eax, byte ptr [rsi]
     cmp     al, '^'
-    je      pn_acc_sharp
+    je      pnp_acc_sharp
     cmp     al, '_'
-    je      pn_acc_flat
+    je      pnp_acc_flat
     cmp     al, '='
-    je      pn_acc_nat
-    jmp     pn_acc_done
-pn_acc_sharp:
+    je      pnp_acc_nat
+    jmp     pnp_acc_done
+pnp_acc_sharp:
     inc     ebx
     mov     r11d, 1
     inc     rsi
-    jmp     pn_acc_loop
-pn_acc_flat:
+    jmp     pnp_acc_loop
+pnp_acc_flat:
     dec     ebx
     mov     r11d, 1
     inc     rsi
-    jmp     pn_acc_loop
-pn_acc_nat:
+    jmp     pnp_acc_loop
+pnp_acc_nat:
     xor     ebx, ebx                  ; natural = 0
     mov     r11d, 1
     inc     rsi
-pn_acc_done:
+pnp_acc_done:
 
     ; --- the note letter ---
     ; MIDI octave convention: C4 = 60, i.e. midi = (octave+1)*12 + semitone.
@@ -44,68 +53,68 @@ pn_acc_done:
     movzx   eax, byte ptr [rsi]
     mov     r8d, 5
     cmp     al, 'a'
-    jb      pn_upper
+    jb      pnp_upper
     cmp     al, 'g'
-    ja      pn_bail
+    ja      pnp_bail
     mov     r8d, 6
     sub     al, 32                    ; uppercase
-    jmp     pn_have_letter
-pn_upper:
+    jmp     pnp_have_letter
+pnp_upper:
     cmp     al, 'A'
-    jb      pn_bail
+    jb      pnp_bail
     cmp     al, 'G'
-    ja      pn_bail
-pn_have_letter:
+    ja      pnp_bail
+pnp_have_letter:
     ; pc index = (letter-'A' + 5) mod 7   (A->5 B->6 C->0 D->1 E->2 F->3 G->4)
     movzx   ecx, al
     sub     ecx, 'A'
     add     ecx, 5
     cmp     ecx, 7
-    jb      pn_pc_ok
+    jb      pnp_pc_ok
     sub     ecx, 7
-pn_pc_ok:
+pnp_pc_ok:
     mov     r12d, ecx                 ; pitch-class index
     inc     rsi                       ; consume letter
 
     ; --- octave marks ' (+12) and , (-12), stackable ---
     xor     r13d, r13d
-pn_oct_loop:
+pnp_oct_loop:
     movzx   eax, byte ptr [rsi]
     cmp     al, 0x27                  ; apostrophe  '
-    je      pn_oct_up
+    je      pnp_oct_up
     cmp     al, 44                    ; comma  ,  (char literal ',' confuses lexer)
-    je      pn_oct_down
-    jmp     pn_oct_done
-pn_oct_up:
+    je      pnp_oct_down
+    jmp     pnp_oct_done
+pnp_oct_up:
     add     r13d, 12
     inc     rsi
-    jmp     pn_oct_loop
-pn_oct_down:
+    jmp     pnp_oct_loop
+pnp_oct_down:
     sub     r13d, 12
     inc     rsi
-    jmp     pn_oct_loop
-pn_oct_done:
+    jmp     pnp_oct_loop
+pnp_oct_done:
 
     ; --- resolve the effective accidental for this pitch class ---
     lea     r9, [rip + barAcc]
     lea     r10, [rip + barSet]
     mov     ecx, r12d
     test    r11d, r11d
-    jz      pn_acc_resolve_bar
+    jz      pnp_acc_resolve_bar
     mov     [r9 + rcx*4], ebx         ; explicit -> barAcc[pc] = ebx
     mov     dword ptr [r10 + rcx*4], 1
     mov     eax, ebx
-    jmp     pn_acc_resolved
-pn_acc_resolve_bar:
+    jmp     pnp_acc_resolved
+pnp_acc_resolve_bar:
     mov     edx, [r10 + rcx*4]
     test    edx, edx
-    jz      pn_acc_resolve_key
+    jz      pnp_acc_resolve_key
     mov     eax, [r9 + rcx*4]         ; bar override
-    jmp     pn_acc_resolved
-pn_acc_resolve_key:
+    jmp     pnp_acc_resolved
+pnp_acc_resolve_key:
     lea     r11, [rip + keyAcc]
     mov     eax, [r11 + rcx*4]        ; key default
-pn_acc_resolved:
+pnp_acc_resolved:
     mov     ebx, eax                  ; ebx = effective accidental
 
     ; --- MIDI pitch = baseOct*12 + semitab[pc] + accidental + octaveShift ---
@@ -118,23 +127,41 @@ pn_acc_resolved:
     add     eax, r13d
     ; clamp 0..127
     cmp     eax, 0
-    jge     pn_clamp_hi
+    jge     pnp_clamp_hi
     xor     eax, eax
-pn_clamp_hi:
+pnp_clamp_hi:
     cmp     eax, 127
-    jle     pn_pitch_ok
+    jle     pnp_pitch_ok
     mov     eax, 127
-pn_pitch_ok:
-    mov     ebx, eax                  ; ebx = MIDI pitch
+pnp_pitch_ok:
+    ; eax = MIDI pitch; advance the authoritative cursor past the token
+    mov     [rip + txtPtr], rsi
+    jmp     pnp_ret
+pnp_bail:
+    mov     [rip + txtPtr], rsi       ; persist whatever was consumed (accidentals)
+    mov     eax, -1                   ; signal: not a note letter
+pnp_ret:
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseNote: one full note token = pitch (ParseNotePitch) + duration.  Emits
+; NoteOn @ round(curMs) and NoteOff @ round(curMs+dur), then advances curMs.
+;   ParseNotePitch -> ParseDuration -> NoteOn(round(curMs)) -> AdvanceCurMs ->
+;   NoteOff(round(curMs)).  Calls -> frame.  rbx holds the pitch across calls;
+;   durWholes is parked in fDur across AdvanceCurMs.
+; ----------------------------------------------------------------------------
+proc ParseNote uses rbx frame
+    call    ParseNotePitch            ; eax = pitch (txtPtr past the token)
+    cmp     eax, -1
+    je      pn_ret                    ; not a note letter -> nothing emitted
+    mov     ebx, eax                  ; ebx = MIDI pitch (survives the calls)
 
     ; --- duration (writes txtPtr) ---
-    mov     [rip + txtPtr], rsi       ; sync cursor before ParseDuration
     call    ParseDuration             ; xmm0 = durWholes, txtPtr advanced
     movsd   [rip + fDur], xmm0        ; stash durWholes
 
     ; --- NoteOn @ round(curMs) ---
     call    RoundCurMs                ; eax = onMs
-    mov     r13d, eax
     mov     ecx, eax                  ; timeMs
     mov     edx, 0x90                 ; NoteOn
     mov     r8d, ebx                  ; d1 = pitch
@@ -152,11 +179,5 @@ pn_pitch_ok:
     mov     r8d, ebx                  ; d1 = pitch
     xor     r9d, r9d                  ; d2 = 0
     call    EmitEvent
-
-    mov     rsi, [rip + txtPtr]       ; keep local in sync (txtPtr is authoritative)
-    jmp     pn_ret
-pn_bail:
-    mov     [rip + txtPtr], rsi       ; persist whatever was consumed
 pn_ret:
 endproc
-
