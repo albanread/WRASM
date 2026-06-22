@@ -1,0 +1,494 @@
+; gpu/blit.was — GPU Canvas G1 "Texture pool + blitter".
+;
+; Built ON TOP of gpu/canvas.was (G0): reuses pDevice / pContext / pRTV / pSwap,
+; the comobj/.Method COM idioms, the .ASCIISTRING + D3DCompile shader path, the
+; struct..ends descriptors and the invoke ABI. Include AFTER canvas.was.
+;
+; What this adds (docs/gpucanvas.md §4 + the G1 sprint):
+;   * a LAYER render-target: a 640x360 R8G8B8A8_UNORM texture with
+;     BIND_RENDER_TARGET | BIND_SHADER_RESOURCE, its RTV (render INTO it) and its
+;     SRV (later SAMPLE it).
+;   * a small BUFFER POOL: PoolAlloc(kind, w, h) -> a slot handle. kind ASSET
+;     (CPU upload, SRV only) or LAYER (RT + SRV). Fixed slot arrays.
+;   * the GPU BLIT: a blit pixel shader (fullscreen-triangle VS like G0; PS .Load's
+;     src t0 at the output pixel) with MODES copy / colour-key / alpha-blend.
+;     Alpha uses a CreateBlendState'd blend state; copy/key bind a no-blend state.
+;   * a per-frame COMPOSITOR skeleton: asset -> layer RT (copy); layer RT -> back
+;     buffer (copy); a translucent layer alpha-blended over the back buffer. The RT
+;     is switched and the viewport reset on each switch; a texture is never sampled
+;     while still bound as the current render target (the next RT is set first).
+;
+; winkb supplied every D3D11 detail (no magic numbers):
+;   D3D11_BIND_RENDER_TARGET=32, D3D11_BIND_SHADER_RESOURCE=8,
+;   D3D11_BLEND_SRC_ALPHA=5, D3D11_BLEND_INV_SRC_ALPHA=6, D3D11_BLEND_ONE=2,
+;   D3D11_BLEND_OP_ADD=1, D3D11_COLOR_WRITE_ENABLE_ALL=15,
+;   D3D11_RTV_DIMENSION_TEXTURE2D=4, D3D11_SRV_DIMENSION_TEXTURE2D=4.
+;   The LAYER RTV is created with a NULL desc (PoolAlloc) — the RTV inherits the
+;   texture's R8G8B8A8_UNORM format, so no D3D11_RENDER_TARGET_VIEW_DESC is built.
+;   D3D11_BLEND_DESC: AlphaToCoverageEnable@0, IndependentBlendEnable@4,
+;     RenderTarget[0]@8 = D3D11_RENDER_TARGET_BLEND_DESC{ BlendEnable@0,
+;     SrcBlend@4, DestBlend@8, BlendOp@12, SrcBlendAlpha@16, DestBlendAlpha@20,
+;     BlendOpAlpha@24, RenderTargetWriteMask@28(u8) }.
+;
+; Every .DATA block opens with .balign 16 (trap #8).
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The BLIT shader.
+;   VS  — fullscreen triangle from SV_VertexID (identical to G0's).
+;   PS  — px=int(uv.x*640), py=int(uv.y*360); fetch src.Load(int3(px,py,0))
+;         (integer texel fetch, src and dst are both 640x360 so no sampler).
+;         mode (constant b0): 0=copy, 1=colour-key (discard when the texel equals
+;         the key within an epsilon), 2=alpha (the colour passes through, the
+;         blend STATE does the SRC_ALPHA / INV_SRC_ALPHA math).
+; src : Texture2D<float4> at t0 (R8G8B8A8_UNORM, 640x360)
+; CB  : float4 keyCol; float4 modeF;  (modeF.x = mode as a float)
+; ---------------------------------------------------------------------------
+blitSrc:
+.ASCIISTRING
+Texture2D<float4> src:register(t0);
+cbuffer BCB:register(b0){float4 keyCol;float4 modeF;};
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO BVS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float4 BPS(VO v):SV_Target{
+int px=(int)(v.uv.x*640.0);int py=(int)(v.uv.y*360.0);
+px=clamp(px,0,639);py=clamp(py,0,359);
+float4 c=src.Load(int3(px,py,0));
+int m=(int)(modeF.x+0.5);
+if(m==1){float3 d=abs(c.rgb-keyCol.rgb);if(d.x<0.02&&d.y<0.02&&d.z<0.02)discard;}
+return c;}
+.ENDASCIISTRING
+blitEnd:
+    BYTE 0
+
+bvsEntry  BYTE "BVS", 0
+bpsEntry  BYTE "BPS", 0
+blitName  BYTE "gpublit", 0
+
+.balign 16
+; ---- blit COM objects + scalar state ----
+comobj pVSBlobB : ID3DBlob
+comobj pPSBlobB : ID3DBlob
+
+pBlitVS    QWORD ?
+pBlitPS    QWORD ?
+pBlendOpaque QWORD ?              ; no-blend state (copy / colour-key)
+pBlendAlpha  QWORD ?             ; SRC_ALPHA / INV_SRC_ALPHA state
+pBlitCB    QWORD ?               ; the mode/key constant buffer
+blitSrcLen QWORD ?
+tmpPtrB    QWORD ?
+tmpSizeB   QWORD ?
+
+; blend factor for OMSetBlendState (all ones) + the sample mask 0xFFFFFFFF.
+blendFactor DWORD 0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000
+
+; the blit constant-buffer mirror: keyCol(4 floats) + modeF(4 floats) = 32 bytes.
+;   [0..15] keyCol (rgba)  [16] modeF.x (mode)  [20..28] pad
+blitCB DWORD 0,0,0,0, 0,0,0,0
+
+; viewport for a 640x360 layer RT (vs in canvas.was is the 1280x720 backbuffer one).
+vpLayer struct D3D11_VIEWPORT
+    Width    = 0x44200000          ; 640.0f
+    Height   = 0x43B40000          ; 360.0f
+    MaxDepth = 0x3F800000          ; 1.0f
+ends
+
+; clear colour for a layer RT (transparent black: rgba 0,0,0,0 — so the overlay's
+; outside-the-quad region stays fully transparent for the alpha pass).
+clearClear DWORD 0,0,0,0
+
+.balign 16
+; ---- buffer-pool slot tables (fixed capacity = 16) ----
+poolKind   DWORD 16 dup(0)         ; 0=free, 1=ASSET, 2=LAYER
+poolTex    QWORD 16 dup(0)         ; ID3D11Texture2D*
+poolSRV    QWORD 16 dup(0)         ; ID3D11ShaderResourceView*
+poolRTV    QWORD 16 dup(0)         ; ID3D11RenderTargetView* (LAYER only)
+poolCount  DWORD 0
+
+; scratch descriptors reused per PoolAlloc (patched then handed to D3D).
+tdPool struct D3D11_TEXTURE2D_DESC
+    Width            = 640
+    Height           = 360
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 28             ; DXGI_FORMAT_R8G8B8A8_UNORM
+    SampleDesc.Count = 1
+    Usage            = 0              ; D3D11_USAGE_DEFAULT
+    BindFlags        = 8             ; patched: ASSET=8, LAYER=8|32=40
+ends
+
+srvPool struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 28               ; R8G8B8A8_UNORM
+    ViewDimension = 4               ; D3D11_SRV_DIMENSION_TEXTURE2D
+ends
+
+sdPool struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 2560               ; 640*4 (patched per width)
+ends
+
+; the mode/key constant buffer descriptor (32 bytes, dynamic-ish default).
+bcbDesc struct D3D11_BUFFER_DESC
+    ByteWidth = 32
+    Usage     = 0
+    BindFlags = 4                     ; D3D11_BIND_CONSTANT_BUFFER
+ends
+
+.balign 16
+; ---- blend state descriptors ----
+; The struct macro can't address RenderTarget[0] (D3D11_RENDER_TARGET_BLEND_DESC[]
+; at +8), so both D3D11_BLEND_DESCs are laid out by hand (winkb gave the layout):
+;   +0  AlphaToCoverageEnable (BOOL)
+;   +4  IndependentBlendEnable (BOOL)
+;   +8  RenderTarget[0]: BlendEnable(+0) SrcBlend(+4) DestBlend(+8) BlendOp(+12)
+;       SrcBlendAlpha(+16) DestBlendAlpha(+20) BlendOpAlpha(+24)
+;       RenderTargetWriteMask(+28, u8 then 3 pad)
+;   then RenderTarget[1..7] (7*32 = 224 bytes, all zero) -> total 264.
+; opaque: BlendEnable=0, write mask ALL (0xF). The blend fields are ignored.
+bdOpaque:
+    DWORD 0                            ; AlphaToCoverageEnable
+    DWORD 0                            ; IndependentBlendEnable
+    DWORD 0                            ; [0] BlendEnable = FALSE
+    DWORD 0, 0, 0, 0, 0, 0             ; SrcBlend,DestBlend,BlendOp,SrcBlendAlpha,
+                                       ;   DestBlendAlpha,BlendOpAlpha (all ignored)
+    BYTE  15, 0, 0, 0                  ; RenderTargetWriteMask = ALL (+28) + pad
+    BYTE  224 dup(0)                   ; RenderTarget[1..7]
+; alpha-over: BlendEnable=1, SRC_ALPHA / INV_SRC_ALPHA, ADD; alpha ONE/INV_SRC_ALPHA.
+bdAlpha:
+    DWORD 0                            ; AlphaToCoverageEnable
+    DWORD 0                            ; IndependentBlendEnable
+    DWORD 1                            ; [0] BlendEnable = TRUE
+    DWORD 5                            ; SrcBlend       = D3D11_BLEND_SRC_ALPHA
+    DWORD 6                            ; DestBlend      = D3D11_BLEND_INV_SRC_ALPHA
+    DWORD 1                            ; BlendOp        = D3D11_BLEND_OP_ADD
+    DWORD 2                            ; SrcBlendAlpha  = D3D11_BLEND_ONE
+    DWORD 6                            ; DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA
+    DWORD 1                            ; BlendOpAlpha   = D3D11_BLEND_OP_ADD
+    BYTE  15, 0, 0, 0                  ; RenderTargetWriteMask = ALL + pad
+    BYTE  224 dup(0)                   ; RenderTarget[1..7]
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; BlitInit — compile the blit shaders, create both blend states + the mode CB.
+; Returns 0 on success in eax; on D3D failure exits with a small code (like G0).
+; Call AFTER GpuInit (needs pDevice live).
+; ===========================================================================
+.globl BlitInit
+BlitInit:
+    push    rbx
+    sub     rsp, 40
+
+    ; The SRV desc's anonymous union (D3D11_TEX2D_SRV at +8) can't be set by the
+    ; struct macro; patch MipLevels=1 at +12 (MostDetailedMip at +8 is already 0).
+    ; MipLevels=0 makes CreateShaderResourceView fail (E_INVALIDARG) — same trap as
+    ; gpu/canvas.was GpuInit.
+    mov     dword ptr [rip + srvPool + 12], 1
+
+    ; ---- compile the blit VS/PS ----
+    lea     rax, [rip + blitEnd]
+    lea     rcx, [rip + blitSrc]
+    sub     rax, rcx
+    mov     [rip + blitSrcLen], rax
+    invoke  D3DCompile, blitSrc, [rip + blitSrcLen], blitName, 0, 0, bvsEntry, vsTarget, 0, 0, pVSBlobB, pErrBlob
+    test    eax, eax
+    js      bi_fail_compile
+    invoke  D3DCompile, blitSrc, [rip + blitSrcLen], blitName, 0, 0, bpsEntry, psTarget, 0, 0, pPSBlobB, pErrBlob
+    test    eax, eax
+    js      bi_fail_compile
+
+    pVSBlobB.GetBufferPointer()
+    mov     [rip + tmpPtrB], rax
+    pVSBlobB.GetBufferSize()
+    mov     [rip + tmpSizeB], rax
+    pDevice.CreateVertexShader([rip + tmpPtrB], [rip + tmpSizeB], 0, pBlitVS)
+    test    eax, eax
+    js      bi_fail_d3d
+    pPSBlobB.GetBufferPointer()
+    mov     [rip + tmpPtrB], rax
+    pPSBlobB.GetBufferSize()
+    mov     [rip + tmpSizeB], rax
+    pDevice.CreatePixelShader([rip + tmpPtrB], [rip + tmpSizeB], 0, pBlitPS)
+    test    eax, eax
+    js      bi_fail_d3d
+
+    ; ---- blend states ----
+    pDevice.CreateBlendState(bdOpaque, pBlendOpaque)
+    test    eax, eax
+    js      bi_fail_d3d
+    pDevice.CreateBlendState(bdAlpha, pBlendAlpha)
+    test    eax, eax
+    js      bi_fail_d3d
+
+    ; ---- the mode/key constant buffer ----
+    pDevice.CreateBuffer(bcbDesc, 0, pBlitCB)
+    test    eax, eax
+    js      bi_fail_d3d
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     rbx
+    ret
+bi_fail_compile:
+    invoke  ExitProcess, 15
+bi_fail_d3d:
+    invoke  ExitProcess, 13
+
+; ===========================================================================
+; PoolAlloc(kind in rcx, initData in rdx) -> slot handle in eax (-1 on failure).
+;   kind: 1=ASSET (BIND_SHADER_RESOURCE, optional CPU upload via rdx), 2=LAYER
+;   (BIND_SHADER_RESOURCE|BIND_RENDER_TARGET, rdx ignored, RTV created too).
+;   All textures are 640x360 R8G8B8A8_UNORM (the canvas layer size).
+;   rdx = pointer to 640*360*4 RGBA bytes for an ASSET, or 0 for none.
+; ===========================================================================
+.globl PoolAlloc
+PoolAlloc:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    sub     rsp, 24
+
+    mov     r12d, ecx               ; kind
+    mov     r13, rdx                ; init data ptr (ASSET)
+
+    ; find a free slot
+    mov     eax, [rip + poolCount]
+    cmp     eax, 16
+    jge     pa_fail
+    mov     ebx, eax                ; ebx = slot index
+
+    ; BindFlags: ASSET=8 ; LAYER=8|32=40
+    cmp     r12d, 2
+    jne     pa_asset_bind
+    mov     dword ptr [rip + tdPool + D3D11_TEXTURE2D_DESC.BindFlags], 40
+    jmp     pa_make_tex
+pa_asset_bind:
+    mov     dword ptr [rip + tdPool + D3D11_TEXTURE2D_DESC.BindFlags], 8
+
+pa_make_tex:
+    ; CreateTexture2D — for an ASSET with init data, hand sdPool; else NULL.
+    cmp     r12d, 2
+    je      pa_tex_nodata
+    test    r13, r13
+    jz      pa_tex_nodata
+    mov     [rip + sdPool + D3D11_SUBRESOURCE_DATA.pSysMem], r13
+    pDevice.CreateTexture2D(tdPool, sdPool, poolTexTmp)
+    jmp     pa_tex_check
+pa_tex_nodata:
+    pDevice.CreateTexture2D(tdPool, 0, poolTexTmp)
+pa_tex_check:
+    test    eax, eax
+    js      pa_fail
+    ; stash the texture ptr into poolTex[slot]
+    mov     rax, [rip + poolTexTmp]
+    lea     rdi, [rip + poolTex]
+    mov     [rdi + rbx*8], rax
+
+    ; SRV (every kind gets one)
+    pDevice.CreateShaderResourceView([rip + poolTexTmp], srvPool, poolSRVTmp)
+    test    eax, eax
+    js      pa_fail
+    mov     rax, [rip + poolSRVTmp]
+    lea     rdi, [rip + poolSRV]
+    mov     [rdi + rbx*8], rax
+
+    ; LAYER also gets an RTV (NULL desc — inherits the texture's format).
+    cmp     r12d, 2
+    jne     pa_kind_store
+    pDevice.CreateRenderTargetView([rip + poolTexTmp], 0, poolRTVTmp)
+    test    eax, eax
+    js      pa_fail
+    mov     rax, [rip + poolRTVTmp]
+    lea     rdi, [rip + poolRTV]
+    mov     [rdi + rbx*8], rax
+
+pa_kind_store:
+    lea     rdi, [rip + poolKind]
+    mov     [rdi + rbx*4], r12d
+    mov     eax, [rip + poolCount]
+    inc     eax
+    mov     [rip + poolCount], eax
+    mov     eax, ebx                ; return the slot handle
+
+    add     rsp, 24
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+pa_fail:
+    mov     eax, -1
+    add     rsp, 24
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; Blit(srcSRV in rcx, dstRTV in rdx, mode in r8d) — the workhorse.
+;   Sets the dst RT, binds the src SRV at t0, the blit VS/PS, the mode's blend
+;   state, uploads the mode/key CB, Draw(3,0).
+;   Blit does NOT call RSSetViewports — the VIEWPORT IS THE CALLER'S
+;   RESPONSIBILITY. The BlitToLayer / BlitToBack wrappers each set the correct
+;   viewport (640x360 layer vs 1280x720 backbuffer) immediately before calling
+;   Blit. Blit is intentionally not .globl so it is only ever reached via a wrapper.
+;   mode: 0=copy, 1=colour-key, 2=alpha-blend.
+;   Caller has ALREADY ensured srcSRV's texture is not the current RT (we set the
+;   new RT first, which unbinds the old one before any sampling happens).
+; ===========================================================================
+Blit:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     rsi, rcx                ; srcSRV
+    mov     rdi, rdx                ; dstRTV
+    mov     [rip + blitModeTmp], r8d ; mode stashed (comobj clobbers volatiles)
+
+    ; bind the destination render target (this UNBINDS any previously-bound RT,
+    ; so a texture that was an RT becomes safe to sample on the next Blit).
+    mov     [rip + rtvTmp], rdi
+    pContext.OMSetRenderTargets(1, rtvTmp, 0)
+
+    ; bind the src SRV at t0
+    mov     [rip + srvTmp], rsi
+    pContext.PSSetShaderResources(0, 1, srvTmp)
+
+    ; shaders
+    pContext.VSSetShader([rip + pBlitVS], 0, 0)
+    pContext.PSSetShader([rip + pBlitPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+
+    ; mode/key constant buffer: modeF.x = mode; keyCol stays whatever BlitSetKey set.
+    mov     eax, [rip + blitModeTmp]
+    cvtsi2ss xmm0, eax
+    movss   [rip + blitCB + 16], xmm0
+    pContext.UpdateSubresource([rip + pBlitCB], 0, 0, blitCB, 0, 0)
+    pContext.PSSetConstantBuffers(0, 1, pBlitCB)
+
+    ; pick the blend state: alpha (mode 2) -> alpha state; else opaque.
+    mov     eax, [rip + blitModeTmp]
+    cmp     eax, 2
+    je      bl_alpha
+    mov     rax, [rip + pBlendOpaque]
+    jmp     bl_setblend
+bl_alpha:
+    mov     rax, [rip + pBlendAlpha]
+bl_setblend:
+    mov     [rip + blendTmp], rax
+    ; OMSetBlendState(state, blendFactor, sampleMask=0xFFFFFFFF)
+    pContext.OMSetBlendState([rip + blendTmp], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(4)   ; TRIANGLELIST
+    pContext.Draw(3, 0)
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ---------------------------------------------------------------------------
+; BlitToLayer(srcSRV=rcx, dstRTV=rdx, mode=r8) — set the 640x360 viewport then Blit.
+; ---------------------------------------------------------------------------
+.globl BlitToLayer
+BlitToLayer:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+    mov     rsi, rcx
+    mov     rdi, rdx
+    mov     [rip + blitModeTmp], r8d
+    ; set the new RT FIRST (unbind any old RT) — never sample a bound RT.
+    mov     [rip + rtvTmp], rdx
+    pContext.OMSetRenderTargets(1, rtvTmp, 0)
+    pContext.RSSetViewports(1, vpLayer)        ; reset viewport for the 640x360 RT
+    ; now do the rest of the blit (it re-sets the RT harmlessly + binds the SRV).
+    mov     rcx, rsi
+    mov     rdx, rdi
+    mov     r8d, [rip + blitModeTmp]
+    call    Blit
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ---------------------------------------------------------------------------
+; BlitToBack(srcSRV=rcx, mode=rdx) — composite a layer SRV onto the backbuffer,
+; with the 1280x720 backbuffer viewport. dst is pRTV (the swapchain RTV).
+; ---------------------------------------------------------------------------
+.globl BlitToBack
+BlitToBack:
+    push    rbx
+    push    rsi
+    push    rdi                     ; 3rd push: land on residue 0 before `call Blit`
+                                    ;   (matches Blit / BlitToLayer — delivers the
+                                    ;    ABI-correct residue-8 to Blit's entry).
+    sub     rsp, 32
+    mov     rsi, rcx                ; srcSRV
+    mov     [rip + blitModeTmp], edx ; mode
+    ; switch RT to the backbuffer FIRST (unbinds the layer RT so it's safe to sample)
+    mov     rax, [rip + pRTV]
+    mov     [rip + rtvTmp], rax
+    pContext.OMSetRenderTargets(1, rtvTmp, 0)
+    pContext.RSSetViewports(1, vp)             ; reset to the 1280x720 backbuffer viewport
+    mov     rcx, rsi
+    mov     rax, [rip + pRTV]
+    mov     rdx, rax
+    mov     r8d, [rip + blitModeTmp]
+    call    Blit
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ---------------------------------------------------------------------------
+; BlitSetKey(rgba color in ecx) — set the colour-key (0xAABBGGRR? we store rgba as
+; four floats). Pass the key as 0x00RRGGBB bytes (R low). Stored as normalized
+; floats into blitCB.keyCol so the PS compares in the same 0..1 space as the texel.
+; ---------------------------------------------------------------------------
+.globl BlitSetKey
+BlitSetKey:
+    ; R = byte0, G = byte1, B = byte2
+    mov     eax, ecx
+    movzx   edx, al                 ; R
+    cvtsi2ss xmm0, edx
+    divss   xmm0, [rip + f255]
+    movss   [rip + blitCB + 0], xmm0
+    mov     eax, ecx
+    shr     eax, 8
+    movzx   edx, al                 ; G
+    cvtsi2ss xmm0, edx
+    divss   xmm0, [rip + f255]
+    movss   [rip + blitCB + 4], xmm0
+    mov     eax, ecx
+    shr     eax, 16
+    movzx   edx, al                 ; B
+    cvtsi2ss xmm0, edx
+    divss   xmm0, [rip + f255]
+    movss   [rip + blitCB + 8], xmm0
+    ret
+
+.balign 16
+.DATA
+.balign 16
+; scratch ptr cells (CreateXxx writes through these, then we copy to the slot array)
+poolTexTmp QWORD ?
+poolSRVTmp QWORD ?
+poolRTVTmp QWORD ?
+; per-Blit scratch (single-element arrays for the ppArray COM args)
+rtvTmp     QWORD ?
+srvTmp     QWORD ?
+blendTmp   QWORD ?
+blitModeTmp DWORD ?
+f255       DWORD 0x437F0000          ; 255.0f

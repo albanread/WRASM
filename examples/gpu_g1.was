@@ -1,0 +1,344 @@
+; gpu_g1.was — GPU Canvas G1 driver: texture pool + blitter + compositor.
+;
+;   was examples\gpu_g1.was -o gpu_g1.exe   &&   gpu_g1.exe
+;
+; Brings up the G0 device/swapchain (gpu/canvas.was) + the G1 blitter
+; (gpu/blit.was), then runs a per-frame COMPOSITOR that proves the three blit
+; modes and the layer-RT / backbuffer render-target switch:
+;
+;   1. an ASSET texture (a recognizable RGBA pattern: a green field with a red
+;      diagonal and a magenta colour-key border) is blit (COPY) INTO a LAYER RT.
+;   2. that LAYER RT is composited (COPY) to the 1280x720 BACK BUFFER.
+;   3. a second translucent ASSET (a semi-transparent blue gradient quad, alpha
+;      ~0.5) is ALPHA-BLENDED over the back buffer — so the BMP visibly shows the
+;      blue veil darkening/tinting the layer beneath it.
+;
+; The RT is switched (layer RT -> backbuffer) and the viewport reset on each
+; switch; a texture is never sampled while still bound as the current RT (the next
+; RT is bound first). Two gates (docs/gpucanvas.md §8): a live window AND the BMP.
+
+.include "../gpu/canvas.was"
+.include "../gpu/blit.was"
+
+.DATA
+.balign 16
+className   WCHAR  "rasm_gpu_g1", 0
+titleText   WCHAR  "RASM — GPU Canvas G1 (texture pool + blitter @ 720p)", 0
+wc          BYTE   80 dup(0)
+msg         BYTE   48 dup(0)
+hwndSave    QWORD  ?
+winRect     BYTE   16 dup(0)
+winW        DWORD  ?
+winH        DWORD  ?
+didSnap     DWORD  0
+bmpNameG1   WCHAR  "E:/RASM/examples/gpu_g1.bmp", 0
+
+; pool handles
+hAsset      DWORD  ?               ; the base RGBA pattern asset (ASSET)
+hOverlay    DWORD  ?               ; the translucent overlay asset (ASSET)
+hLayer      DWORD  ?               ; the layer render target (LAYER)
+
+.balign 16
+; ---- asset pixel buffers: 640x360 RGBA, byte order R,G,B,A (matches the SRV's
+;      R8G8B8A8_UNORM and the blit PS, which reads .rgba straight through) ----
+assetPix    BYTE 921600 dup(0)     ; 640*360*4
+overlayPix  BYTE 921600 dup(0)
+
+.balign 16
+.CODE
+.globl main
+main:
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 1280
+    mov     dword ptr [rdi + 12], 720
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + winH], eax
+
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail_window
+
+    ; build the asset pixel patterns BEFORE creating the textures (ASSET = upload once)
+    call    BuildAssets
+
+    ; bring up the G0 device/swapchain on this window
+    mov     rcx, [rip + hwndSave]
+    call    GpuInit
+
+    ; bring up the G1 blitter (shaders + blend states + mode CB)
+    call    BlitInit
+
+    ; ---- allocate the pool textures ----
+    ; base pattern asset (CPU upload)
+    mov     ecx, 1                          ; kind ASSET
+    lea     rdx, [rip + assetPix]
+    call    PoolAlloc
+    mov     [rip + hAsset], eax
+    ; translucent overlay asset (CPU upload)
+    mov     ecx, 1
+    lea     rdx, [rip + overlayPix]
+    call    PoolAlloc
+    mov     [rip + hOverlay], eax
+    ; layer render target (RT + SRV, no upload)
+    mov     ecx, 2                          ; kind LAYER
+    xor     edx, edx
+    call    PoolAlloc
+    mov     [rip + hLayer], eax
+
+    ; set the colour key to magenta (R=255,G=0,B=255) — for the COPY path it is
+    ; unused, but Composite uses COPY for the layer; the key is wired for review.
+    mov     ecx, 0x00FF00FF                 ; bytes R=FF,G=00,B=FF
+    call    BlitSetKey
+
+    ; redirect GpuSnapshot's output to gpu_g1.bmp
+    lea     rax, [rip + bmpNameG1]
+    mov     [rip + bmpPathPtr], rax
+
+    call    Composite                       ; first frame
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail_window:
+    invoke  ExitProcess, 1
+
+; ===========================================================================
+; Composite — one frame of the G1 compositor skeleton.
+;   (a) blit hAsset (SRV) INTO hLayer (RT), mode COPY  [viewport 640x360]
+;   (b) blit hLayer (SRV) onto the BACK BUFFER, mode COPY  [viewport 1280x720]
+;   (c) alpha-blend hOverlay (SRV) onto the BACK BUFFER, mode ALPHA
+;   then Present. The RT switches layer->backbuffer; the viewport resets on each
+;   switch; hLayer is sampled in (b) only AFTER (b) bound the backbuffer as the RT
+;   (so it is no longer bound as a render target — no read-while-bound hazard).
+; ===========================================================================
+.globl Composite
+Composite:
+    push    rbx
+    sub     rsp, 32
+
+    ; (a) asset -> layer RT (copy). Clear the layer first to transparent black.
+    ; ClearRenderTargetView takes the RTV explicitly, so it does NOT need the RT
+    ; bound — BlitToLayer (below) owns the single OMSetRenderTargets + RSSetViewports
+    ; RT/viewport switch for the layer (no redundant binds here).
+    mov     ebx, [rip + hLayer]
+    lea     rax, [rip + poolRTV]
+    mov     rax, [rax + rbx*8]              ; layer RTV
+    mov     [rip + cmpRTV], rax
+    pContext.ClearRenderTargetView([rip + cmpRTV], clearClear)
+
+    ; src = hAsset SRV ; dst = layer RTV ; mode COPY(0)
+    mov     ebx, [rip + hAsset]
+    lea     rax, [rip + poolSRV]
+    mov     rcx, [rax + rbx*8]
+    mov     ebx, [rip + hLayer]
+    lea     rax, [rip + poolRTV]
+    mov     rdx, [rax + rbx*8]
+    xor     r8d, r8d                        ; mode COPY
+    call    BlitToLayer
+
+    ; (b) layer RT -> backbuffer (copy). BlitToBack binds the backbuffer RT first
+    ;     (unbinding the layer RT), resets the 1280x720 viewport, then samples the
+    ;     layer SRV — safe because the layer is no longer the current RT.
+    pContext.ClearRenderTargetView([rip + pRTV], clearCol)
+    mov     ebx, [rip + hLayer]
+    lea     rax, [rip + poolSRV]
+    mov     rcx, [rax + rbx*8]              ; layer SRV
+    xor     edx, edx                        ; mode COPY
+    call    BlitToBack
+
+    ; (c) translucent overlay -> backbuffer (alpha-blend over what's already there).
+    mov     ebx, [rip + hOverlay]
+    lea     rax, [rip + poolSRV]
+    mov     rcx, [rax + rbx*8]
+    mov     edx, 2                          ; mode ALPHA
+    call    BlitToBack
+
+    pSwap.Present(1, 0)
+
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildAssets — fill assetPix (base pattern) and overlayPix (translucent veil).
+; All pixels are R,G,B,A bytes (R8G8B8A8_UNORM).
+;
+;   assetPix : a green field; a thick red diagonal stripe (|x-y|<24); a 16px
+;              magenta border (the colour-key demo value). Alpha = 255 (opaque).
+;   overlayPix: a horizontal blue gradient quad in the centre band
+;              (y 120..240), alpha = 128 (~0.5) so it visibly blends; fully
+;              transparent (alpha 0) elsewhere so the rest of the scene shows.
+; ===========================================================================
+BuildAssets:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8
+
+    ; ---- assetPix ----
+    lea     rdi, [rip + assetPix]
+    xor     r12d, r12d                       ; y
+ba_row:
+    cmp     r12d, 360
+    jge     ba_done_asset
+    xor     r13d, r13d                       ; x
+ba_col:
+    cmp     r13d, 640
+    jge     ba_rowend
+    ; default: green field (R=20,G=160,B=40)
+    mov     r8d, 20                          ; R
+    mov     r9d, 160                         ; G
+    mov     r10d, 40                         ; B
+    ; red diagonal: |x - y| < 24  -> red (200,30,30)
+    mov     eax, r13d
+    sub     eax, r12d
+    cdq
+    xor     eax, edx
+    sub     eax, edx                         ; abs(x-y)
+    cmp     eax, 24
+    jge     ba_chk_border
+    mov     r8d, 200
+    mov     r9d, 30
+    mov     r10d, 30
+    jmp     ba_emit
+ba_chk_border:
+    ; magenta border (16px): x<16 || x>=624 || y<16 || y>=344 -> (255,0,255)
+    cmp     r13d, 16
+    jl      ba_magenta
+    cmp     r13d, 624
+    jge     ba_magenta
+    cmp     r12d, 16
+    jl      ba_magenta
+    cmp     r12d, 344
+    jge     ba_magenta
+    jmp     ba_emit
+ba_magenta:
+    mov     r8d, 255
+    mov     r9d, 0
+    mov     r10d, 255
+ba_emit:
+    mov     [rdi + 0], r8b                  ; R
+    mov     [rdi + 1], r9b                  ; G
+    mov     [rdi + 2], r10b                 ; B
+    mov     byte ptr [rdi + 3], 255         ; A = opaque
+    add     rdi, 4
+    inc     r13d
+    jmp     ba_col
+ba_rowend:
+    inc     r12d
+    jmp     ba_row
+ba_done_asset:
+
+    ; ---- overlayPix ----
+    lea     rdi, [rip + overlayPix]
+    xor     r12d, r12d                       ; y
+bo_row:
+    cmp     r12d, 360
+    jge     bo_done
+    xor     r13d, r13d                       ; x
+bo_col:
+    cmp     r13d, 640
+    jge     bo_rowend
+    ; default transparent
+    xor     r8d, r8d                        ; R
+    xor     r9d, r9d                        ; G
+    xor     r10d, r10d                      ; B
+    xor     r11d, r11d                      ; A = 0
+    ; centre band y 120..240 : a blue gradient, alpha 128
+    cmp     r12d, 120
+    jl      bo_emit
+    cmp     r12d, 240
+    jge     bo_emit
+    ; B ramps with x (0..255 across the width), small R for a violet tint
+    mov     eax, r13d
+    imul    eax, eax, 255
+    mov     ecx, 640
+    cdq
+    idiv    ecx                             ; eax = x*255/640
+    mov     r10d, eax                       ; B
+    mov     r8d, 40                         ; R (slight violet)
+    xor     r9d, r9d                        ; G
+    mov     r11d, 128                       ; A ~0.5
+bo_emit:
+    mov     [rdi + 0], r8b
+    mov     [rdi + 1], r9b
+    mov     [rdi + 2], r10b
+    mov     [rdi + 3], r11b
+    add     rdi, 4
+    inc     r13d
+    jmp     bo_col
+bo_rowend:
+    inc     r12d
+    jmp     bo_row
+bo_done:
+
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 2                            ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                          ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    Composite
+    mov     eax, [rip + didSnap]
+    test    eax, eax
+    jnz     wp_timer_done
+    mov     dword ptr [rip + didSnap], 1
+    call    GpuSnapshot
+wp_timer_done:
+    xor     eax, eax
+    ret
+
+.balign 16
+.DATA
+.balign 16
+cmpRTV    QWORD ?

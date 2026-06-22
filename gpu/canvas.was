@@ -216,6 +216,11 @@ clearCol  DWORD 0, 0, 0, 0x3F800000      ; black, A=1
 ; biSizeImage = 1280*3 padded-to-4 (=3840) * 720 = 2764800 = 0x002A3000
 ; bfOffBits = 54 = 0x36 ; bfSize = 54 + 2764800 = 0x002A3036
 bmpName   WCHAR "E:/RASM/examples/gpu_g0.bmp", 0
+; GpuSnapshot writes to whatever wide path bmpPathPtr points at (defaults to the
+; G0 name above). A later driver (e.g. examples/gpu_g1.was) overrides it before
+; calling GpuSnapshot so each sprint dumps its own BMP without duplicating this proc.
+.globl bmpPathPtr
+bmpPathPtr QWORD 0                       ; set to bmpName in GpuInit (a driver may override)
 bmpWrote  DWORD ?
 bmpFile   QWORD ?
 bmpHdr:
@@ -254,6 +259,10 @@ GpuInit:
     sub     rsp, 40                       ; align + shadow space
 
     mov     [rip + scd + DXGI_SWAP_CHAIN_DESC.OutputWindow], rcx
+
+    ; default the snapshot path to the G0 name (a driver may override afterwards).
+    lea     rax, [rip + bmpName]
+    mov     [rip + bmpPathPtr], rax
 
     ; The SRV descriptors' anonymous union (D3D11_TEX2D_SRV at +8) can't be set by
     ; the struct macro (it's one opaque leaf), so patch MipLevels=1 at +12 here —
@@ -428,8 +437,8 @@ GpuSnapshot:
     test    eax, eax
     js      gs_fail_map
 
-    ; open the file
-    invoke  CreateFileW, bmpName, 0x40000000, 0, 0, 2, 0x80, 0
+    ; open the file (path is bmpPathPtr — overridable per driver)
+    invoke  CreateFileW, [rip + bmpPathPtr], 0x40000000, 0, 0, 2, 0x80, 0
     mov     [rip + bmpFile], rax            ; keep handle in memory (invoke clobbers rbx)
     cmp     rax, -1                          ; INVALID_HANDLE_VALUE
     je      gs_fail_file
