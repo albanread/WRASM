@@ -1,0 +1,627 @@
+; gpu/text.was — GPU Canvas G4 "Text — font atlas + text layer".
+;
+; Built ON TOP of gpu/canvas.was (G0) and gpu/blit.was (G1: pBlendAlpha, the
+; alpha-over state, blendFactor). It MIRRORS the gpu/sprite.was (G3) instanced
+; path almost exactly: one quad INSTANCE per glyph, the instance's atlas region =
+; that glyph's cell, ONE DrawInstanced for a whole string. Include AFTER both
+; canvas.was and blit.was. (docs/gpucanvas.md §3 row 6: text is the TOP layer.)
+;
+; This MIRRORS library/canvas.was Text semantics on the GPU:
+;   * the 5x7 gc_font (library/gc_font.inc) is baked into a FONT ATLAS — an
+;     R8_UINT index texture. The atlas is laid out as a 16 x 8 grid of 8x8 cells
+;     (128 glyphs, ASCII-indexed). A glyph's on-pixels are index 1; off/background
+;     is index 0 (TRANSPARENT — discarded, exactly like library Text's "plot only
+;     set bits"). gc_font rows are 5 bits wide (bit 4 = leftmost column), 7 rows.
+;   * DrawText(x, y, str) renders the glyphs as instanced quads: for each character
+;     it folds lowercase->uppercase (library Text does the same), looks up the cell
+;     (cellX = (ch&15)*8, cellY = (ch>>4)*8), and pushes one 8x8 instance at the pen
+;     position; the pen advances 6px per glyph (library Text's 6px advance). One
+;     DrawInstanced draws the whole line.
+;   * a TEXT COLOUR per call (TxtSetColour) — carried per-instance as an RGB triple,
+;     so different lines (a title vs a HUD) can be different colours in one pass.
+;     The PS outputs (colour.rgb, 1) for on-pixels; index 0 is discarded.
+;
+; The instance record mirrors gpu/sprite.was's but swaps {paletteSlot, alpha} for
+; {r, g, b} (the text colour): {screenX, screenY, atlasX, atlasY, w, h, ... } — we
+; keep 8 floats (32-byte stride) so the input-layout / VB machinery is identical to
+; G3, with INSTRGB packed as 3 floats over the last 12 bytes:
+;   [0] screenX [4] screenY [8] atlasX [12] atlasY [16] w [20] h [24] r [28] g
+;   ... and b spills — so instead we keep w,h IMPLICIT (always 8) and pack
+;   {screenX, screenY, atlasX, atlasY, r, g, b, a} = 8 floats. The VS reads a fixed
+;   8x8 cell (the glyph cell), the PS uses (r,g,b) as the text colour.
+;
+; winkb supplied every D3D11 detail — all REUSED from gpu/sprite.was (G3):
+;   D3D11_INPUT_ELEMENT_DESC (32 bytes), D3D11_BUFFER_DESC (24), D3D11_MAPPED_
+;   SUBRESOURCE; D3D11_USAGE_DYNAMIC=2, D3D11_CPU_ACCESS_WRITE=0x10000,
+;   D3D11_BIND_VERTEX_BUFFER=1, D3D11_INPUT_PER_INSTANCE_DATA=1,
+;   D3D11_MAP_WRITE_DISCARD=4, DXGI_FORMAT_R32G32_FLOAT=16, DXGI_FORMAT_R32_FLOAT=41,
+;   DXGI_FORMAT_R8_UINT=62, DXGI_FORMAT_R32G32B32_FLOAT=6,
+;   D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP=5. Context vtbl slots as in G3.
+;
+; Every .DATA block opens with .balign 16 (trap #8).
+
+.DATA
+.balign 16
+; the 5x7 glyph font (library/gc_font.inc): fontTab = 128 glyphs x 7 bytes, each
+; byte a 5-bit row (bit 4 = leftmost). BakeFontAtlas expands it into fontAtlasPix.
+.include "../library/gc_font.inc"
+
+.balign 16
+; ---------------------------------------------------------------------------
+; The TEXT shader.
+;   VS  — a base quad from SV_VertexID (4 verts, TRIANGLESTRIP); corner =
+;         (vid&1, vid>>1) in {0,1}^2. The instance places a fixed 8x8 cell:
+;           pos = inst.scr.xy + corner*8       (screen px)
+;           clip = pos/canvasHalf - 1, y flipped (640x360 -> NDC)
+;           atl = inst.atl.xy + corner*8       (the glyph's atlas cell texel)
+;         and forwards the text colour (flat).
+;   PS  — .Load the font atlas at int(atl) (integer fetch, R8_UINT). index 0 ->
+;         discard (transparent background). else output (colour.rgb, 1).
+;
+; fontAtlas : Texture2D<uint> at t0 (R8_UINT, FONT_ATLAS_W x FONT_ATLAS_H)
+;
+; Per-instance inputs (one InputSlot, PER_INSTANCE_DATA, step 1):
+;   INSTPOS (R32G32_FLOAT) : screenX, screenY  (glyph top-left, screen px)
+;   INSTCEL (R32G32_FLOAT) : atlasX, atlasY     (glyph cell top-left texel)
+;   INSTCOL (R32G32B32_FLOAT) : r, g, b          (text colour, 0..1)
+; ---------------------------------------------------------------------------
+txtSrc:
+.ASCIISTRING
+Texture2D<uint> fontAtlas:register(t0);
+struct VO{float4 p:SV_Position;float2 atl:TEXCOORD0;nointerpolation float3 col:TEXCOORD1;
+          nointerpolation float2 org:TEXCOORD2;};
+VO TXVS(uint vid:SV_VertexID,
+        float2 scr:INSTPOS, float2 atl:INSTCEL, float3 col:INSTCOL){
+  VO o;
+  float2 corner=float2((float)(vid&1u),(float)((vid>>1)&1u));
+  float2 pos=scr+corner*8.0;
+  o.p=float4(pos.x/320.0-1.0, 1.0-pos.y/180.0, 0.0, 1.0);
+  o.atl=atl+corner*8.0;
+  o.col=col;
+  o.org=atl;
+  return o;
+}
+float4 TXPS(VO v):SV_Target{
+  int ax=(int)v.atl.x; int ay=(int)v.atl.y;
+  int x0=(int)v.org.x; int y0=(int)v.org.y;
+  ax=clamp(ax, x0, x0+7);
+  ay=clamp(ay, y0, y0+7);
+  ax=clamp(ax,0,127); ay=clamp(ay,0,63);   // global guard = real 128x64 atlas (FontAtlasW/H-1)
+  uint c=fontAtlas.Load(int3(ax,ay,0));
+  if(c==0u) discard;
+  return float4(v.col, 1.0);
+}
+.ENDASCIISTRING
+txtEnd:
+    BYTE 0
+
+txvsEntry BYTE "TXVS", 0
+txpsEntry BYTE "TXPS", 0
+txtName   BYTE "gputext", 0
+
+semPos    BYTE "INSTPOS", 0
+semCel    BYTE "INSTCEL", 0
+semCol    BYTE "INSTCOL", 0
+
+.balign 16
+; ---- font atlas geometry ----
+; 16 cells across x 8 cells down, each 8x8 -> 128 glyphs in a 128 x 64 R8_UINT atlas.
+.globl FontAtlasW
+.globl FontAtlasH
+FontAtlasW  DWORD 128
+FontAtlasH  DWORD 64
+.globl TxtMaxInst
+TxtMaxInst  DWORD 4096                    ; max glyphs queued per frame
+
+.balign 16
+; ---- text COM objects + scalar state ----
+comobj pVSBlobX : ID3DBlob
+comobj pPSBlobX : ID3DBlob
+comobj pFontTex : ID3D11Texture2D         ; 128x64 R8_UINT font atlas
+comobj pTxtInstVB : ID3D11Buffer          ; dynamic per-instance vertex buffer
+
+pTxtVS      QWORD ?
+pTxtPS      QWORD ?
+pTxtLayout  QWORD ?                       ; ID3D11InputLayout*
+pTxtSRVfont QWORD ?
+txtSrcLen   QWORD ?
+tmpPtrX     QWORD ?
+tmpSizeX    QWORD ?
+
+; the live instance count for the upcoming DrawText pass.
+.globl txtInstCount
+txtInstCount DWORD 0
+; DrawInstanced's InstanceCount, marshalled through memory (trap #9 — the comcall
+; macro loads `this` into rcx first, clobbering an aliasing GP-reg arg; snapshot to
+; a QWORD slot and pass [rip + txtDrawCount] so InstanceCount (r8d) reads true).
+txtDrawCount QWORD 0
+
+; the current text colour (3 floats r,g,b), set by TxtSetColour; default white.
+.balign 16
+txtCol      DWORD 0x3F800000, 0x3F800000, 0x3F800000   ; 1,1,1
+
+; per-instance stride (8 floats = 32 bytes) + IASetVertexBuffers stride/offset arrays.
+txtStride   DWORD 32
+txtOffset   DWORD 0
+.balign 16
+txtVBArr    QWORD 0
+txtMapped   BYTE 16 dup(0)                 ; D3D11_MAPPED_SUBRESOURCE out
+txtRTVTmp   QWORD ?
+
+.balign 16
+; ---- the CPU instance mirror: TxtMaxInst * 32 bytes (8 floats per glyph),
+;      packed {screenX, screenY, atlasX, atlasY, r, g, b, pad}. 4096*32 = 131072.
+.globl txtInstData
+txtInstData BYTE 131072 dup(0)
+
+.balign 16
+; ---- the font atlas CPU mirror: 128*64 indexed bytes (index 1 = on, 0 = off).
+.globl fontAtlasPix
+fontAtlasPix BYTE 8192 dup(0)             ; 128*64
+
+.balign 16
+; ---- descriptors --------------------------------------------------------
+; font atlas texture: 128x64, R8_UINT, DEFAULT, BIND_SHADER_RESOURCE.
+tdFont struct D3D11_TEXTURE2D_DESC
+    Width            = 128
+    Height           = 64
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 62                  ; DXGI_FORMAT_R8_UINT
+    SampleDesc.Count = 1
+    Usage            = 0                   ; D3D11_USAGE_DEFAULT
+    BindFlags        = 8                  ; D3D11_BIND_SHADER_RESOURCE
+ends
+
+; SRV for the R8_UINT font atlas.
+srvFont struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 62                     ; R8_UINT
+    ViewDimension = 4                      ; D3D11_SRV_DIMENSION_TEXTURE2D
+ends
+
+; subresource upload (pSysMem patched at init; pitch = 128 = atlas width for R8).
+sdFont struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 128
+ends
+
+; the DYNAMIC instance vertex buffer: 4096*32 = 131072 bytes, DYNAMIC +
+; CPU_ACCESS_WRITE + BIND_VERTEX_BUFFER (Map WRITE_DISCARD each frame).
+txvbDesc struct D3D11_BUFFER_DESC
+    ByteWidth      = 131072                ; TxtMaxInst * 32
+    Usage          = 2                     ; D3D11_USAGE_DYNAMIC
+    BindFlags      = 1                     ; D3D11_BIND_VERTEX_BUFFER
+    CPUAccessFlags = 0x10000               ; D3D11_CPU_ACCESS_WRITE
+ends
+
+.balign 16
+; ---- the input layout: 3 per-instance attributes, one InputSlot (0),
+;      PER_INSTANCE_DATA (1), step 1. Offsets walk the 32-byte record:
+;        INSTPOS @0 (R32G32_FLOAT=16), INSTCEL @8 (R32G32_FLOAT=16),
+;        INSTCOL @16 (R32G32B32_FLOAT=6). SemanticName PSTRs patched at init.
+txtElems:
+elPos struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16              ; DXGI_FORMAT_R32G32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 0
+    InputSlotClass       = 1               ; D3D11_INPUT_PER_INSTANCE_DATA
+    InstanceDataStepRate = 1
+ends
+elCel struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16
+    InputSlot            = 0
+    AlignedByteOffset    = 8
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elCol struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 6               ; DXGI_FORMAT_R32G32B32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 16
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; TxtInit — bake the font atlas from gc_font, compile the text VS/PS, patch +
+; create the input layout, create the font atlas texture + SRV, create the dynamic
+; instance VB. Returns 0 in eax; on D3D failure exits with a distinct code. Call
+; AFTER GpuInit + BlitInit.
+; ===========================================================================
+.globl TxtInit
+TxtInit:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    sub     rsp, 40
+
+    ; bake the gc_font glyphs into fontAtlasPix BEFORE creating the texture.
+    call    BakeFontAtlas
+
+    ; SRV MipLevels patch (+12) — MipLevels=0 fails (the G0/G1/G2/G3 trap).
+    mov     dword ptr [rip + srvFont + 12], 1
+
+    ; patch each input element's SemanticName PSTR (@0).
+    lea     rax, [rip + semPos]
+    mov     [rip + elPos + 0], rax
+    lea     rax, [rip + semCel]
+    mov     [rip + elCel + 0], rax
+    lea     rax, [rip + semCol]
+    mov     [rip + elCol + 0], rax
+
+    ; ---- compile the text VS/PS ----
+    lea     rax, [rip + txtEnd]
+    lea     rcx, [rip + txtSrc]
+    sub     rax, rcx
+    mov     [rip + txtSrcLen], rax
+    invoke  D3DCompile, txtSrc, [rip + txtSrcLen], txtName, 0, 0, txvsEntry, vsTarget, 0, 0, pVSBlobX, pErrBlob
+    test    eax, eax
+    js      xi_fail_compile
+    invoke  D3DCompile, txtSrc, [rip + txtSrcLen], txtName, 0, 0, txpsEntry, psTarget, 0, 0, pPSBlobX, pErrBlob
+    test    eax, eax
+    js      xi_fail_compile
+
+    pVSBlobX.GetBufferPointer()
+    mov     [rip + tmpPtrX], rax
+    pVSBlobX.GetBufferSize()
+    mov     [rip + tmpSizeX], rax
+    pDevice.CreateVertexShader([rip + tmpPtrX], [rip + tmpSizeX], 0, pTxtVS)
+    test    eax, eax
+    js      xi_fail_d3d
+    pPSBlobX.GetBufferPointer()
+    mov     [rip + tmpPtrX], rax
+    pPSBlobX.GetBufferSize()
+    mov     [rip + tmpSizeX], rax
+    pDevice.CreatePixelShader([rip + tmpPtrX], [rip + tmpSizeX], 0, pTxtPS)
+    test    eax, eax
+    js      xi_fail_d3d
+
+    ; ---- input layout (against the VS blob's input signature) ----
+    pVSBlobX.GetBufferPointer()
+    mov     [rip + tmpPtrX], rax
+    pVSBlobX.GetBufferSize()
+    mov     [rip + tmpSizeX], rax
+    pDevice.CreateInputLayout(txtElems, 3, [rip + tmpPtrX], [rip + tmpSizeX], pTxtLayout)
+    test    eax, eax
+    js      xi_fail_d3d
+
+    ; ---- font atlas texture + SRV (from fontAtlasPix) ----
+    lea     rax, [rip + fontAtlasPix]
+    mov     [rip + sdFont + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdFont, sdFont, pFontTex)
+    test    eax, eax
+    js      xi_fail_d3d
+    pDevice.CreateShaderResourceView([rip + pFontTex], srvFont, pTxtSRVfont)
+    test    eax, eax
+    js      xi_fail_d3d
+
+    ; ---- the dynamic instance vertex buffer ----
+    pDevice.CreateBuffer(txvbDesc, 0, pTxtInstVB)
+    test    eax, eax
+    js      xi_fail_d3d
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+xi_fail_compile:
+    invoke  ExitProcess, 55
+xi_fail_d3d:
+    invoke  ExitProcess, 53
+
+; ===========================================================================
+; BakeFontAtlas — expand library/gc_font.inc's fontTab (128 glyphs x 7 bytes,
+; each byte a 5-bit row, bit 4 = leftmost) into fontAtlasPix (128x64 R8_UINT). Glyph
+; g occupies the 8x8 cell at (cellX=(g&15)*8, cellY=(g>>4)*8). On-bits -> index 1,
+; everything else -> 0 (transparent). Mirrors library Text's bit-walk
+; (mask = 16 >> col), 5 cols x 7 rows; the bottom row + right cols of the cell stay 0.
+; ===========================================================================
+BakeFontAtlas:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+
+    lea     rsi, [rip + fontTab]          ; glyph rows source
+    lea     rdi, [rip + fontAtlasPix]     ; atlas dst (already zeroed)
+    xor     r12d, r12d                    ; glyph g = 0..127
+bfa_glyph:
+    cmp     r12d, 128
+    jge     bfa_done
+    ; cellX = (g & 15) * 8 ; cellY = (g >> 4) * 8
+    mov     r13d, r12d
+    and     r13d, 15
+    shl     r13d, 3                       ; cellX
+    mov     r14d, r12d
+    shr     r14d, 4
+    shl     r14d, 3                       ; cellY
+    ; glyph rows base = fontTab + g*7
+    mov     eax, r12d
+    imul    eax, eax, 7
+    mov     r15, rsi
+    add     r15, rax                      ; r15 -> the 7 row bytes
+    ; walk 7 rows x 5 cols
+    xor     ebx, ebx                      ; row 0..6
+bfa_row:
+    cmp     ebx, 7
+    jge     bfa_rowend
+    movzx   ecx, byte ptr [r15 + rbx]     ; row bits (bit4 = leftmost)
+    xor     eax, eax                      ; col 0..4
+bfa_col:
+    cmp     eax, 5
+    jge     bfa_coladv
+    ; mask = 16 >> col ; on if (rowbits & mask)
+    push    rax
+    push    rcx
+    mov     edx, 16
+    mov     r8d, eax                      ; col
+    mov     cl, r8b
+    shr     edx, cl                       ; mask = 16 >> col
+    pop     rcx                           ; rowbits
+    test    ecx, edx
+    pop     rax                           ; col
+    jz      bfa_coladv2
+    ; atlas offset = (cellY + row)*128 + (cellX + col)
+    mov     r8d, r14d
+    add     r8d, ebx                      ; cellY + row
+    imul    r8d, r8d, 128
+    mov     r9d, r13d
+    add     r9d, eax                      ; cellX + col
+    add     r8d, r9d
+    mov     byte ptr [rdi + r8], 1        ; on-pixel
+bfa_coladv2:
+    inc     eax
+    jmp     bfa_col
+bfa_coladv:
+    inc     ebx
+    jmp     bfa_row
+bfa_rowend:
+    inc     r12d
+    jmp     bfa_glyph
+bfa_done:
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; TxtSetColour(ecx = 0x00RRGGBB) — set the text colour for subsequent DrawText
+; calls (stored as 3 normalized floats r,g,b in txtCol). Mirrors a library Text's
+; colour index, but the GPU text carries an RGB triple per-instance.
+; ===========================================================================
+.globl TxtSetColour
+TxtSetColour:
+    ; R = byte2 (bits16..23), G = byte1, B = byte0 of 0x00RRGGBB.
+    mov     eax, ecx
+    shr     eax, 16
+    movzx   edx, al                       ; R
+    cvtsi2ss xmm0, edx
+    divss   xmm0, [rip + txtF255]
+    movss   [rip + txtCol + 0], xmm0
+    mov     eax, ecx
+    shr     eax, 8
+    movzx   edx, al                       ; G
+    cvtsi2ss xmm0, edx
+    divss   xmm0, [rip + txtF255]
+    movss   [rip + txtCol + 4], xmm0
+    mov     eax, ecx
+    movzx   edx, al                       ; B
+    cvtsi2ss xmm0, edx
+    divss   xmm0, [rip + txtF255]
+    movss   [rip + txtCol + 8], xmm0
+    ret
+
+; ===========================================================================
+; TxtClear — reset the per-frame glyph instance list (txtInstCount = 0). Call at
+; the start of each frame's text build.
+; ===========================================================================
+.globl TxtClear
+TxtClear:
+    mov     dword ptr [rip + txtInstCount], 0
+    ret
+
+; ===========================================================================
+; DrawText(ecx=x, edx=y, r8=asciiz) — append one line's glyph instances at the
+; current text colour. Mirrors library/canvas.was Text: lowercase->uppercase fold,
+; per-glyph 8x8 cell from the 16x8 atlas grid, 6px pen advance, index-0 transparent
+; (the PS discards it). Space + unprintable -> blank cell (no instance, just advance).
+; Does NOT draw — call DrawTextUpload + DrawTextFlush after all DrawText calls.
+;   x,y are screen pixels (640x360 space); each glyph quad is 8x8 (the 5x7 glyph
+;   sits in its top-left), advancing 6px (library's tight spacing).
+; ===========================================================================
+.globl DrawText
+DrawText:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    mov     r13d, ecx                     ; pen x
+    mov     r14d, edx                     ; pen y
+    mov     rsi, r8                       ; string
+
+dt_char:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      dt_done
+    inc     rsi
+    ; fold lowercase -> uppercase (library Text does the same).
+    cmp     al, 97                        ; 'a'
+    jb      dt_noup
+    cmp     al, 122                       ; 'z'
+    ja      dt_noup
+    sub     al, 32
+dt_noup:
+    cmp     al, 128
+    jae     dt_adv                        ; unprintable -> blank cell
+    ; space (32) and any all-blank glyph still emit no visible pixels; to save
+    ; instances we skip space explicitly (its glyph is empty anyway).
+    cmp     al, 32
+    je      dt_adv
+    movzx   ebp, al                       ; ch (0..127)
+
+    ; list-full guard.
+    mov     eax, [rip + txtInstCount]
+    cmp     eax, 4096                      ; TxtMaxInst
+    jae     dt_done
+
+    ; cell = ( (ch&15)*8, (ch>>4)*8 )
+    mov     r12d, ebp
+    and     r12d, 15
+    shl     r12d, 3                        ; cellX
+    mov     r15d, ebp
+    shr     r15d, 4
+    shl     r15d, 3                        ; cellY
+
+    ; dst record = txtInstData + count*32.
+    lea     rdi, [rip + txtInstData]
+    mov     ecx, eax                       ; count
+    shl     ecx, 5                         ; *32
+    add     rdi, rcx                       ; rdi -> the 32-byte record
+
+    ; [0] screenX = (float)penx ; [4] screenY = (float)peny
+    cvtsi2ss xmm0, r13d
+    movss   [rdi + 0], xmm0
+    cvtsi2ss xmm0, r14d
+    movss   [rdi + 4], xmm0
+    ; [8] atlasX = (float)cellX ; [12] atlasY = (float)cellY
+    cvtsi2ss xmm0, r12d
+    movss   [rdi + 8], xmm0
+    cvtsi2ss xmm0, r15d
+    movss   [rdi + 12], xmm0
+    ; [16..27] colour rgb (from txtCol)
+    mov     ecx, [rip + txtCol + 0]
+    mov     [rdi + 16], ecx
+    mov     ecx, [rip + txtCol + 4]
+    mov     [rdi + 20], ecx
+    mov     ecx, [rip + txtCol + 8]
+    mov     [rdi + 24], ecx
+    ; [28] pad = 0
+    mov     dword ptr [rdi + 28], 0
+
+    inc     eax
+    mov     [rip + txtInstCount], eax
+dt_adv:
+    add     r13d, 6                        ; advance the pen (6px, library spacing)
+    jmp     dt_char
+dt_done:
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; TxtUpload — copy txtInstData (txtInstCount*32 bytes) into the dynamic instance VB
+; via Map(WRITE_DISCARD)/copy/Unmap. Call once per frame after all DrawText calls,
+; before TxtFlush. (Mirrors gpu/sprite.was SprUpload.)
+; ===========================================================================
+.globl TxtUpload
+TxtUpload:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    pContext.Map([rip + pTxtInstVB], 0, 4, 0, txtMapped)
+    test    eax, eax
+    js      tu_done
+    mov     rdi, [rip + txtMapped + 0]    ; dst (GPU)
+    lea     rsi, [rip + txtInstData]      ; src
+    mov     ecx, [rip + txtInstCount]
+    shl     ecx, 5                        ; *32 byte count
+    test    ecx, ecx
+    jz      tu_unmap
+tu_cpy:
+    mov     al, [rsi]
+    mov     [rdi], al
+    inc     rsi
+    inc     rdi
+    dec     ecx
+    jnz     tu_cpy
+tu_unmap:
+    pContext.Unmap([rip + pTxtInstVB], 0)
+tu_done:
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; TxtFlush(rcx=dstRTV) — draw ALL queued glyph instances onto dstRTV in ONE
+; DrawInstanced call. Binds the input layout, the dynamic instance VB (slot 0,
+; stride 32), the text VS/PS, the font SRV (t0), the G1 alpha blend state (so the
+; 8x8 cells antialias-free composite over the scene; alpha=1 on-pixel, discard off),
+; TRIANGLESTRIP, DrawInstanced(4, txtInstCount, 0, 0). Mirrors gpu/sprite.was
+; DrawSprites. The caller sets dstRTV + viewport; we (re)bind the RT here.
+; ===========================================================================
+.globl TxtFlush
+TxtFlush:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     rdi, rcx                      ; dstRTV
+
+    mov     [rip + txtRTVTmp], rdi
+    pContext.OMSetRenderTargets(1, txtRTVTmp, 0)
+
+    pContext.IASetInputLayout([rip + pTxtLayout])
+    mov     rax, [rip + pTxtInstVB]
+    mov     [rip + txtVBArr], rax
+    pContext.IASetVertexBuffers(0, 1, txtVBArr, txtStride, txtOffset)
+
+    pContext.VSSetShader([rip + pTxtVS], 0, 0)
+    pContext.PSSetShader([rip + pTxtPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+
+    mov     rax, [rip + pTxtSRVfont]
+    mov     [rip + txtSrvArr + 0], rax
+    pContext.PSSetShaderResources(0, 1, txtSrvArr)
+
+    pContext.OMSetBlendState([rip + pBlendAlpha], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(5)    ; TRIANGLESTRIP
+    ; marshal InstanceCount through memory (trap #9, like G3 DrawSprites).
+    mov     eax, [rip + txtInstCount]
+    mov     qword ptr [rip + txtDrawCount], 0
+    mov     [rip + txtDrawCount], eax
+    pContext.DrawInstanced(4, [rip + txtDrawCount], 0, 0)
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+txtF255   DWORD 0x437F0000                ; 255.0f
+txtSrvArr QWORD 0                          ; single-element SRV array (t0 = font)

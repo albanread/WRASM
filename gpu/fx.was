@@ -1,0 +1,210 @@
+; gpu/fx.was — GPU Canvas G4 "procedural fx layer".
+;
+; Built ON TOP of gpu/canvas.was (G0: device/swapchain, pDevice/pContext/pRTV,
+; the comobj/.Method idioms, the .ASCIISTRING + D3DCompile path, vsTarget/psTarget,
+; pErrBlob, pRast, vp) and gpu/blit.was (G1: pBlendOpaque, blendFactor). Include
+; AFTER both. (docs/gpucanvas.md §3 row 0: the fx layer is the BACK of the stack —
+; RGBA, procedural, opaque, clears first.)
+;
+; This PORTS examples/plasma.was (the CPU demoscene plasma — three scrolling sine
+; waves summed into a palette index, that index read three times at 120-degree
+; phase offsets for a red/green/blue rainbow) into a full-screen PIXEL SHADER. The
+; CPU version baked a 256-byte sine table and walked every pixel; the GPU version
+; uses the hardware sin() per pixel (cheap on a GPU) with the SAME wave structure:
+;
+;   v = sin(x/2 + t) + sin(y/2 + t) + sin((x+y)/8 + t)     (the three waves)
+;   idx = v folded to 0..1
+;   rgb = ( sin(idx*2pi), sin(idx*2pi + 2.094), sin(idx*2pi + 4.189) ) * 0.5 + 0.5
+;
+; The TIME uniform `t` lives in a constant buffer (b0); FxSetTime bumps it each
+; frame and FxRender re-uploads + draws the full-screen triangle. Output is RGBA,
+; opaque (alpha 1), drawn FIRST into the back buffer so it is the bottom layer.
+;
+; The fx layer is the ONLY RGBA-native layer (the rest resolve through palettes);
+; it owns no index buffer — it is purely a function of screen position + time.
+;
+; winkb supplied every D3D11 detail (all reused from G0/G1):
+;   D3D11_BUFFER_DESC{ByteWidth@0,Usage@4,BindFlags@8,...} (24 bytes, winkb skel).
+;   D3D11_BIND_CONSTANT_BUFFER=4, D3D11_USAGE_DEFAULT=0,
+;   D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST=4.
+;
+; Every .DATA block opens with .balign 16 (trap #8).
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The FX (plasma) shader.
+;   VS  — fullscreen triangle from SV_VertexID, forwards a 0..1 uv (identical to G0).
+;   PS  — px = uv.x*640, py = uv.y*360 (screen pixels, matching the CPU plasma's
+;         coordinate scale so the wavelengths look the same as plasma.was), then the
+;         three summed scrolling sine waves; the sum is folded to a 0..1 index and
+;         expanded to an RGB rainbow via three phase-shifted cosines. Opaque.
+; CB (b0): float4 tparm = { time, 0, 0, 0 }  — time advances each frame.
+; ---------------------------------------------------------------------------
+fxSrc:
+.ASCIISTRING
+cbuffer FCB:register(b0){float4 tparm;};
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO FVS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float4 FPS(VO v):SV_Target{
+float t=tparm.x;
+float px=v.uv.x*640.0;
+float py=v.uv.y*360.0;
+float w1=sin(px*0.045+t);
+float w2=sin(py*0.045+t*1.1);
+float w3=sin((px+py)*0.012+t*0.7);
+float w4=sin(sqrt((px-320.0)*(px-320.0)+(py-180.0)*(py-180.0))*0.05-t*1.3);
+float vsum=(w1+w2+w3+w4)*0.25;
+float idx=vsum*3.14159;
+float r=sin(idx)*0.5+0.5;
+float g=sin(idx+2.0944)*0.5+0.5;
+float b=sin(idx+4.18879)*0.5+0.5;
+return float4(r*0.85,g*0.85,b*0.95,1.0);}
+.ENDASCIISTRING
+fxEnd:
+    BYTE 0
+
+fvsEntry  BYTE "FVS", 0
+fpsEntry  BYTE "FPS", 0
+fxName    BYTE "gpufx", 0
+
+.balign 16
+; ---- fx shader COM objects + scalar state ----
+comobj pVSBlobF : ID3DBlob
+comobj pPSBlobF : ID3DBlob
+
+pFxVS     QWORD ?
+pFxPS     QWORD ?
+pFxCB     QWORD ?                       ; the time constant buffer (b0)
+fxSrcLen  QWORD ?
+tmpPtrF   QWORD ?
+tmpSizeF  QWORD ?
+
+.balign 16
+; the time constant-buffer mirror: float4 { time, 0, 0, 0 } = 16 bytes.
+fxCB      DWORD 0, 0, 0, 0
+; the running animation time (float seconds-ish; FxSetTime adds a per-frame step).
+fxTime    DWORD 0                       ; reinterpreted as a float (starts 0.0)
+fxStep    DWORD 0x3DCCCCCD              ; 0.1f per frame
+.balign 16
+fxCBArr   QWORD 0                       ; single-element CB array for PSSetConstantBuffers
+
+; the time constant buffer descriptor (16 bytes, BIND_CONSTANT_BUFFER).
+fcbDesc struct D3D11_BUFFER_DESC
+    ByteWidth = 16
+    Usage     = 0                       ; D3D11_USAGE_DEFAULT
+    BindFlags = 4                       ; D3D11_BIND_CONSTANT_BUFFER
+ends
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; FxInit — compile the fx VS/PS, create the time constant buffer. Returns 0 in
+; eax; on D3D failure exits with a small distinct code (like G0/G1/G2/G3). Call
+; AFTER GpuInit + BlitInit (needs pDevice live).
+; ===========================================================================
+.globl FxInit
+FxInit:
+    push    rbx
+    sub     rsp, 40
+
+    ; ---- compile the fx VS/PS ----
+    lea     rax, [rip + fxEnd]
+    lea     rcx, [rip + fxSrc]
+    sub     rax, rcx
+    mov     [rip + fxSrcLen], rax
+    invoke  D3DCompile, fxSrc, [rip + fxSrcLen], fxName, 0, 0, fvsEntry, vsTarget, 0, 0, pVSBlobF, pErrBlob
+    test    eax, eax
+    js      fi_fail_compile
+    invoke  D3DCompile, fxSrc, [rip + fxSrcLen], fxName, 0, 0, fpsEntry, psTarget, 0, 0, pPSBlobF, pErrBlob
+    test    eax, eax
+    js      fi_fail_compile
+
+    pVSBlobF.GetBufferPointer()
+    mov     [rip + tmpPtrF], rax
+    pVSBlobF.GetBufferSize()
+    mov     [rip + tmpSizeF], rax
+    pDevice.CreateVertexShader([rip + tmpPtrF], [rip + tmpSizeF], 0, pFxVS)
+    test    eax, eax
+    js      fi_fail_d3d
+    pPSBlobF.GetBufferPointer()
+    mov     [rip + tmpPtrF], rax
+    pPSBlobF.GetBufferSize()
+    mov     [rip + tmpSizeF], rax
+    pDevice.CreatePixelShader([rip + tmpPtrF], [rip + tmpSizeF], 0, pFxPS)
+    test    eax, eax
+    js      fi_fail_d3d
+
+    ; ---- the time constant buffer (16 bytes, no init data) ----
+    pDevice.CreateBuffer(fcbDesc, 0, pFxCB)
+    test    eax, eax
+    js      fi_fail_d3d
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     rbx
+    ret
+fi_fail_compile:
+    invoke  ExitProcess, 45
+fi_fail_d3d:
+    invoke  ExitProcess, 43
+
+; ===========================================================================
+; FxSetTime — advance the animation time by fxStep (float add). The CB mirror's
+; tparm.x is set to the new time; FxRender uploads it. Call once per frame.
+; (Float add via SSE; fxTime holds the running float, reinterpreted from DWORD.)
+; ===========================================================================
+.globl FxSetTime
+FxSetTime:
+    movss   xmm0, [rip + fxTime]
+    addss   xmm0, [rip + fxStep]
+    movss   [rip + fxTime], xmm0
+    movss   [rip + fxCB + 0], xmm0       ; tparm.x = time
+    ret
+
+; ===========================================================================
+; FxRender(rcx=dstRTV) — draw the plasma full-screen into dstRTV (the back buffer
+; or a layer RT). The fx layer is the BACK of the stack, so the caller clears the
+; RT (or relies on this fully covering it) and calls FxRender FIRST. Binds the fx
+; VS/PS, the opaque blend state, uploads + binds the time CB, Draw(3,0).
+; The caller is responsible for the viewport (vp for the back buffer).
+; ===========================================================================
+.globl FxRender
+FxRender:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     rdi, rcx                     ; dstRTV
+
+    ; bind the dst RT (unbinds any prior RT).
+    mov     [rip + fxRTVTmp], rdi
+    pContext.OMSetRenderTargets(1, fxRTVTmp, 0)
+
+    ; upload the time CB + bind it at b0.
+    pContext.UpdateSubresource([rip + pFxCB], 0, 0, fxCB, 0, 0)
+    mov     rax, [rip + pFxCB]
+    mov     [rip + fxCBArr], rax
+    pContext.PSSetConstantBuffers(0, 1, fxCBArr)
+
+    ; shaders + raster + opaque blend (fully covers the RT, no blend needed).
+    pContext.VSSetShader([rip + pFxVS], 0, 0)
+    pContext.PSSetShader([rip + pFxPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+    pContext.OMSetBlendState([rip + pBlendOpaque], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(4)   ; TRIANGLELIST
+    pContext.Draw(3, 0)
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+fxRTVTmp  QWORD ?                        ; single-element RTV array for OMSetRenderTargets
