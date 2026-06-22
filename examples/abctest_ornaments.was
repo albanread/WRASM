@@ -1,0 +1,54 @@
+; abctest_ornaments.was — ties / broken rhythm / tuplets / grace notes (Sprint M-E).
+;
+;   was examples\abctest_ornaments.was -o abc_orn.exe  &&  abc_orn.exe
+;   (writes tune_brk.bin / tune_tup.bin / tune_tie.bin / tune_grace.bin)
+;
+; Four tunes parsed + dumped one after another (ParseTune resets ALL state at its
+; top, so each parse starts clean).  L=1/4, Q=120 -> a quarter note = 500 ms.
+;
+; 1. BROKEN  "C>D E"   : C x1.5 (750ms), D x0.5 (250ms), E (500ms).
+;    NoteOns @ 0 / 750 / 1000.
+; 2. TUPLET  "(3CDE F" : C,D,E each x2/3 (~333ms), F (500ms).
+;    NoteOns @ 0 / 333 / 667 / 1000  (the rounded thirds land at 333/667).
+; 3. TIE     "C-C D"   : ONE C held 0..1000 (one NoteOn@0, one NoteOff@1000),
+;    then D @ 1000.  Only ONE NoteOn for pitch 60.
+; 4. GRACE   "{E}C D"  : a 60 ms E grace, then C, then D.  E(64) sounds 0..60;
+;    C(60) starts @ 60 and lasts 500 -> @ 560; D(62) @ 560.
+
+.DATA
+tBrk   BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "C>D E", 10, 0
+tTup   BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "(3CDE F", 10, 0
+tTie   BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "C-C D", 10, 0
+tGrace BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "{E}C D", 10, 0
+
+nBrk   WCHAR "tune_brk.bin", 0
+nTup   WCHAR "tune_tup.bin", 0
+nTie   WCHAR "tune_tie.bin", 0
+nGrace WCHAR "tune_grace.bin", 0
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tBrk]
+    call    ParseTune
+    lea     rcx, [rip + nBrk]
+    call    WriteTune
+
+    lea     rcx, [rip + tTup]
+    call    ParseTune
+    lea     rcx, [rip + nTup]
+    call    WriteTune
+
+    lea     rcx, [rip + tTie]
+    call    ParseTune
+    lea     rcx, [rip + nTie]
+    call    WriteTune
+
+    lea     rcx, [rip + tGrace]
+    call    ParseTune
+    lea     rcx, [rip + nGrace]
+    call    WriteTune
+
+    invoke  ExitProcess, 0
+
+.include "../library/audio/music/abc.was"

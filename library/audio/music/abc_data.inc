@@ -20,6 +20,19 @@ tsN       DWORD ?                     ; meter numerator    (M:)
 tsD       DWORD ?                     ; meter denominator
 inBody    DWORD ?                     ; 0 = header, 1 = body (set by K:)
 
+; ---- ornament / rhythm state (Sprint M-E) ----
+; All reset at the top of ParseTune; each is INERT at its default (multipliers
+; 1.0, counts 0, tiePend 0) so a tune with no ornaments behaves exactly as before.
+brokenMul real8 1.0                  ; pending dur multiplier for the NEXT note (a>b)
+tupCount  DWORD ?                    ; remaining notes inside an active tuplet
+tupMul    real8 1.0                  ; the tuplet ratio (q/p) applied per tuplet note
+tiePend   DWORD ?                    ; 1 = the previous note left a tie '-' open
+tiePitch  DWORD ?                    ; the pitch of the note holding the open tie
+
+; ParseNote ornament scratch (parked across calls; single-threaded .DATA).
+pnDur     real8 0.0                  ; durWholes carried across RoundCurMs/EmitEvent
+pnBrk     real8 0.0                  ; THIS note's broken-rhythm factor scratch
+
 ; ---- repeat / first-second-ending state (Sprint M-C) ----
 ; ONE level of repeat only (no nesting).  The repeat is replayed by JUMPING the
 ; text cursor back to repStart and letting pt_loop re-parse the section; curMs
@@ -61,6 +74,10 @@ keyFifths BYTE 3, 5, 0, 2, 4, -1, 1
 fHalf     real8 0.5
 f60000    real8 60000.0
 fZero     real8 0.0
+fOne      real8 1.0                   ; broken/tuplet multiplier reset value
+fDot5     real8 0.5                   ; broken rhythm: the SHORT side (x0.5)
+fDot15    real8 1.5                   ; broken rhythm: the LONG side  (x1.5)
+fGraceMs  real8 60.0                  ; grace-note fixed duration (ms) — see ParseGraces
 
 ; ---- finalize / file-write scratch ----
 ftTemp    BYTE 20 dup(0)             ; scratch record for insertion sort

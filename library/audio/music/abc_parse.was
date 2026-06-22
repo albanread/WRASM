@@ -24,6 +24,14 @@ proc ParseTune uses rsi rbx frame in rcx
     mov     dword ptr [rip + repArmed], 0
     mov     dword ptr [rip + repPass], 1
 
+    ; --- reset ornament / rhythm state (Sprint M-E) so it is inert when absent ---
+    movsd   xmm0, [rip + fOne]
+    movsd   [rip + brokenMul], xmm0   ; pending broken multiplier = 1.0
+    movsd   [rip + tupMul], xmm0      ; tuplet ratio = 1.0
+    mov     dword ptr [rip + tupCount], 0
+    mov     dword ptr [rip + tiePend], 0
+    mov     dword ptr [rip + tiePitch], 0
+
     ; --- reset per-voice state: active voice 0, vChan[i]=i, clocks/programs 0 ---
     mov     dword ptr [rip + curVoice], 0
     mov     dword ptr [rip + curChan], 0
@@ -193,6 +201,12 @@ pt_body:
     je      pt_b_bar
     cmp     al, ':'                   ; ":|" close-repeat (a bare ':' is skipped)
     je      pt_b_colon
+    cmp     al, '('                   ; "(<digit>" tuplet, else a slur open
+    je      pt_b_lparen
+    cmp     al, ')'                   ; slur close -> just skip
+    je      pt_b_skip
+    cmp     al, '{'                   ; grace-note group {..}
+    je      pt_b_grace
     cmp     al, 'z'
     je      pt_b_rest
     cmp     al, 'Z'
@@ -467,6 +481,21 @@ pt_b_rest:
 
 pt_b_note:
     call    ParseNote                 ; emits NoteOn/NoteOff, advances txtPtr+curMs
+    jmp     pt_loop
+
+pt_b_lparen:
+    ; '(' — a tuplet header IFF followed by a digit; otherwise a slur open (skip).
+    movzx   eax, byte ptr [rsi + 1]
+    cmp     al, '0'
+    jb      pt_b_skip                 ; "(" + non-digit -> slur open, just skip '('
+    cmp     al, '9'
+    ja      pt_b_skip
+    call    ParseTuplet               ; sets tupCount/tupMul, advances txtPtr
+    jmp     pt_loop
+
+pt_b_grace:
+    ; '{' — grace-note group: emit short ornament notes, then resume parsing.
+    call    ParseGraces               ; emits the grace NoteOn/NoteOffs, advances txtPtr
     jmp     pt_loop
 
 pt_end:

@@ -51,11 +51,22 @@
 ;   repeats |: :| and first/second endings |1 |2 — replayed by JUMPING the text
 ;     cursor back and re-parsing, while curMs keeps advancing so the replay lands
 ;     at later timestamps (see abc_repeat.was).  ONE level only — no nesting.
+;   ties `-`, broken rhythm `> <`, tuplets `(p[:q[:r]]`, and grace notes `{..}`
+;     (Sprint M-E, see abc_ornament.was + ParseNote): a tie holds one sustained
+;     note across the next same-pitch note (one On, one Off); broken `a>b` makes a
+;     x1.5 / b x0.5 (and `a<b` the reverse); a tuplet `(3CDE` scales the next r
+;     notes by q/p; a grace group `{ab}c` emits short 60 ms ornament notes that
+;     steal a little time just before the main note.  All scale the SAME durWholes
+;     used for both the NoteOff stamp and the curMs advance, and ALL of the new
+;     state is reset (multipliers 1.0, counts 0) at the top of ParseTune so a tune
+;     without ornaments is byte-identical to before.
 ;
 ; --- DEFERRED (no-ops / skipped, NOT implemented) ---
-;   ties - , tuplets (p , broken rhythm > < , nested repeats,
-;   inline fields [K:..] , grace {} , trailing duration dots, minor/mode key
-;   qualifiers (only the root letter + one optional #/b is read for the key sig).
+;   nested repeats, trailing duration dots (the `>`/`<` broken rhythm is handled,
+;   but a `.`-dotted duration is not), and minor/mode key qualifiers beyond the
+;   root letter + one optional #/b for the key sig (modes ARE handled in ParseKey).
+;   Slurs ( ) are accepted but inert (skipped); `>>`/`<<` are read as two single
+;   broken marks; a `(` not followed by a digit is a slur, not a tuplet.
 ; ============================================================================
 
 .DATA
@@ -67,6 +78,7 @@
 .include "abc_voice.was"
 .include "abc_chord.was"
 .include "abc_repeat.was"
+.include "abc_ornament.was"
 .include "abc_parse.was"
 .include "abc_finalize.was"
 .include "abc_play.was"

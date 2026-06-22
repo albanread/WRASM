@@ -1,0 +1,176 @@
+; abc_ornament.was — tuplets `(p[:q[:r]]` and grace notes `{...}` (Sprint M-E).
+; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included in
+; the shell BEFORE abc_parse.was so the body '(' / '{' dispatch can call these.
+;
+; TUPLETS — `(3CDE` = 3 notes in the time of 2, i.e. each note x(2/3) ----------
+; A tuplet header is `(` followed by a DIGIT.  The general form is `(p`, `(p:q`,
+; or `(p:q:r`:
+;   p = how many notes are squeezed,
+;   q = into the time of how many   (DEFAULT by ABC convention, keyed on p:
+;         p=2->3, p=3->2, p=4->3, p=6->2, else 2),
+;   r = how many of the following notes are in the tuplet (DEFAULT = p).
+; ParseTuplet sets tupCount = r and tupMul = q/p (an f64 ratio < 1 for the usual
+; "more notes in less time").  ParseNote then multiplies each of the next r notes'
+; durWholes by tupMul and decrements tupCount.  A `(` NOT followed by a digit is a
+; SLUR — the body dispatch just skips it (and a stray `)` too); ParseTuplet is
+; only entered for `(<digit>`.
+; Leaf-ish: calls ParseUInt (which has a frame) so this proc needs a frame.
+; ----------------------------------------------------------------------------
+proc ParseTuplet uses rbx rsi r12 frame
+    ; txtPtr is at the '(' .  Consume it, then read p (a non-negative int).
+    mov     rsi, [rip + txtPtr]
+    inc     rsi                       ; past '('
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; eax = p, txtPtr advanced past the digits
+    mov     ebx, eax                  ; ebx = p
+    test    ebx, ebx
+    jz      ptp_done                  ; "(0" — degenerate; do nothing (inert)
+
+    ; defaults: r12d = q (time-of), derived from p; tupCount default = p.
+    mov     r12d, 2                   ; q default for the "else" bucket
+    cmp     ebx, 2
+    je      ptp_q3
+    cmp     ebx, 3
+    je      ptp_q2
+    cmp     ebx, 4
+    je      ptp_q3
+    cmp     ebx, 6
+    je      ptp_q2
+    jmp     ptp_q_set
+ptp_q3:
+    mov     r12d, 3
+    jmp     ptp_q_set
+ptp_q2:
+    mov     r12d, 2
+ptp_q_set:
+    mov     ecx, ebx                  ; r default = p
+
+    ; optional ":q"
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, ':'
+    jne     ptp_have_qr               ; no ':' -> keep default q, default r=p
+    inc     rsi                       ; consume ':'
+    mov     [rip + txtPtr], rsi
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '0'
+    jb      ptp_after_q               ; ":<non-digit>" -> q omitted, keep default
+    cmp     al, '9'
+    ja      ptp_after_q
+    call    ParseUInt                 ; eax = q (explicit)
+    test    eax, eax
+    jz      ptp_after_q               ; q==0 -> ignore, keep default
+    mov     r12d, eax                 ; q = explicit
+ptp_after_q:
+    ; optional second ":r"
+    mov     ecx, ebx                  ; r default = p (recompute; ParseUInt clobbers)
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, ':'
+    jne     ptp_have_qr
+    inc     rsi                       ; consume ':'
+    mov     [rip + txtPtr], rsi
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '0'
+    jb      ptp_have_qr               ; ":<non-digit>" -> r omitted, keep default
+    cmp     al, '9'
+    ja      ptp_have_qr
+    call    ParseUInt                 ; eax = r (explicit)
+    test    eax, eax
+    jz      ptp_have_qr               ; r==0 -> keep default
+    mov     ecx, eax                  ; r = explicit
+ptp_have_qr:
+    ; commit: tupCount = r (in ecx), tupMul = q/p = r12d / ebx.
+    mov     [rip + tupCount], ecx
+    cvtsi2sd xmm0, r12d               ; q
+    cvtsi2sd xmm1, ebx                ; p
+    divsd   xmm0, xmm1                ; q/p
+    movsd   [rip + tupMul], xmm0
+ptp_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; GRACE NOTES — `{ab}c` = small ornament notes struck just before the main note.
+; txtPtr is at the '{' .  ON-BEAT interpretation: the graces steal a small fixed
+; slice of time STARTING at the current curMs, so the following main note ends up
+; slightly later by (number of graces * GRACE_MS).  Each grace note:
+;   * pitch via ParseNotePitch (reuse the note tokenizer; durations inside {} are
+;     ignored — ParseNotePitch stops at a digit and the body loop steps over it),
+;   * fixed duration GRACE_MS = 60 ms (fGraceMs) regardless of L:/Q:,
+;   * NoteOn @ round(curMs), curMs += 60 ms, NoteOff @ round(curMs).
+; The loop stops at '}', newline, or NUL (robust against a missing '}').  After
+; '}', normal parsing resumes and the main note is parsed by ParseNote as usual.
+;
+; Grace timing is INDEPENDENT of tuplet/broken/tie state — graces never touch
+; brokenMul/tupCount/tiePend, so they don't disturb the main note's modifiers.
+; Calls -> frame.  Non-volatiles: rsi (cursor view), r12 (grace pitch across calls).
+; ----------------------------------------------------------------------------
+proc ParseGraces uses rsi r12 frame
+    mov     rsi, [rip + txtPtr]
+    inc     rsi                       ; past '{'
+    ; an optional '/' right after '{' marks an acciaccatura — skip it, same timing.
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '/'
+    jne     pg_no_slash
+    inc     rsi
+pg_no_slash:
+    mov     [rip + txtPtr], rsi
+
+pg_loop:
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pg_done                   ; NUL -> stop (missing '}')
+    cmp     al, 10                    ; newline -> stop (missing '}')
+    je      pg_done
+    cmp     al, '}'
+    je      pg_close
+
+    call    ParseNotePitch            ; eax = grace pitch, or -1 if not a letter
+    cmp     eax, -1
+    je      pg_skip_one               ; non-note inside {} -> step over it
+    mov     r12d, eax                 ; r12 = grace pitch (survives the calls)
+
+    ; NoteOn @ round(curMs)
+    call    RoundCurMs
+    mov     ecx, eax
+    mov     edx, 0x90                 ; NoteOn
+    mov     r8d, r12d                 ; d1 = grace pitch
+    mov     r9d, 80                   ; d2 = velocity
+    call    EmitEvent
+
+    ; curMs += GRACE_MS (a flat 60 ms slice; bypass AdvanceCurMs / msPerWhole)
+    movsd   xmm0, [rip + curMs]
+    addsd   xmm0, [rip + fGraceMs]
+    movsd   [rip + curMs], xmm0
+
+    ; NoteOff @ round(curMs)
+    call    RoundCurMs
+    mov     ecx, eax
+    mov     edx, 0x80                 ; NoteOff
+    mov     r8d, r12d
+    xor     r9d, r9d
+    call    EmitEvent
+    jmp     pg_loop
+
+pg_skip_one:
+    ; ParseNotePitch may have advanced txtPtr (committed accidentals) before the
+    ; non-letter; re-read and re-dispatch rather than blindly stepping (mirrors
+    ; ParseChord's pc_skip_one), so a '}' or end-of-buffer isn't skipped past.
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pg_done
+    cmp     al, 10
+    je      pg_done
+    cmp     al, '}'
+    je      pg_close
+    inc     rsi                       ; genuine junk -> step over it
+    mov     [rip + txtPtr], rsi
+    jmp     pg_loop
+
+pg_close:
+    inc     rsi                       ; consume '}'
+    mov     [rip + txtPtr], rsi
+pg_done:
+endproc

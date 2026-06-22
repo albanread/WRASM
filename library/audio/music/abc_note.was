@@ -144,13 +144,31 @@ pnp_ret:
 endproc
 
 ; ----------------------------------------------------------------------------
-; ParseNote: one full note token = pitch (ParseNotePitch) + duration.  Emits
-; NoteOn @ round(curMs) and NoteOff @ round(curMs+dur), then advances curMs.
-;   ParseNotePitch -> ParseDuration -> NoteOn(round(curMs)) -> AdvanceCurMs ->
-;   NoteOff(round(curMs)).  Calls -> frame.  rbx holds the pitch across calls;
-;   durWholes is parked in fDur across AdvanceCurMs.
+; ParseNote: one full note token = pitch (ParseNotePitch) + duration, then the
+; Sprint-M-E rhythm/ornament modifiers that ride on the SAME note:
+;   tuplets `(p`  — if tupCount>0: durWholes *= tupMul, tupCount-- .
+;   broken rhythm `> <` — the pending brokenMul (from the PREVIOUS note's >/<)
+;     scales THIS note, then resets to 1.0; then a trailing >/< on THIS note
+;     scales it (x1.5 / x0.5) and arms brokenMul (0.5 / 1.5) for the NEXT note.
+;   ties `-` — a trailing `-` after the duration holds the note across the next
+;     same-pitch note: the NoteOn/NoteOff are suppressed so one sustained note
+;     spans both durations (one NoteOn, one NoteOff).
+; ALL of these scale the SAME durWholes used for BOTH the NoteOff stamp and the
+; curMs advance, so onset timing stays drift-free.
+;
+; Order of trailing markers parsed after the duration: broken `>`/`<` first,
+; then tie `-` (the common forms are `a>b` and `C-C`; `a>-b` is tolerated).
+; A single `>`/`<` only — `>>` is read as two separate broken marks (the second
+; arms brokenMul for a third note); document, not an error.
+;
+; Tie continuation rule when pitches DIFFER: if tiePend is open but THIS note's
+; pitch != tiePitch, we close the held note (emit its suppressed NoteOff) at
+; THIS note's onset, then treat THIS note normally — keeps the stream balanced.
+;
+; Calls -> frame.  Non-volatiles: rbx = pitch, r12 = thisTied flag.  durWholes
+; is parked in pnDur across the Round/Emit/Advance calls.
 ; ----------------------------------------------------------------------------
-proc ParseNote uses rbx frame
+proc ParseNote uses rbx rsi r12 frame
     call    ParseNotePitch            ; eax = pitch (txtPtr past the token)
     cmp     eax, -1
     je      pn_ret                    ; not a note letter -> nothing emitted
@@ -158,8 +176,99 @@ proc ParseNote uses rbx frame
 
     ; --- duration (writes txtPtr) ---
     call    ParseDuration             ; xmm0 = durWholes, txtPtr advanced
-    movsd   [rip + fDur], xmm0        ; stash durWholes
 
+    ; --- tuplet: scale by tupMul while a tuplet is active, then count it down ---
+    mov     eax, [rip + tupCount]
+    test    eax, eax
+    jz      pn_no_tuplet
+    mulsd   xmm0, [rip + tupMul]
+    dec     eax
+    mov     [rip + tupCount], eax
+pn_no_tuplet:
+
+    ; --- broken rhythm: apply the PENDING multiplier, then reset it to 1.0 ---
+    mulsd   xmm0, [rip + brokenMul]
+    movsd   xmm1, [rip + fOne]
+    movsd   [rip + brokenMul], xmm1
+
+    ; --- peek a trailing >/< on THIS note: scale it, arm brokenMul for NEXT ---
+    movsd   [rip + pnDur], xmm0        ; park durWholes across the byte peek
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '>'
+    je      pn_brk_gt
+    cmp     al, '<'
+    je      pn_brk_lt
+    jmp     pn_brk_done
+pn_brk_gt:
+    ; a>b : THIS note x1.5, NEXT note x0.5
+    movsd   xmm0, [rip + pnDur]
+    mulsd   xmm0, [rip + fDot15]
+    movsd   [rip + pnDur], xmm0
+    movsd   xmm1, [rip + fDot5]
+    movsd   [rip + brokenMul], xmm1
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pn_brk_done
+pn_brk_lt:
+    ; a<b : THIS note x0.5, NEXT note x1.5
+    movsd   xmm0, [rip + pnDur]
+    mulsd   xmm0, [rip + fDot5]
+    movsd   [rip + pnDur], xmm0
+    movsd   xmm1, [rip + fDot15]
+    movsd   [rip + brokenMul], xmm1
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+pn_brk_done:
+
+    ; --- peek a trailing tie '-' on THIS note (after duration + broken mark) ---
+    xor     r12d, r12d                 ; thisTied = 0
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '-'
+    jne     pn_tie_peeked
+    mov     r12d, 1                    ; thisTied = 1
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+pn_tie_peeked:
+
+    ; --- decide: are we CONTINUING an open tie at the SAME pitch? ---
+    mov     eax, [rip + tiePend]
+    test    eax, eax
+    jz      pn_normal                  ; no open tie -> normal emission
+    mov     eax, [rip + tiePitch]
+    cmp     eax, ebx
+    jne     pn_tie_mismatch            ; open tie but different pitch -> close it first
+
+    ; ---- CONTINUE the held note: SUPPRESS this NoteOn (already sounding) ----
+    movsd   xmm0, [rip + pnDur]
+    call    AdvanceCurMs               ; curMs += durWholes * msPerWhole
+    test    r12d, r12d
+    jnz     pn_still_held              ; still tied -> keep tiePend, no NoteOff yet
+    ; tie ends here: emit the single NoteOff @ round(curMs), clear the tie
+    call    RoundCurMs
+    mov     ecx, eax
+    mov     edx, 0x80                  ; NoteOff
+    mov     r8d, ebx                   ; d1 = pitch
+    xor     r9d, r9d
+    call    EmitEvent
+    mov     dword ptr [rip + tiePend], 0
+pn_still_held:
+    jmp     pn_ret
+
+pn_tie_mismatch:
+    ; an open tie but THIS note differs: close the held note at the current curMs
+    ; (its onset was emitted earlier), clearing the tie, then fall into normal.
+    call    RoundCurMs
+    mov     ecx, eax
+    mov     edx, 0x80                  ; NoteOff for the previously-held pitch
+    mov     r8d, [rip + tiePitch]
+    xor     r9d, r9d
+    call    EmitEvent
+    mov     dword ptr [rip + tiePend], 0
+    ; fall through to normal emission for THIS note
+
+pn_normal:
     ; --- NoteOn @ round(curMs) ---
     call    RoundCurMs                ; eax = onMs
     mov     ecx, eax                  ; timeMs
@@ -169,9 +278,17 @@ proc ParseNote uses rbx frame
     call    EmitEvent
 
     ; --- advance curMs by durWholes ---
-    movsd   xmm0, [rip + fDur]
+    movsd   xmm0, [rip + pnDur]
     call    AdvanceCurMs
 
+    ; --- if THIS note opens a tie: SUPPRESS the NoteOff, arm tiePend ---
+    test    r12d, r12d
+    jz      pn_emit_off
+    mov     dword ptr [rip + tiePend], 1
+    mov     [rip + tiePitch], ebx
+    jmp     pn_ret
+
+pn_emit_off:
     ; --- NoteOff @ round(curMs) ---
     call    RoundCurMs                ; eax = offMs
     mov     ecx, eax
