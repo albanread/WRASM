@@ -138,9 +138,20 @@ pu_done:
 endproc
 
 ; ----------------------------------------------------------------------------
-; ParseKey: read a key from txtPtr (e.g. "C","G","F","Bb","F#"); compute signed
-; sharp count via circle of fifths and call ApplyKey.  Only the root letter +
-; one optional #/b is honoured (mode/minor DEFERRED).  Calls -> frame.
+; ParseKey: read a key from txtPtr (e.g. "C","G","F","Bb","F#","Cm","Ddor"):
+; root letter + one optional #/b -> base signed fifths via keyFifths, then an
+; OPTIONAL mode word (M-D) shifts the fifths before ApplyKey.  Calls -> frame.
+;
+; MODE OFFSETS (added to the major fifths): how far the tonic of the named mode
+; sits, in fifths, from the major key with the same accidentals.  Lowercase the
+; mode letters and match a prefix:
+;   maj / ion  0    (Ionian = major)
+;   m   -3   (a LONE 'm' not followed by a letter = minor)
+;   min -3   maj 0   mix -1   dor -2   phr -4   lyd +1   aeo -3   loc -5   ion 0
+;   (none / unrecognized)  0
+; Examples: K:Cm = C(0)+(-3) = -3 (3 flats Bb Eb Ab); K:Ddor = D(+2)+(-2) = 0;
+;           K:Amix = A(+3)+(-1) = +2 (F# C#); K:Am = A(+3)+(-3) = 0.
+; The whole run of mode letters (after one optional leading space) is consumed.
 ; ----------------------------------------------------------------------------
 proc ParseKey uses rsi rbx frame
     mov     rsi, [rip + txtPtr]
@@ -168,14 +179,128 @@ pk_haveU:
     je      pk_sharp
     cmp     al, 'b'
     je      pk_flat
-    jmp     pk_apply
+    jmp     pk_mode
 pk_sharp:
     add     ebx, 7
     inc     rsi
-    jmp     pk_apply
+    jmp     pk_mode
 pk_flat:
     sub     ebx, 7
     inc     rsi
+
+    ; --- optional mode word: skip ONE leading space, read the letter run ---
+pk_mode:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, ' '
+    jne     pk_mode_noskip
+    inc     rsi                       ; consume one optional leading space
+pk_mode_noskip:
+    ; read up to 3 lowercased mode letters (c0/c1/c2) and the total letter count.
+    ; r8b/r10b/r11b = c0/c1/c2 (0 if absent); r9d = count of letters in the run.
+    xor     r8d, r8d
+    xor     r10d, r10d
+    xor     r11d, r11d
+    xor     r9d, r9d                  ; letter count
+    mov     rdx, rsi                  ; rdx scans the run; rsi is the run start
+pk_mode_scan:
+    movzx   eax, byte ptr [rdx]
+    cmp     al, 'A'
+    jb      pk_mode_scan_done
+    cmp     al, 'Z'
+    jbe     pk_mode_lc                ; uppercase letter -> lowercase it
+    cmp     al, 'a'
+    jb      pk_mode_scan_done
+    cmp     al, 'z'
+    ja      pk_mode_scan_done
+    jmp     pk_mode_store
+pk_mode_lc:
+    add     al, 32                    ; to lowercase
+pk_mode_store:
+    cmp     r9d, 0
+    jne     pk_mode_c1
+    mov     r8b, al                   ; c0
+    jmp     pk_mode_next
+pk_mode_c1:
+    cmp     r9d, 1
+    jne     pk_mode_c2
+    mov     r10b, al                  ; c1
+    jmp     pk_mode_next
+pk_mode_c2:
+    cmp     r9d, 2
+    jne     pk_mode_next
+    mov     r11b, al                  ; c2
+pk_mode_next:
+    inc     r9d
+    inc     rdx
+    jmp     pk_mode_scan
+pk_mode_scan_done:
+    ; rdx now points just past the letter run; r9d = length.  No letters -> no shift.
+    test    r9d, r9d
+    jz      pk_apply
+    ; consume the WHOLE letter run from the cursor regardless of recognition.
+    mov     rsi, rdx
+
+    ; classify by first letter, then verify the prefix.
+    cmp     r8b, 'm'
+    je      pk_mode_m
+    cmp     r8b, 'd'
+    je      pk_mode_dor
+    cmp     r8b, 'p'
+    je      pk_mode_phr
+    cmp     r8b, 'l'
+    je      pk_mode_l
+    cmp     r8b, 'a'
+    je      pk_mode_aeo
+    cmp     r8b, 'i'
+    je      pk_mode_ion
+    jmp     pk_apply                  ; unrecognized first letter -> 0 shift
+
+pk_mode_m:
+    ; lone "m" (count==1) -> minor(-3); else look at c1 for min/maj/mix.
+    cmp     r9d, 1
+    je      pk_mode_minor
+    cmp     r10b, 'i'
+    je      pk_mode_mi
+    cmp     r10b, 'a'                 ; "ma.." -> maj (0)
+    je      pk_apply                  ; major: +0 (no shift)
+    jmp     pk_apply                  ; "m" + other -> treat as 0 (unrecognized)
+pk_mode_mi:
+    cmp     r11b, 'n'                 ; "min" -> minor
+    je      pk_mode_minor
+    cmp     r11b, 'x'                 ; "mix" -> mixolydian (-1)
+    je      pk_mode_mix
+    jmp     pk_apply
+pk_mode_minor:
+    sub     ebx, 3
+    jmp     pk_apply
+pk_mode_mix:
+    sub     ebx, 1
+    jmp     pk_apply
+pk_mode_dor:
+    sub     ebx, 2                    ; dorian
+    jmp     pk_apply
+pk_mode_phr:
+    sub     ebx, 4                    ; phrygian
+    jmp     pk_apply
+pk_mode_l:
+    ; "ly.." -> lydian (+1); "lo.." -> locrian (-5).
+    cmp     r10b, 'y'
+    je      pk_mode_lyd
+    cmp     r10b, 'o'
+    je      pk_mode_loc
+    jmp     pk_apply
+pk_mode_lyd:
+    add     ebx, 1                    ; lydian
+    jmp     pk_apply
+pk_mode_loc:
+    sub     ebx, 5                    ; locrian
+    jmp     pk_apply
+pk_mode_aeo:
+    sub     ebx, 3                    ; aeolian = natural minor
+    jmp     pk_apply
+pk_mode_ion:
+    ; ionian = major (+0); fall through to apply with no shift.
+
 pk_apply:
     mov     [rip + txtPtr], rsi
     mov     ecx, ebx

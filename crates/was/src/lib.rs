@@ -332,7 +332,7 @@ fn reg_effects<F: Fn(&str) -> Option<&'static str>>(
     let ops: Vec<String> = if rest.is_empty() { Vec::new() } else { split_top_commas(rest) };
     let mut reads = Vec::new();
     let mut writes = Vec::new();
-    let mut rd = |r: &str| canon(r);
+    let rd = |r: &str| canon(r);
     // Implicit rdx:rax operands.
     match mn.as_str() {
         "cdq" | "cqo" | "cwd" => {

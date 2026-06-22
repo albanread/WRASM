@@ -62,6 +62,7 @@
 .include "abc_data.inc"
 .CODE
 .include "abc_scan.was"
+.include "abc_field.was"
 .include "abc_note.was"
 .include "abc_voice.was"
 .include "abc_chord.was"

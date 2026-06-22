@@ -87,94 +87,24 @@ pt_h_V:
     jmp     pt_h_skipline
 
 pt_h_L:
+    ; "L:<value>" — position past "L:", parse the value (ParseFieldL), skip to EOL.
     add     rsi, 2
     mov     [rip + txtPtr], rsi
-    call    SkipSpaces
-    call    ParseUInt                 ; N
-    test    eax, eax
-    jnz     pt_h_L_n_ok
-    mov     eax, 1
-pt_h_L_n_ok:
-    mov     [rip + unitN], eax
-    mov     rsi, [rip + txtPtr]
-    movzx   edx, byte ptr [rsi]
-    cmp     dl, '/'
-    jne     pt_h_L_setd1
-    inc     rsi
-    mov     [rip + txtPtr], rsi
-    call    ParseUInt                 ; D
-    test    eax, eax
-    jnz     pt_h_L_d_ok
-    mov     eax, 1
-pt_h_L_d_ok:
-    mov     [rip + unitD], eax
-    jmp     pt_h_skipline
-pt_h_L_setd1:
-    mov     dword ptr [rip + unitD], 1
+    call    ParseFieldL               ; sets unitN/unitD, advances txtPtr
     jmp     pt_h_skipline
 
 pt_h_M:
+    ; "M:<value>" — position past "M:", parse the value (ParseFieldM), skip to EOL.
     add     rsi, 2
     mov     [rip + txtPtr], rsi
-    call    SkipSpaces
-    mov     rsi, [rip + txtPtr]
-    movzx   eax, byte ptr [rsi]
-    cmp     al, 'C'                   ; "C" / "C|" common/cut -> 4/4
-    jne     pt_h_M_num
-    mov     dword ptr [rip + tsN], 4
-    mov     dword ptr [rip + tsD], 4
-    jmp     pt_h_skipline
-pt_h_M_num:
-    call    ParseUInt                 ; N
-    test    eax, eax
-    jnz     pt_h_M_n_ok
-    mov     eax, 4
-pt_h_M_n_ok:
-    mov     [rip + tsN], eax
-    mov     rsi, [rip + txtPtr]
-    movzx   edx, byte ptr [rsi]
-    cmp     dl, '/'
-    jne     pt_h_skipline
-    inc     rsi
-    mov     [rip + txtPtr], rsi
-    call    ParseUInt                 ; D
-    test    eax, eax
-    jnz     pt_h_M_d_ok
-    mov     eax, 4
-pt_h_M_d_ok:
-    mov     [rip + tsD], eax
+    call    ParseFieldM               ; sets tsN/tsD, advances txtPtr
     jmp     pt_h_skipline
 
 pt_h_Q:
+    ; "Q:<value>" — position past "Q:", parse the value (ParseFieldQ), skip to EOL.
     add     rsi, 2
     mov     [rip + txtPtr], rsi
-    call    SkipSpaces
-    call    ParseUInt                 ; first number
-    mov     ebx, eax
-    mov     rsi, [rip + txtPtr]
-    movzx   edx, byte ptr [rsi]
-    cmp     dl, '/'
-    jne     pt_h_Q_chkeq
-    inc     rsi                       ; skip "/D"
-    mov     [rip + txtPtr], rsi
-    call    ParseUInt                 ; discard denominator
-pt_h_Q_chkeq:
-    mov     rsi, [rip + txtPtr]
-    movzx   edx, byte ptr [rsi]
-    cmp     dl, '='
-    jne     pt_h_Q_use_first
-    inc     rsi
-    mov     [rip + txtPtr], rsi
-    call    SkipSpaces
-    call    ParseUInt                 ; bpm after '='
-    test    eax, eax
-    jz      pt_h_Q_use_first
-    mov     [rip + bpmVal], eax
-    jmp     pt_h_skipline
-pt_h_Q_use_first:
-    test    ebx, ebx
-    jz      pt_h_skipline
-    mov     [rip + bpmVal], ebx
+    call    ParseFieldQ               ; sets bpmVal, advances txtPtr
     jmp     pt_h_skipline
 
 pt_h_K:
@@ -305,9 +235,9 @@ pt_b_lbrack:
     ; Peek the char after '['.
     ;   accidental (^ _ =) or a note letter (A-G / a-g)  -> chord  [CEG]
     ;   'V' then ':'                                     -> inline voice switch
-    ;   otherwise (a field letter K/L/M/Q then ':', etc) -> inline field, ignored
-    ;     (consume through ']' so we don't mis-eat it as a chord or crash; full
-    ;      inline-field handling is deferred to M-C).
+    ;   a field letter K/Q/M/L then ':'                  -> inline field, APPLIED
+    ;     ([K:..] re-keys, [Q/M/L:..] change tempo/meter/unit) — M-D.
+    ;   any other "[X:.."                                -> skipped through ']'.
     movzx   eax, byte ptr [rsi + 1]
     cmp     al, '^'
     je      pt_b_chord
@@ -324,14 +254,29 @@ pt_b_lbrack:
     cmp     al, 'g'
     jbe     pt_b_chord
 pt_b_lbrack_other:
-    ; not a note start: voice switch [V:..], bracket ending [1/[2, or inline field
+    ; not a note start: voice switch [V:..], bracket ending [1/[2, an inline field
+    ; [K:..]/[Q:..]/[M:..]/[L:..] we now HANDLE (M-D), or any other [X:..] we skip.
     cmp     al, 'V'
     je      pt_b_inlineV
     cmp     al, '1'                   ; "[1" first ending (bracket form of |1)
     je      pt_b_lend1
     cmp     al, '2'                   ; "[2" second ending (bracket form of |2)
     je      pt_b_lend2
+    ; A handled inline field is "[<F>:" with F in {K,Q,M,L} AND the next char ':'.
+    cmp     al, 'K'
+    je      pt_b_inl_chk
+    cmp     al, 'Q'
+    je      pt_b_inl_chk
+    cmp     al, 'M'
+    je      pt_b_inl_chk
+    cmp     al, 'L'
+    je      pt_b_inl_chk
     jmp     pt_b_inlinefield          ; any other [X:..] -> skip through ']'
+pt_b_inl_chk:
+    movzx   edx, byte ptr [rsi + 2]   ; the char after the field letter
+    cmp     dl, ':'
+    jne     pt_b_inlinefield          ; "[K..", no ':' -> not a field; skip it
+    jmp     pt_b_inlinefield_parse
 
 pt_b_lend1:
     call    ResetBar
@@ -353,9 +298,55 @@ pt_b_chord:
     call    ParseChord                ; emits NoteOns/NoteOffs, advances txtPtr+curMs
     jmp     pt_loop
 
+pt_b_inlinefield_parse:
+    ; A HANDLED inline field "[<F>:..]" with F in {K,Q,M,L} (M-D).  rsi is at '['.
+    ; Position past "[F:" (3 chars), call the matching value parser (ParseKey for
+    ; K; ParseFieldL/M/Q otherwise) — each applies the change to the live parse
+    ; state and advances txtPtr — then consume whatever remains through the ']'.
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi + 1]   ; the field letter F
+    add     rsi, 3                    ; past "[F:"
+    mov     [rip + txtPtr], rsi
+    cmp     al, 'K'
+    je      pt_b_inl_K
+    cmp     al, 'Q'
+    je      pt_b_inl_Q
+    cmp     al, 'M'
+    je      pt_b_inl_M
+    ; else 'L'
+    call    ParseFieldL
+    jmp     pt_b_inl_eat
+pt_b_inl_K:
+    call    SkipSpaces                ; mirror the header K: (skip leading spaces)
+    call    ParseKey                  ; re-seeds keyAcc, advances txtPtr
+    jmp     pt_b_inl_eat
+pt_b_inl_Q:
+    call    ParseFieldQ
+    jmp     pt_b_inl_eat
+pt_b_inl_M:
+    call    ParseFieldM
+pt_b_inl_eat:
+    ; consume the rest of the field through the matching ']' (or EOL/NUL).
+    mov     rsi, [rip + txtPtr]
+pt_b_inl_eat_loop:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pt_b_inl_done             ; NUL -> stop
+    cmp     al, ']'
+    je      pt_b_inl_close
+    cmp     al, 10                    ; newline ends it too (malformed input)
+    je      pt_b_inl_done
+    inc     rsi
+    jmp     pt_b_inl_eat_loop
+pt_b_inl_close:
+    inc     rsi                       ; step past ']'
+pt_b_inl_done:
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
 pt_b_inlinefield:
-    ; an inline field [K:..]/[L:..]/[M:..]/[Q:..] etc — deferred (M-C).  Just eat
-    ; from '[' through the matching ']' (or EOL/NUL) without parsing it.
+    ; an UNHANDLED inline field [X:..] (X not in K/Q/M/L, or no ':') — eat from '['
+    ; through the matching ']' (or EOL/NUL) without parsing it (as before M-D).
     mov     rsi, [rip + txtPtr]
     inc     rsi                       ; past '['
 pt_b_inlinefield_eat:

@@ -1,0 +1,126 @@
+; abc_field.was — reusable value parsers for the L:/M:/Q: fields (Sprint M-D).
+; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included in
+; the shell BEFORE abc_parse.was so BOTH the header dispatch (pt_h_L/M/Q) AND the
+; body inline-field dispatch ([L:..]/[M:..]/[Q:..]) can call them.
+;
+; THE FACTORING --------------------------------------------------------------
+; Each proc assumes txtPtr is positioned JUST PAST the "X:" label (e.g. after the
+; "L:" of an "L:1/8" header, or after the "L:" of an inline "[L:1/8]").  It
+; parses the value, APPLIES it to the parse state (unitN/unitD, tsN/tsD, bpmVal),
+; and advances txtPtr past the consumed value — WITHOUT skipping to end-of-line.
+; The caller then does the context-appropriate trailing consumption:
+;   * the HEADER dispatch skips to EOL (header behaviour unchanged);
+;   * the BODY inline dispatch consumes the rest through the matching ']'.
+; This is exactly the value-parsing that used to live inline in pt_h_L/M/Q —
+; lifted verbatim so the header path stays BYTE-IDENTICAL.  (K: needs no such
+; proc: ParseKey is already a proc the inline case calls directly.)
+; ----------------------------------------------------------------------------
+
+; ----------------------------------------------------------------------------
+; ParseFieldL: parse an L: value (default note length) at txtPtr just past "L:".
+;   bare N        -> unitN = N (>=1), unitD = 1
+;   N/D or /D     -> unitN = N (>=1), unitD = D (>=1)
+; Calls SkipSpaces/ParseUInt -> frame.  Advances txtPtr past the value.
+; ----------------------------------------------------------------------------
+proc ParseFieldL uses rsi frame
+    call    SkipSpaces
+    call    ParseUInt                 ; N
+    test    eax, eax
+    jnz     pfl_n_ok
+    mov     eax, 1
+pfl_n_ok:
+    mov     [rip + unitN], eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pfl_setd1
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; D
+    test    eax, eax
+    jnz     pfl_d_ok
+    mov     eax, 1
+pfl_d_ok:
+    mov     [rip + unitD], eax
+    ret
+pfl_setd1:
+    mov     dword ptr [rip + unitD], 1
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseFieldM: parse an M: value (meter) at txtPtr just past "M:".
+;   "C" (common) -> tsN = 4, tsD = 4
+;   N            -> tsN = N (default 4); tsD unchanged unless a "/D" follows
+;   N/D          -> tsN = N (default 4), tsD = D (default 4)
+; Calls SkipSpaces/ParseUInt -> frame.  Advances txtPtr past the value.
+; ----------------------------------------------------------------------------
+proc ParseFieldM uses rsi frame
+    call    SkipSpaces
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 'C'                   ; "C" / "C|" common/cut -> 4/4
+    jne     pfm_num
+    mov     dword ptr [rip + tsN], 4
+    mov     dword ptr [rip + tsD], 4
+    ret
+pfm_num:
+    call    ParseUInt                 ; N
+    test    eax, eax
+    jnz     pfm_n_ok
+    mov     eax, 4
+pfm_n_ok:
+    mov     [rip + tsN], eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pfm_done
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; D
+    test    eax, eax
+    jnz     pfm_d_ok
+    mov     eax, 4
+pfm_d_ok:
+    mov     [rip + tsD], eax
+pfm_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseFieldQ: parse a Q: value (tempo) at txtPtr just past "Q:".
+;   bpm           -> bpmVal = bpm
+;   N/D=bpm       -> bpmVal = bpm   (the "N/D=" beat-spec is parsed but the
+;                    denominator is discarded; the bpm after '=' wins)
+;   N (no '=')    -> bpmVal = N
+; Calls SkipSpaces/ParseUInt -> frame.  Advances txtPtr past the value.  rbx holds
+; the first number across the calls.
+; ----------------------------------------------------------------------------
+proc ParseFieldQ uses rsi rbx frame
+    call    SkipSpaces
+    call    ParseUInt                 ; first number
+    mov     ebx, eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pfq_chkeq
+    inc     rsi                       ; skip "/D"
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; discard denominator
+pfq_chkeq:
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '='
+    jne     pfq_use_first
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; bpm after '='
+    test    eax, eax
+    jz      pfq_use_first
+    mov     [rip + bpmVal], eax
+    ret
+pfq_use_first:
+    test    ebx, ebx
+    jz      pfq_done
+    mov     [rip + bpmVal], ebx
+pfq_done:
+endproc

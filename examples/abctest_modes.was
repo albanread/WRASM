@@ -1,0 +1,71 @@
+; abctest_modes.was — modes + inline-field test (Sprint M-D).
+;
+;   was examples\abctest_modes.was -o abc_modes.exe  &&  abc_modes.exe
+;   (writes five .bin files — verify offline, 20-byte MidiEvent records)
+;
+; ParseTune resets all state at its top, so each parse starts clean.  Default
+; L=1/8; tunes 1-4 set L:1/4 (quarter = 500 ms @ Q:120); tune 5 exercises tempo.
+;
+; TUNE 1 — K:Cm (C minor = 3 flats Bb Eb Ab).  Body "C D E F G A B":
+;   C natural 60, D 62, E flat 63, F 65, G 67, A flat 68, B flat 70.
+;   pitches [60,62,63,65,67,68,70]
+;
+; TUNE 2 — K:Ddor (D dorian = C-major sig, no accidentals).  Body "D E F G A B c":
+;   pitches [62,64,65,67,69,71,72]
+;
+; TUNE 3 — K:Amix (A mixolydian = D-major sig: F# C#).  Body "A B c d e f g":
+;   A 69, B 71, c# 73, d 74, e 76, f# 78, g 79.
+;   pitches [69,71,73,74,76,78,79]
+;
+; TUNE 4 — INLINE KEY.  K:C, body "F [K:G] F |":
+;   first F natural 65; [K:G] re-keys to G major (one sharp F#); second F -> 66.
+;   NoteOns: F 65 @0, then F# 66 @500.
+;
+; TUNE 5 — INLINE TEMPO.  K:C Q:120, body "C [Q:240] C |":
+;   first C: NoteOn @0, NoteOff @500 (quarter @120).  [Q:240] doubles the tempo.
+;   second C: NoteOn @500, NoteOff @500+250=750 (quarter @240 = half as long).
+
+.DATA
+tune1 BYTE "X:1", 10, "L:1/4", 10, "Q:120", 10, "K:Cm", 10, "C D E F G A B", 10, 0
+tune2 BYTE "X:1", 10, "L:1/4", 10, "Q:120", 10, "K:Ddor", 10, "D E F G A B c", 10, 0
+tune3 BYTE "X:1", 10, "L:1/4", 10, "Q:120", 10, "K:Amix", 10, "A B c d e f g", 10, 0
+tune4 BYTE "X:1", 10, "L:1/4", 10, "Q:120", 10, "K:C", 10, "F [K:G] F |", 10, 0
+tune5 BYTE "X:1", 10, "L:1/4", 10, "Q:120", 10, "K:C", 10, "C [Q:240] C |", 10, 0
+
+binName1 WCHAR "tune_cm.bin", 0
+binName2 WCHAR "tune_ddor.bin", 0
+binName3 WCHAR "tune_amix.bin", 0
+binName4 WCHAR "tune_inlk.bin", 0
+binName5 WCHAR "tune_inlq.bin", 0
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tune1]
+    call    ParseTune
+    lea     rcx, [rip + binName1]
+    call    WriteTune
+
+    lea     rcx, [rip + tune2]
+    call    ParseTune
+    lea     rcx, [rip + binName2]
+    call    WriteTune
+
+    lea     rcx, [rip + tune3]
+    call    ParseTune
+    lea     rcx, [rip + binName3]
+    call    WriteTune
+
+    lea     rcx, [rip + tune4]
+    call    ParseTune
+    lea     rcx, [rip + binName4]
+    call    WriteTune
+
+    lea     rcx, [rip + tune5]
+    call    ParseTune
+    lea     rcx, [rip + binName5]
+    call    WriteTune
+
+    invoke  ExitProcess, 0
+
+.include "../library/audio/music/abc.was"
