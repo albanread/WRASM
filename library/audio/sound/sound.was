@@ -25,3 +25,4 @@
 .include "sound_osc.was"
 .include "sound_render.was"
 .include "sound_presets.was"
+.include "sound_play.was"

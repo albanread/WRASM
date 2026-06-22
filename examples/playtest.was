@@ -1,0 +1,35 @@
+; playtest.was — Sprint 3 audio: live waveOut mixer thread.
+;
+;   was examples\playtest.was -o /tmp/play.exe
+;   cd /tmp && timeout 5 /tmp/play.exe; echo exit=$?      ; ~1.4 s, exit 0
+;
+; Starts the mixer thread, plays two SFX (Coin, then Jump) through it, then shuts
+; the thread + device down cleanly.  Each sound is rendered into the shared
+; sndBuf and played; we Sleep long enough for it to finish before rendering the
+; next (the next render overwrites sndBuf), so only one buffer is ever live.
+
+.CODE
+.globl main
+main:
+    call    AudioInit
+
+    ; --- Coin: render into sndBuf, then point a voice at it ---
+    mov     edx, 400                 ; 400 ms
+    call    Coin                     ; renders into sndBuf, sets sndFrames
+    lea     rcx, [rip + sndBuf]
+    mov     edx, [rip + sndFrames]
+    call    Play
+    invoke  Sleep, 700               ; let it finish (the mixer drains it)
+
+    ; --- Jump: rising sweep 300->600, same buffer (Coin is done playing) ---
+    mov     edx, 400
+    call    Jump
+    lea     rcx, [rip + sndBuf]
+    mov     edx, [rip + sndFrames]
+    call    Play
+    invoke  Sleep, 700
+
+    call    AudioShutdown
+    invoke  ExitProcess, 0
+
+.include "../library/audio/sound/sound.was"

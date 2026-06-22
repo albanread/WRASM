@@ -1,0 +1,349 @@
+; ============================================================================
+; sound_play.was — Sprint 3: the live waveOut mixer thread.
+; Part of the sound.was shell.  This fragment opens .DATA for its own state,
+; then .CODE for the procs, so it can sit after the other .include lines.
+; ============================================================================
+; A dedicated thread drains the audio device; the game thread only ever pokes a
+; small, spinlock-guarded voice table.  The synth renders f64 PCM into `sndBuf`;
+; Play() points a voice slot at that buffer and the mixer converts to i16 on the
+; fly into 4 double-buffered waveOut blocks (2048 frames each).
+;
+; Public API:
+;   AudioInit                 open the device, prepare 4 blocks, start the thread
+;   Play(rcx = sndPtr, edx = frames)   claim a free voice slot, pos=0
+;   StopAll                   deactivate every voice (instant silence)
+;   AudioShutdown             signal+join the thread, then reset+close the device
+;
+; THE THREADING (review this) ------------------------------------------------
+; * MixerThread is a Win64 *callback* — the OS calls it (param in rcx, must
+;   preserve every non-volatile, return in rax).  It is written as
+;   `proc MixerThread uses rbx rsi rdi r12 r13 r14 r15 frame in rcx` so the
+;   `proc` prologue/epilogue is the firewall: every GP non-volatile is push/pop
+;   restored.  The `uses` contract does NOT track xmm, so the mix math stays
+;   strictly in xmm0..xmm5 (all volatile) — xmm6..xmm15 are never touched, so
+;   there is nothing to save and nothing the OS gets back dirty.
+; * The shared voice table is guarded by the `gLock` spinlock.  Acquire:
+;   `mov eax,1; xchg eax,[rip+gLock]; test eax,eax; jnz spin` (xchg on memory is
+;   implicitly LOCKed).  Release: `mov dword ptr [rip+gLock],0`.  Critical sections
+;   are tiny and NEVER span a blocking call: the mixer holds the lock only around
+;   each block's voice mix and releases it *before* the waveOutWrite syscall, so a
+;   Play() waiter never spins behind a kernel transition.
+; * Shutdown order is signal -> join -> reset -> close.  AudioShutdown sets
+;   gQuit, WaitForSingleObject on the thread handle (the thread sees gQuit and
+;   returns), THEN waveOutReset + waveOutClose.  Reverse it and the device hangs.
+;
+; DEFERRED (noted): pan, fade, looping, and a master volume — the voice gain is
+; a flat 1.0.  Voice count is 8 (the design's 32 is overkill for the test).  The
+; mixer sums active voices with a hard clamp to [-1,1]; that is enough to verify
+; the thread/lock/shutdown without a DSP gain stage.
+; ----------------------------------------------------------------------------
+
+.DATA
+
+; --- device handle ---
+hwo          QWORD  0                     ; HWAVEOUT from waveOutOpen
+
+; --- WAVEFORMATEX (18 meaningful bytes; laid out raw, not via the struct DB) ---
+;   wFormatTag=1(PCM) nChannels=2 nSamplesPerSec=44100 nAvgBytesPerSec=176400
+;   nBlockAlign=4 wBitsPerSample=16 cbSize=0
+wfx:
+    WORD  1                               ; +0  wFormatTag = WAVE_FORMAT_PCM
+    WORD  2                               ; +2  nChannels
+    DWORD 44100                           ; +4  nSamplesPerSec
+    DWORD 176400                          ; +8  nAvgBytesPerSec = 44100*2*2
+    WORD  4                               ; +12 nBlockAlign = 2ch*2bytes
+    WORD  16                              ; +14 wBitsPerSample
+    WORD  0                               ; +16 cbSize
+
+; --- 4 WAVEHDRs (48 bytes each, x64).  Fields:
+;   +0 lpData(ptr) +8 dwBufferLength(u32) +12 dwBytesRecorded(u32)
+;   +16 dwUser(ptr) +24 dwFlags(u32) +28 dwLoops(u32) +32 lpNext(ptr) +40 reserved
+; All zero-initialised; AudioInit fills lpData + dwBufferLength before prepare.
+hdr0     BYTE 48 dup(0)
+hdr1     BYTE 48 dup(0)
+hdr2     BYTE 48 dup(0)
+hdr3     BYTE 48 dup(0)
+
+; --- 4 block buffers: 2048 frames * 2ch * 2 bytes = 8192 bytes each ---
+blk0     BYTE 8192 dup(0)
+blk1     BYTE 8192 dup(0)
+blk2     BYTE 8192 dup(0)
+blk3     BYTE 8192 dup(0)
+
+; --- thread / synchronisation ---
+gLock        DWORD  0                     ; spinlock: 0 = free, 1 = held
+gQuit        DWORD  0                     ; mixer loop stop flag (0 = run)
+hThread      QWORD  0                     ; mixer thread handle (for the join)
+gTid         DWORD  0                     ; thread id sink for CreateThread
+
+; --- voice table: 8 voices, 32 bytes each = 256 bytes ---
+; Voice @ base:  +0 active(u32) +4 pad  +8 snd(ptr)  +16 frames(u32)
+;                +20 pos(u32)  +24 gain(f64)
+voices   BYTE 256 dup(0)
+
+; The 4 headers (hdr0..hdr3) are laid out contiguously, 48 bytes apart; the 4
+; block buffers (blk0..blk3) contiguously, 8192 bytes apart.  So the loops index
+; them by stride from the base label — no pointer table needed (and a QWORD data
+; directive can't take symbol operands in this dialect anyway).
+;   &hdrN = hdr0 + N*48      blkN = blk0 + N*8192
+
+cBlockFrames DWORD 2048                    ; frames per block
+cBlockBytes  DWORD 8192                    ; bytes per block
+
+.CODE
+
+; ----------------------------------------------------------------------------
+; AudioInit: open the device, prepare the 4 blocks, start the mixer thread.
+;   waveOutOpen(&hwo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL)
+;   for each of 4 hdrs: lpData=buf, dwBufferLength=8192; waveOutPrepareHeader(.,48)
+;   CreateThread(0, 0, &MixerThread, 0, 0, &gTid)
+; Calls -> frame.  Uses rbx (loop index), rsi (hdr ptr), rdi (buf ptr).
+; ----------------------------------------------------------------------------
+proc AudioInit uses rbx rsi rdi frame
+    ; --- open the device (WAVE_MAPPER = 0xFFFFFFFF, CALLBACK_NULL = 0) ---
+    invoke  waveOutOpen, hwo, 0xFFFFFFFF, wfx, 0, 0, 0
+    test    eax, eax                       ; MMRESULT != 0 -> open failed
+    jnz     ai_done                        ; bail: hwo stays 0, no thread started
+
+    ; --- prepare the 4 headers: set lpData + dwBufferLength, then prepare ---
+    ; rsi walks the headers (+48 each), rdi walks the buffers (+8192 each).
+    lea     rsi, [rip + hdr0]
+    lea     rdi, [rip + blk0]
+    xor     ebx, ebx                       ; block index 0..3
+ai_prep:
+    mov     [rsi + 0], rdi                 ; hdr.lpData = buf
+    mov     eax, [rip + cBlockBytes]
+    mov     [rsi + 8], eax                 ; hdr.dwBufferLength = 8192
+    ; the rest (flags etc.) are already zero
+    invoke  waveOutPrepareHeader, [rip + hwo], rsi, 48
+    add     rsi, 48                        ; next header
+    add     rdi, 8192                      ; next buffer
+    inc     ebx
+    cmp     ebx, 4
+    jb      ai_prep
+
+    ; --- start the mixer thread ---
+    invoke  CreateThread, 0, 0, MixerThread, 0, 0, gTid
+    mov     [rip + hThread], rax
+ai_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; MixerThread(rcx = param): the Win64 callback.  Loops until gQuit; under the
+; lock, fills+writes any block not currently queued, then Sleep(2).
+;
+; ABI firewall: `uses rbx rsi rdi r12 r13 r14 r15` saves/restores every GP
+; non-volatile (the OS demands them back intact).  Mix math is xmm0..xmm5 only
+; (all volatile) so xmm6..xmm15 are untouched — nothing to save there.  Returns
+; 0 in eax (the thread exit code).
+;
+; Register roles in the loop:
+;   rbx = block index 0..3            r12 = &voices base
+;   rsi = &hdrN                       r13 = voice loop index
+;   rdi = blkN (i16 write cursor)     r14 = frame index within the block
+;   r15 = scratch (voice ptr / snd ptr)
+; ----------------------------------------------------------------------------
+proc MixerThread uses rbx rsi rdi r12 r13 r14 r15 frame in rcx
+mt_loop:
+    mov     eax, [rip + gQuit]
+    test    eax, eax
+    jnz     mt_exit
+
+    ; --- for each of the 4 blocks: if not in queue, mix + write it ---
+    ; rsi = &hdrN (base + index*48); the matching buffer is blk0 + index*8192.
+    xor     ebx, ebx                       ; block index
+mt_block:
+    ; rsi = &hdr0 + index*48
+    mov     rax, rbx
+    imul    rax, rax, 48
+    lea     rsi, [rip + hdr0]
+    add     rsi, rax                       ; rsi = &hdrN
+    mov     eax, [rsi + 24]                ; hdr.dwFlags
+    and     eax, 0x10                      ; WHDR_INQUEUE
+    jnz     mt_next                        ; still draining -> skip
+
+    ; --- fill this block: 2048 frames, mix active voices -> i16 stereo ---
+    ; rdi = blk0 + index*8192
+    mov     rax, rbx
+    imul    rax, rax, 8192
+    lea     rdi, [rip + blk0]
+    add     rdi, rax                       ; rdi = blkN (i16 cursor)
+    lea     r12, [rip + voices]
+    ; --- acquire the lock ONLY around the voice mix; released before the
+    ;     waveOutWrite below (never hold a spinlock across a kernel call) ---
+mt_spin:
+    mov     eax, 1
+    xchg    eax, [rip + gLock]             ; atomic (xchg has implicit LOCK)
+    test    eax, eax
+    jnz     mt_spin
+    xor     r14d, r14d                     ; frame index f = 0
+mt_frame:
+    ; accumulate the mix for this frame into xmm0 (mono; written to L and R)
+    xorps   xmm0, xmm0                     ; sum = 0.0
+    xor     r13d, r13d                     ; voice index v = 0
+mt_voice:
+    mov     r15, r13
+    shl     r15, 5                         ; v * 32 (voice stride)
+    add     r15, r12                       ; r15 = &voice[v]
+    mov     eax, [r15 + 0]                 ; active?
+    test    eax, eax
+    jz      mt_vnext
+    ; pos within range?  (pos < frames)
+    mov     eax, [r15 + 20]                ; pos
+    mov     ecx, [r15 + 16]                ; frames
+    cmp     eax, ecx
+    jb      mt_vmix
+    ; reached the end -> deactivate and skip
+    mov     dword ptr [r15 + 0], 0
+    jmp     mt_vnext
+mt_vmix:
+    ; sample = snd[pos*2] (use the left channel of the interleaved f64 buffer)
+    mov     r9, [r15 + 8]                  ; snd ptr
+    mov     edx, eax                       ; pos (eax = pos still)
+    add     edx, edx                       ; pos*2 (interleaved index)
+    movsd   xmm1, [r9 + rdx*8]             ; snd[pos*2]  (L)
+    mulsd   xmm1, [r15 + 24]               ; * gain
+    addsd   xmm0, xmm1                     ; sum += sample*gain
+    ; advance this voice's position
+    mov     eax, [r15 + 20]
+    inc     eax
+    mov     [r15 + 20], eax
+mt_vnext:
+    inc     r13d
+    cmp     r13d, 8                        ; voice count
+    jb      mt_voice
+
+    ; --- clamp sum to [-1,1] then -> i16 = round(sum * 32767) ---
+    movsd   xmm1, [rip + cOne]
+    minsd   xmm0, xmm1                     ; min(sum, 1)
+    movsd   xmm2, [rip + cNeg1]
+    maxsd   xmm0, xmm2                     ; max(., -1)
+    mulsd   xmm0, [rip + cI16Max]          ; * 32767
+    cvtsd2si eax, xmm0                     ; round to nearest int32
+    mov     [rdi], ax                      ; L
+    mov     [rdi + 2], ax                  ; R (mono -> both channels)
+    add     rdi, 4                         ; next frame (4 bytes stereo i16)
+
+    inc     r14d
+    cmp     r14d, [rip + cBlockFrames]     ; 2048
+    jb      mt_frame
+    ; --- voice mix done: release the lock BEFORE the device call ---
+    mov     dword ptr [rip + gLock], 0
+
+    ; --- block filled: reset DONE and submit it (lock already released) ---
+    ; clear WHDR_DONE so the driver re-flags it (keep WHDR_PREPARED set)
+    mov     eax, [rsi + 24]
+    and     eax, 0xFFFFFFFE                ; clear WHDR_DONE (bit 0)
+    mov     [rsi + 24], eax
+    invoke  waveOutWrite, [rip + hwo], rsi, 48
+
+mt_next:
+    inc     ebx
+    cmp     ebx, 4
+    jb      mt_block
+
+    ; --- breathe ~2 ms, then loop (lock released per filled block) ---
+    invoke  Sleep, 2
+    jmp     mt_loop
+
+mt_exit:
+    ; the lock is released per filled block (and the gQuit check is outside any
+    ; acquire), so it is already free here — this store is belt-and-braces.
+    mov     dword ptr [rip + gLock], 0
+    xor     eax, eax                       ; thread exit code 0
+endproc
+
+; ----------------------------------------------------------------------------
+; Play(rcx = sndPtr, edx = frames): claim a free voice slot pointing at the PCM
+; buffer, pos=0, gain=1.0, active=1.  Under the lock; tiny critical section.
+;
+; NOTE on buffer reuse: the synth always renders into the single shared `sndBuf`,
+; which the *next* render overwrites.  So in the test we render a sound, Play it,
+; and Sleep long enough for it to finish *before* rendering the next one.  A real
+; game would render each SFX into its own buffer (or copy here); deferred.
+; Leaf w.r.t. external calls but uses a spinlock; no `invoke` -> no frame needed.
+; ----------------------------------------------------------------------------
+proc Play uses rbx in rcx rdx
+    ; acquire the lock
+pl_spin:
+    mov     eax, 1
+    xchg    eax, [rip + gLock]         ; atomic (xchg has implicit LOCK on memory)
+    test    eax, eax
+    jnz     pl_spin
+
+    ; find a free slot (active == 0)
+    lea     r9, [rip + voices]
+    xor     r8d, r8d                        ; voice index
+pl_find:
+    mov     rbx, r8
+    shl     rbx, 5                          ; *32
+    add     rbx, r9                         ; &voice[i]
+    mov     eax, [rbx + 0]
+    test    eax, eax
+    jz      pl_claim                        ; found free slot
+    inc     r8d
+    cmp     r8d, 8
+    jb      pl_find
+    jmp     pl_release                      ; no free slot -> drop the sound
+
+pl_claim:
+    mov     [rbx + 8], rcx                  ; snd = sndPtr
+    mov     [rbx + 16], edx                 ; frames
+    mov     dword ptr [rbx + 20], 0         ; pos = 0
+    movsd   xmm0, [rip + cOne]
+    movsd   [rbx + 24], xmm0                ; gain = 1.0
+    mov     dword ptr [rbx + 0], 1          ; active = 1 (last: now visible to mixer)
+
+pl_release:
+    mov     dword ptr [rip + gLock], 0
+endproc
+
+; ----------------------------------------------------------------------------
+; StopAll: deactivate every voice (instant silence).  Under the lock.
+; ----------------------------------------------------------------------------
+proc StopAll
+sa_spin:
+    mov     eax, 1
+    xchg    eax, [rip + gLock]         ; atomic (xchg has implicit LOCK on memory)
+    test    eax, eax
+    jnz     sa_spin
+    lea     r9, [rip + voices]
+    xor     r8d, r8d
+sa_loop:
+    mov     rax, r8
+    shl     rax, 5
+    mov     dword ptr [r9 + rax + 0], 0     ; active = 0
+    inc     r8d
+    cmp     r8d, 8
+    jb      sa_loop
+    mov     dword ptr [rip + gLock], 0
+    ret
+endproc
+
+; ----------------------------------------------------------------------------
+; AudioShutdown: signal -> join -> reset -> unprepare -> close.  Order matters:
+; stopping the device before the thread joins lets the thread waveOutWrite into a
+; closed device (hang/error); joining first guarantees the loop has stopped.  The
+; 4 headers prepared in AudioInit are unprepared before close (resource pairing).
+;   gQuit = 1
+;   WaitForSingleObject(hThread, INFINITE=0xFFFFFFFF)   (the join)
+;   CloseHandle(hThread)
+;   waveOutReset(hwo) ; waveOutUnprepareHeader x4 ; waveOutClose(hwo)
+; Calls -> frame.  Uses rbx (index), rsi (header ptr) for the unprepare loop.
+; ----------------------------------------------------------------------------
+proc AudioShutdown uses rbx rsi frame
+    mov     dword ptr [rip + gQuit], 1     ; tell the loop to stop
+    invoke  WaitForSingleObject, [rip + hThread], 0xFFFFFFFF   ; join
+    invoke  CloseHandle, [rip + hThread]
+    invoke  waveOutReset, [rip + hwo]       ; stop playback, mark all hdrs done
+    ; --- unprepare the 4 headers before close (pair AudioInit's prepare) ---
+    lea     rsi, [rip + hdr0]
+    xor     ebx, ebx
+as_unprep:
+    invoke  waveOutUnprepareHeader, [rip + hwo], rsi, 48
+    add     rsi, 48
+    inc     ebx
+    cmp     ebx, 4
+    jb      as_unprep
+    invoke  waveOutClose, [rip + hwo]
+endproc
