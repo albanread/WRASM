@@ -622,7 +622,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
         // MASM data: validate each field value fits its size, then skip the ident
         // scan (the type keyword would otherwise look like an unknown constant).
         if let Some((_, type_kw, values)) = parse_data_line(t) {
-            if let Some((_, width, _)) = data_type(type_kw) {
+            if let Some((_, width, _, _)) = data_type(type_kw) {
                 for val in split_top_commas(values) {
                     let v = val.trim();
                     if let Some(n) = data_value_i64(v) {
@@ -973,15 +973,36 @@ fn macro_names(src: &str) -> Vec<String> {
 /// Map a MASM data-type keyword to `(encoder directive, width bytes, wide)`.
 /// `WCHAR` is a 2-byte field whose strings encode as UTF-16LE. Case-insensitive;
 /// `S`-prefixed (signed) and `Dx` aliases included.
-fn data_type(kw: &str) -> Option<(&'static str, usize, bool)> {
+// Returns (gas directive, byte width, wide-string?, float?). `float` data takes a
+// decimal literal (`real8 440.0`) emitted as its IEEE-754 bit pattern.
+fn data_type(kw: &str) -> Option<(&'static str, usize, bool, bool)> {
     Some(match kw.to_ascii_uppercase().as_str() {
-        "BYTE" | "SBYTE" | "DB" => ("byte", 1, false),
-        "WORD" | "SWORD" | "DW" => ("word", 2, false),
-        "WCHAR" => ("word", 2, true),
-        "DWORD" | "SDWORD" | "DD" => ("long", 4, false),
-        "QWORD" | "SQWORD" | "DQ" => ("quad", 8, false),
+        "BYTE" | "SBYTE" | "DB" => ("byte", 1, false, false),
+        "WORD" | "SWORD" | "DW" => ("word", 2, false, false),
+        "WCHAR" => ("word", 2, true, false),
+        "DWORD" | "SDWORD" | "DD" => ("long", 4, false, false),
+        "QWORD" | "SQWORD" | "DQ" => ("quad", 8, false, false),
+        "REAL4" | "F32" => ("long", 4, false, true),
+        "REAL8" | "F64" => ("quad", 8, false, true),
         _ => return None,
     })
+}
+
+/// A float data literal → its IEEE-754 bits as a hex string (`.long`/`.quad` operand).
+/// A `0x…` literal is taken verbatim as the raw bit pattern.
+fn float_bits(v: &str, width: usize) -> Result<String> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        let bits = u64::from_str_radix(hex, 16).with_context(|| format!("bad float bits '{v}'"))?;
+        return Ok(format!("0x{bits:X}"));
+    }
+    if width == 4 {
+        let f: f32 = v.parse().with_context(|| format!("bad float literal '{v}'"))?;
+        Ok(format!("0x{:X}", f.to_bits()))
+    } else {
+        let f: f64 = v.parse().with_context(|| format!("bad float literal '{v}'"))?;
+        Ok(format!("0x{:X}", f.to_bits()))
+    }
 }
 
 /// Split off the first whitespace-delimited word; the rest is left-trimmed.
@@ -1059,7 +1080,7 @@ fn lower_data(
     kb: &Kb,
     labels: &HashSet<String>,
 ) -> Result<String> {
-    let (dir, width, wide) = data_type(type_kw).expect("caller checked the type");
+    let (dir, width, wide, is_float) = data_type(type_kw).expect("caller checked the type");
     let mut out = String::new();
     if let Some(l) = label {
         out.push_str(&format!("{l}:\n"));
@@ -1071,6 +1092,16 @@ fn lower_data(
         }
         if v == "?" {
             out.push_str(&format!("  .zero {width}\n"));
+        } else if is_float {
+            // `real4`/`real8` value: a decimal float (or 0x bit pattern) → IEEE bits.
+            if let Some((count, inner)) = parse_dup(v) {
+                let bits = float_bits(inner, width)?;
+                for _ in 0..count {
+                    out.push_str(&format!("  .{dir} {bits}\n"));
+                }
+            } else {
+                out.push_str(&format!("  .{dir} {}\n", float_bits(v, width)?));
+            }
         } else if v.starts_with('"') {
             if wide {
                 let units: Vec<String> =
@@ -2566,6 +2597,17 @@ mod tests {
         assert!(low.contains("scd:"), "labelled: {low}");
         assert!(low.contains("BufferDesc.Format @ 16"), "nested offset resolved: {low}");
         assert!(low.contains("BufferCount @ 40"), "top-level offset: {low}");
+    }
+
+    #[test]
+    fn real_data_literals_emit_ieee_bits() {
+        let Some(kb) = kb() else { return };
+        let low =
+            lower(".data\nx real8 2.5\ny real4 1.5\nz real8 -0.5\n.code\n.globl m\nm:\n  ret\n", &kb)
+                .unwrap();
+        assert!(low.contains(".quad 0x4004000000000000"), "real8 2.5 → f64 bits:\n{low}");
+        assert!(low.contains(".long 0x3FC00000"), "real4 1.5 → f32 bits:\n{low}");
+        assert!(low.contains(".quad 0xBFE0000000000000"), "real8 -0.5 → f64 bits:\n{low}");
     }
 
     #[test]
