@@ -65,6 +65,11 @@ sWin1     BYTE "YOU WIN", 0
 sWin2     BYTE "PRESS SPACE TO PLAY AGAIN", 0
 numBuf    BYTE "0000000", 0        ; scratch for the decimal HUD numbers
 
+; ---- the soundtrack: a looping A-minor chiptune (square lead + synth bass) ----
+; multi-voice ABC; V:1 = GM 80 (square lead), V:2 = GM 38 (synth bass), looped by
+; the midiOut player.  Built by the very ABC grammar this session finished.
+soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=140", 10, "%%MIDI program 1 80", 10, "%%MIDI program 2 38", 10, "K:Am", 10, "V:1", 10, "e2 a2 e2 c2 | d2 f2 e2 d2 | c2 e2 a2 g2 | e2 d2 c4 |", 10, "V:2", 10, "A,2 E,2 A,2 E,2 | D,2 A,2 E,2 E,2 | A,2 E,2 C2 G,2 | A,2 E,2 A,4 |", 10, 0
+
 .CODE
 .globl main
 main:
@@ -80,6 +85,7 @@ main:
     mov     edx, 15                  ; sample every 15 → 6 BMPs
     call    GameSelfTest
     call    GameLoop                 ; live window until Esc
+    call    MusicShutdown            ; stop + join the soundtrack thread
     call    AudioShutdown            ; join the mixer thread + close the device
     invoke  ExitProcess, 0
 
@@ -103,6 +109,12 @@ GameInit:
     lea     rcx, [rip + explodeBuf]
     lea     rdx, [rip + explodeFrames]
     call    CopySfx
+
+    ; --- start the looping soundtrack (ABC text -> midiOut scheduler thread) ---
+    mov     dword ptr [rip + gMusicLoop], 1
+    lea     rcx, [rip + soundtrack]
+    call    ParseTune                ; ABC -> the time-sorted tuneEv array
+    call    MusicInit                ; open MIDI_MAPPER + start the player thread
 
     call    ResetGame
     ret
@@ -664,3 +676,4 @@ GameSprites:
 .include "../library/harness.was"          ; window + loop + present + GameSelfTest
 .include "../library/introspect.was"       ; Snapshot (the self-test filmstrip)
 .include "../library/audio/sound/sound.was" ; the synth + the live waveOut mixer
+.include "../library/audio/music/abc.was"   ; the ABC parser + the midiOut player

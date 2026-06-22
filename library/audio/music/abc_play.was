@@ -44,6 +44,7 @@ hMusicThread QWORD  0                     ; scheduler thread handle (for the joi
 gMusicTid    DWORD  0                     ; thread id sink for CreateThread
 mStartMs     DWORD  0                     ; wall-clock base (GetTickCount at start)
 mMsg         DWORD  0                     ; staged dwMsg (invoke clobbers eax — trap #1)
+gMusicLoop   DWORD  0                     ; 1 = replay the tune from the top when it ends
 
 .CODE
 
@@ -94,8 +95,8 @@ proc MusicThread uses rbx rsi rdi r12 r13 r14 r15 frame in rcx
     lea     rsi, [rip + tuneEv]            ; &tuneEv[0]
 
 mtt_loop:
-    cmp     r12d, r13d                     ; i >= count -> done
-    jae     mtt_end
+    cmp     r12d, r13d                     ; i >= count -> tune finished
+    jae     mtt_wrap
 
     mov     eax, [rip + gMusicQuit]        ; atomic aligned DWORD read (no lock)
     test    eax, eax
@@ -142,6 +143,20 @@ mtt_send:
     inc     r12d
     jmp     mtt_loop
 
+mtt_wrap:
+    ; tune finished — replay from the top if looping (and not quitting), else stop.
+    mov     eax, [rip + gMusicQuit]
+    test    eax, eax
+    jnz     mtt_end
+    mov     eax, [rip + gMusicLoop]
+    test    eax, eax
+    jz      mtt_end
+    invoke  timeGetTime                    ; new wall-clock base for the replay
+    mov     [rip + mStartMs], eax
+    xor     r12d, r12d                     ; i = 0
+    lea     rsi, [rip + tuneEv]            ; back to &tuneEv[0]
+    jmp     mtt_loop
+
 mtt_end:
     invoke  midiOutReset, [rip + hmo]      ; all-notes-off (silence any held NoteOn)
     invoke  timeEndPeriod, 1
@@ -168,4 +183,5 @@ proc MusicShutdown frame
     mov     qword ptr [rip + hMusicThread], 0
     mov     qword ptr [rip + hmo], 0
     mov     dword ptr [rip + gMusicQuit], 0
+    mov     dword ptr [rip + gMusicLoop], 0
 endproc
