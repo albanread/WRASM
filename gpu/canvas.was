@@ -1,0 +1,664 @@
+; gpu/canvas.was — GPU Canvas G0 "spike": the D3D11 LUT background backend.
+;
+; The CPU canvas (library/) keeps a 320x200 indexed framebuffer and resolves it
+; through a palette on the CPU. This is the GPU mirror of that idea: a 640x360
+; *indexed* buffer (R8_UINT) lives in a GPU texture, and a pixel shader resolves
+; each index through palette LUT textures — the indexed soul stays alive, the
+; per-pixel work moves to the GPU. (docs/gpucanvas.md sections 4,5,6,9.)
+;
+; Public surface used by examples/gpu_spike.was:
+;   idxBuf      BYTE 640*360 dup(0)   — the index buffer the game writes into
+;   GpuInit(hwnd in rcx)              — device/swapchain/textures/shader; palettes
+;   GpuPresent                        — upload idxBuf, draw the fullscreen LUT pass, Present
+;   GpuSnapshot                       — backbuffer -> staging -> 24-bit BMP "gpu_g0.bmp"
+;   CanvasW / CanvasH                 — DWORD 640 / 360
+;
+; Built by adapting examples/mandel_gpu.was — same comobj / .Method COM idioms,
+; same .ASCIISTRING + D3DCompile, same struct..ends descriptors, same invoke ABI.
+; Every .DATA block opens with `.balign 16` (docs/gpucanvas.md §8 / help.md trap #8:
+; D3D structs + the shader source string are alignment-sensitive).
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The LUT background shader.
+;   VS  — fullscreen triangle from SV_VertexID, also forwards a 0..1 uv.
+;   PS  — px=int(uv.x*640), py=int(uv.y*360); fetch the index (integer .Load,
+;         NO sampler); resolve: low 16 through the per-line palette (this
+;         scanline's 16-colour row), 16..255 through the global 256 palette.
+; idx    : Texture2D<uint>  at t0  (R8_UINT, 640x360)
+; global : Texture2D<float4> at t1 (B8G8R8A8_UNORM, 256x1)
+; perLine: Texture2D<float4> at t2 (B8G8R8A8_UNORM, 16x360)
+; ---------------------------------------------------------------------------
+shaderSrc:
+.ASCIISTRING
+Texture2D<uint> idx:register(t0);
+Texture2D<float4> palGlobal:register(t1);
+Texture2D<float4> palLine:register(t2);
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO VS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float4 PS(VO v):SV_Target{
+int px=(int)(v.uv.x*640.0);int py=(int)(v.uv.y*360.0);
+px=clamp(px,0,639);py=clamp(py,0,359);
+uint c=idx.Load(int3(px,py,0));
+float4 col;
+if(c<16u){col=palLine.Load(int3((int)c,py,0));}else{col=palGlobal.Load(int3((int)c,0,0));}
+return float4(col.rgb,1.0);}
+.ENDASCIISTRING
+shaderEnd:
+    BYTE 0
+
+vsEntry   BYTE "VS", 0
+psEntry   BYTE "PS", 0
+vsTarget  BYTE "vs_4_0", 0
+psTarget  BYTE "ps_4_0", 0
+srcName   BYTE "gpucanvas", 0
+
+.balign 16
+; ---- public canvas geometry (games read these, never hardcode) ----
+.globl CanvasW
+.globl CanvasH
+CanvasW   DWORD 640
+CanvasH   DWORD 360
+
+; ---- the index buffer the game draws into (640x360, one byte = one index) ----
+.globl idxBuf
+idxBuf    BYTE 230400 dup(0)            ; 640*360
+
+; ---- palette LUTs, BGRA (B8G8R8A8_UNORM) one DWORD per colour ----
+;   palGlobalData : 256 entries (the global 240 + low 16 mirror).
+;   palLineData   : 16*360 entries — one 16-colour row per scanline, varied
+;                   top-to-bottom so the per-line path is visibly exercised.
+.globl palGlobalData
+palGlobalData  DWORD 256 dup(0)         ; 256 * 4 = 1024 bytes
+.globl palLineData
+palLineData    DWORD 5760 dup(0)        ; 16*360 * 4 = 23040 bytes
+
+.balign 16
+; ---- COM objects (typed pointers + a type binding) ----
+comobj pDevice     : ID3D11Device
+comobj pContext    : ID3D11DeviceContext
+comobj pSwap       : IDXGISwapChain
+comobj pBackBuffer : ID3D11Texture2D
+comobj pVSBlob     : ID3DBlob
+comobj pPSBlob     : ID3DBlob
+comobj pTexIdx     : ID3D11Texture2D    ; the 640x360 R8_UINT index texture
+comobj pTexGlobal  : ID3D11Texture2D    ; 256x1 global palette
+comobj pTexLine    : ID3D11Texture2D    ; 16x360 per-line palette
+comobj pStaging    : ID3D11Texture2D    ; 1280x720 RGBA readback target
+
+pRTV       QWORD ?
+pVS        QWORD ?
+pPS        QWORD ?
+pRast      QWORD ?
+pErrBlob   QWORD ?
+pSRVidx    QWORD ?
+pSRVglobal QWORD ?
+pSRVline   QWORD ?
+tmpPtr     QWORD ?
+tmpSize    QWORD ?
+srcLen     QWORD ?
+
+iid_tex2d:
+    iid ID3D11Texture2D                 ; GetBuffer wants this interface's IID
+
+.balign 16
+; ---- descriptors --------------------------------------------------------
+; swap chain: 1280x720, R8G8B8A8_UNORM, render-target-output, single buffer,
+; DISCARD (the demo path; FLIP_DISCARD is the later upgrade).
+scd struct DXGI_SWAP_CHAIN_DESC
+    BufferCount       = 1
+    BufferDesc.Width  = 1280
+    BufferDesc.Height = 720
+    BufferDesc.Format = 28               ; DXGI_FORMAT_R8G8B8A8_UNORM
+    BufferUsage       = 0x20             ; DXGI_USAGE_RENDER_TARGET_OUTPUT
+    SampleDesc.Count  = 1
+    Windowed          = 1
+    SwapEffect        = 0                ; DXGI_SWAP_EFFECT_DISCARD
+    OutputWindow      = 0                ; patched with the HWND at runtime
+ends
+
+; index texture: 640x360, R8_UINT, DEFAULT usage, BIND_SHADER_RESOURCE.
+tdIdx struct D3D11_TEXTURE2D_DESC
+    Width            = 640
+    Height           = 360
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 62                ; DXGI_FORMAT_R8_UINT
+    SampleDesc.Count = 1
+    Usage            = 0                  ; D3D11_USAGE_DEFAULT
+    BindFlags        = 8                  ; D3D11_BIND_SHADER_RESOURCE
+ends
+
+; global palette: 256x1, B8G8R8A8_UNORM.
+tdGlobal struct D3D11_TEXTURE2D_DESC
+    Width            = 256
+    Height           = 1
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 87                ; DXGI_FORMAT_B8G8R8A8_UNORM
+    SampleDesc.Count = 1
+    Usage            = 0
+    BindFlags        = 8
+ends
+
+; per-line palette: 16x360, B8G8R8A8_UNORM.
+tdLine struct D3D11_TEXTURE2D_DESC
+    Width            = 16
+    Height           = 360
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 87
+    SampleDesc.Count = 1
+    Usage            = 0
+    BindFlags        = 8
+ends
+
+; staging readback: 1280x720, R8G8B8A8_UNORM, STAGING + CPU_ACCESS_READ.
+tdStaging struct D3D11_TEXTURE2D_DESC
+    Width            = 1280
+    Height           = 720
+    MipLevels        = 1
+    ArraySize        = 1
+    Format           = 28
+    SampleDesc.Count = 1
+    Usage            = 3                  ; D3D11_USAGE_STAGING
+    BindFlags        = 0
+    CPUAccessFlags   = 0x20000            ; D3D11_CPU_ACCESS_READ
+ends
+
+; SRV descriptors. Format + ViewDimension=TEXTURE2D(4); the anonymous union at
+; +8 is D3D11_TEX2D_SRV{ MostDetailedMip(+8), MipLevels(+12) } — MipLevels=1.
+srvIdx struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 62                   ; R8_UINT
+    ViewDimension = 4                    ; D3D11_SRV_DIMENSION_TEXTURE2D
+ends
+srvGlobal struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 87                   ; B8G8R8A8_UNORM
+    ViewDimension = 4
+ends
+srvLine struct D3D11_SHADER_RESOURCE_VIEW_DESC
+    Format        = 87
+    ViewDimension = 4
+ends
+
+; subresource upload descriptors. pSysMem patched at runtime; pitch is the
+; source row stride in BYTES (R8 -> width; BGRA -> width*4).
+sdIdx struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 640
+ends
+sdGlobal struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 1024                   ; 256 * 4
+ends
+sdLine struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch = 64                     ; 16 * 4
+ends
+
+vp struct D3D11_VIEWPORT
+    Width    = 0x44A00000                ; 1280.0f
+    Height   = 0x44340000                ; 720.0f
+    MaxDepth = 0x3F800000                ; 1.0f
+ends
+
+rdesc struct D3D11_RASTERIZER_DESC
+    FillMode = 3                         ; D3D11_FILL_SOLID
+    CullMode = 1                         ; D3D11_CULL_NONE
+ends
+
+mapped    BYTE 16 dup(0)                 ; D3D11_MAPPED_SUBRESOURCE out (pData, RowPitch, DepthPitch)
+clearCol  DWORD 0, 0, 0, 0x3F800000      ; black, A=1
+
+.balign 16
+; ---- BMP snapshot state --------------------------------------------------
+; 54-byte header: file(14) + info(40). 1280x720, 24bpp. The height is stored
+; NEGATIVE (top-down) so row 0 of the staging texture is the top of the image.
+;   0x00050000 = 1280 width ; -720 = 0xFFFFFD30 height ; biBitCount=24
+; biSizeImage = 1280*3 padded-to-4 (=3840) * 720 = 2764800 = 0x002A3000
+; bfOffBits = 54 = 0x36 ; bfSize = 54 + 2764800 = 0x002A3036
+bmpName   WCHAR "E:/RASM/examples/gpu_g0.bmp", 0
+bmpWrote  DWORD ?
+bmpFile   QWORD ?
+bmpHdr:
+    BYTE 0x42, 0x4D                       ; "BM"
+    BYTE 0x36, 0x30, 0x2A, 0x00           ; bfSize = 0x002A3036
+    BYTE 0x00, 0x00, 0x00, 0x00           ; reserved
+    BYTE 0x36, 0x00, 0x00, 0x00           ; bfOffBits = 54
+    BYTE 0x28, 0x00, 0x00, 0x00           ; biSize = 40
+    BYTE 0x00, 0x05, 0x00, 0x00           ; biWidth = 1280
+    BYTE 0x30, 0xFD, 0xFF, 0xFF           ; biHeight = -720 (top-down)
+    BYTE 0x01, 0x00                       ; biPlanes = 1
+    BYTE 0x18, 0x00                       ; biBitCount = 24
+    BYTE 0x00, 0x00, 0x00, 0x00           ; biCompression = BI_RGB
+    BYTE 0x00, 0x30, 0x2A, 0x00           ; biSizeImage = 0x002A3000
+    BYTE 0x00, 0x00, 0x00, 0x00           ; biXPelsPerMeter
+    BYTE 0x00, 0x00, 0x00, 0x00           ; biYPelsPerMeter
+    BYTE 0x00, 0x00, 0x00, 0x00           ; biClrUsed
+    BYTE 0x00, 0x00, 0x00, 0x00           ; biClrImportant
+
+; one 1280*3 = 3840-byte BGR scratch row (already 4-byte aligned, no pad needed)
+bmpRow    BYTE 3840 dup(0)
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; GpuInit(hwnd) — hwnd in rcx. Build palettes, create device+swapchain on the
+; given window, create + upload all textures, compile the shader. On any D3D
+; failure jumps to a fail_* exit (small distinct exit codes, like the demos).
+; ===========================================================================
+.globl GpuInit
+GpuInit:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 40                       ; align + shadow space
+
+    mov     [rip + scd + DXGI_SWAP_CHAIN_DESC.OutputWindow], rcx
+
+    ; The SRV descriptors' anonymous union (D3D11_TEX2D_SRV at +8) can't be set by
+    ; the struct macro (it's one opaque leaf), so patch MipLevels=1 at +12 here —
+    ; MostDetailedMip at +8 is already 0. MipLevels=0 makes CreateSRV fail.
+    mov     dword ptr [rip + srvIdx + 12], 1
+    mov     dword ptr [rip + srvGlobal + 12], 1
+    mov     dword ptr [rip + srvLine + 12], 1
+
+    call    BuildPalettes
+
+    ; ---- device + swapchain ----
+    invoke  D3D11CreateDeviceAndSwapChain, 0, 1, 0, 0, 0, 0, 7, scd, pSwap, pDevice, featureLevel, pContext
+    test    eax, eax
+    js      gi_fail_device
+
+    pSwap.GetBuffer(0, iid_tex2d, pBackBuffer)
+    test    eax, eax
+    js      gi_fail_d3d
+    pDevice.CreateRenderTargetView([rip + pBackBuffer], 0, pRTV)
+    test    eax, eax
+    js      gi_fail_d3d
+    pBackBuffer.Release()
+
+    ; ---- compile the shaders ----
+    lea     rax, [rip + shaderEnd]
+    lea     rcx, [rip + shaderSrc]
+    sub     rax, rcx
+    mov     [rip + srcLen], rax
+    invoke  D3DCompile, shaderSrc, [rip + srcLen], srcName, 0, 0, vsEntry, vsTarget, 0, 0, pVSBlob, pErrBlob
+    test    eax, eax
+    js      gi_fail_compile
+    invoke  D3DCompile, shaderSrc, [rip + srcLen], srcName, 0, 0, psEntry, psTarget, 0, 0, pPSBlob, pErrBlob
+    test    eax, eax
+    js      gi_fail_compile
+
+    pVSBlob.GetBufferPointer()
+    mov     [rip + tmpPtr], rax
+    pVSBlob.GetBufferSize()
+    mov     [rip + tmpSize], rax
+    pDevice.CreateVertexShader([rip + tmpPtr], [rip + tmpSize], 0, pVS)
+    test    eax, eax
+    js      gi_fail_d3d
+    pPSBlob.GetBufferPointer()
+    mov     [rip + tmpPtr], rax
+    pPSBlob.GetBufferSize()
+    mov     [rip + tmpSize], rax
+    pDevice.CreatePixelShader([rip + tmpPtr], [rip + tmpSize], 0, pPS)
+    test    eax, eax
+    js      gi_fail_d3d
+
+    ; rasterizer: cull off so the fullscreen triangle always draws.
+    pDevice.CreateRasterizerState(rdesc, pRast)
+    test    eax, eax
+    js      gi_fail_d3d
+
+    ; ---- index texture (uploaded fresh each frame in GpuPresent, but create
+    ;      it with an initial copy of idxBuf so SRV is valid immediately) ----
+    lea     rax, [rip + idxBuf]
+    mov     [rip + sdIdx + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdIdx, sdIdx, pTexIdx)
+    test    eax, eax
+    js      gi_fail_d3d
+    pDevice.CreateShaderResourceView([rip + pTexIdx], srvIdx, pSRVidx)
+    test    eax, eax
+    js      gi_fail_d3d
+
+    ; ---- global palette texture + SRV ----
+    lea     rax, [rip + palGlobalData]
+    mov     [rip + sdGlobal + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdGlobal, sdGlobal, pTexGlobal)
+    test    eax, eax
+    js      gi_fail_d3d
+    pDevice.CreateShaderResourceView([rip + pTexGlobal], srvGlobal, pSRVglobal)
+    test    eax, eax
+    js      gi_fail_d3d
+
+    ; ---- per-line palette texture + SRV ----
+    lea     rax, [rip + palLineData]
+    mov     [rip + sdLine + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateTexture2D(tdLine, sdLine, pTexLine)
+    test    eax, eax
+    js      gi_fail_d3d
+    pDevice.CreateShaderResourceView([rip + pTexLine], srvLine, pSRVline)
+    test    eax, eax
+    js      gi_fail_d3d
+
+    ; ---- staging readback texture (for GpuSnapshot) ----
+    pDevice.CreateTexture2D(tdStaging, 0, pStaging)
+    test    eax, eax
+    js      gi_fail_d3d
+
+    xor     eax, eax                       ; success
+    add     rsp, 40
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+gi_fail_compile:
+    invoke  ExitProcess, 5
+gi_fail_d3d:
+    invoke  ExitProcess, 3
+gi_fail_device:
+    invoke  ExitProcess, 2
+
+; ===========================================================================
+; GpuPresent — upload the current idxBuf to the index texture, run the
+; fullscreen LUT pass into the back buffer, Present. Palettes were uploaded at
+; create time; re-uploading them here would let a game cycle them (left as a
+; later hook — re-create-via-UpdateSubresource is the cheap path).
+; ===========================================================================
+.globl GpuPresent
+GpuPresent:
+    push    rbx
+    sub     rsp, 32
+
+    ; refresh the index texture from idxBuf (UpdateSubresource, full subresource,
+    ; box=NULL, srcRowPitch=640, srcDepthPitch=0).
+    pContext.UpdateSubresource([rip + pTexIdx], 0, 0, idxBuf, 640, 0)
+
+    pContext.OMSetRenderTargets(1, pRTV, 0)
+    pContext.ClearRenderTargetView([rip + pRTV], clearCol)
+    pContext.RSSetViewports(1, vp)
+    pContext.RSSetState([rip + pRast])
+    pContext.VSSetShader([rip + pVS], 0, 0)
+    pContext.PSSetShader([rip + pPS], 0, 0)
+
+    ; bind the three SRVs at t0,t1,t2. PSSetShaderResources(StartSlot, NumViews,
+    ; ppShaderResourceViews) — needs a contiguous array of 3 SRV pointers.
+    mov     rax, [rip + pSRVidx]            ; build an explicit contiguous array of
+    mov     [rip + srvArray + 0], rax       ; the 3 SRV pointers (t0,t1,t2) — don't
+
+    mov     rax, [rip + pSRVglobal]         ; rely on declared adjacency.
+    mov     [rip + srvArray + 8], rax
+    mov     rax, [rip + pSRVline]
+    mov     [rip + srvArray + 16], rax
+    pContext.PSSetShaderResources(0, 3, srvArray)
+
+    pContext.IASetPrimitiveTopology(4)     ; TRIANGLELIST
+    pContext.Draw(3, 0)
+    pSwap.Present(1, 0)
+
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; GpuSnapshot — CopyResource(staging, backbuffer); Map; write a 24-bit BMP
+; (RGBA -> BGR, honouring the mapped RowPitch); Unmap. Reuses the introspect.was
+; idea (a headless BMP we can Read), adapted to a GPU staging readback.
+; ===========================================================================
+.globl GpuSnapshot
+GpuSnapshot:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    sub     rsp, 40
+
+    ; need a fresh back buffer reference (the RTV holds one but Map needs the
+    ; texture). Re-fetch buffer 0.
+    pSwap.GetBuffer(0, iid_tex2d, pBackBuffer)
+    test    eax, eax
+    js      gs_fail_get
+
+    pContext.CopyResource([rip + pStaging], [rip + pBackBuffer])
+    pBackBuffer.Release()
+
+    ; Map(pResource, Subresource=0, MapType=D3D11_MAP_READ(1), MapFlags=0, &mapped)
+    pContext.Map([rip + pStaging], 0, 1, 0, mapped)
+    test    eax, eax
+    js      gs_fail_map
+
+    ; open the file
+    invoke  CreateFileW, bmpName, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     [rip + bmpFile], rax            ; keep handle in memory (invoke clobbers rbx)
+    cmp     rax, -1                          ; INVALID_HANDLE_VALUE
+    je      gs_fail_file
+    invoke  WriteFile, [rip + bmpFile], bmpHdr, 54, bmpWrote, 0
+    test    eax, eax
+    jz      gs_fail_write
+
+    ; rsi = mapped.pData ; r13 = RowPitch (src stride, RGBA, may be padded)
+    mov     rsi, [rip + mapped + 0]
+    mov     r13d, dword ptr [rip + mapped + 8]
+    xor     r12d, r12d                      ; r12 = row counter (0..719)
+gs_row:
+    cmp     r12d, 720
+    jge     gs_endrows
+    ; build one 3840-byte BGR row from this RGBA source row
+    lea     rdi, [rip + bmpRow]             ; dst BGR
+    mov     rcx, rsi                        ; src RGBA for this row
+    xor     r14d, r14d                      ; pixel x (0..1279)
+gs_px:
+    cmp     r14d, 1280
+    jge     gs_emit
+    ; src RGBA at rcx: [0]=R [1]=G [2]=B [3]=A ; dst BGR = B,G,R
+    mov     al, [rcx + 2]                   ; B
+    mov     [rdi + 0], al
+    mov     al, [rcx + 1]                   ; G
+    mov     [rdi + 1], al
+    mov     al, [rcx + 0]                   ; R
+    mov     [rdi + 2], al
+    add     rcx, 4
+    add     rdi, 3
+    inc     r14d
+    jmp     gs_px
+gs_emit:
+    invoke  WriteFile, [rip + bmpFile], bmpRow, 3840, bmpWrote, 0
+    add     rsi, r13                        ; next source row (RowPitch bytes)
+    inc     r12d
+    jmp     gs_row
+gs_endrows:
+    invoke  CloseHandle, [rip + bmpFile]
+    pContext.Unmap([rip + pStaging], 0)
+    jmp     gs_done
+gs_fail_file:
+    ; the file failed to open but Map() already succeeded — release the GPU map
+    ; before returning so we don't leak the staging map.
+    pContext.Unmap([rip + pStaging], 0)
+gs_fail_get:
+gs_fail_map:
+    ; snapshot is a diagnostic; on any failure just return without crashing.
+    ; (gs_fail_get / gs_fail_map hold no map, so they skip the Unmap above.)
+    add     rsp, 40
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+gs_fail_write:
+    ; WriteFile failed after Map() succeeded and the file was opened — close the
+    ; handle and release the GPU map so neither leaks.
+    invoke  CloseHandle, [rip + bmpFile]
+    pContext.Unmap([rip + pStaging], 0)
+    add     rsp, 40
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+gs_done:
+    add     rsp, 40
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildPalettes — fill palGlobalData (256 BGRA) and palLineData (16*360 BGRA).
+;   global[0..15]   : a CGA-ish 16 (also the fallback for the low range)
+;   global[16..255] : a smooth colour ramp across the index range
+;   perLine[row r]  : 16 colours that shift hue with the scanline r, so the
+;                     per-line path shows visible top-to-bottom variation.
+; All entries are 0xAARRGGBB stored as B,G,R,A bytes (B8G8R8A8_UNORM, little
+; endian => DWORD 0xFFRRGGBB lands as B,G,R,A in memory).
+; ===========================================================================
+BuildPalettes:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8
+
+    ; ---- global[0..15] = CGA palette (DWORD 0xFFRRGGBB) ----
+    lea     rdi, [rip + palGlobalData]
+    lea     rsi, [rip + cgaTable]
+    mov     ecx, 16
+bp_cga:
+    mov     eax, [rsi]
+    mov     [rdi], eax
+    add     rsi, 4
+    add     rdi, 4
+    dec     ecx
+    jnz     bp_cga
+
+    ; ---- global[16..255] = ramp. For index i (16..255), t=i-16 (0..239):
+    ;        R = t                 (0..239)
+    ;        G = (t*2) & 0xFF
+    ;        B = 255 - t           (255..16)
+    ;      packed 0xFF<R><G><B>. ----
+    mov     ecx, 16                          ; index i
+bp_ramp:
+    cmp     ecx, 256
+    jge     bp_ramp_done
+    mov     eax, ecx
+    sub     eax, 16                          ; t = i-16  (0..239), r12=t
+    mov     r12d, eax
+    ; B byte (bits 0..7) = 255 - t
+    mov     edx, 255
+    sub     edx, r12d
+    and     edx, 0xFF
+    ; G byte (bits 8..15) = (t*2)&0xFF
+    mov     r8d, r12d
+    shl     r8d, 1
+    and     r8d, 0xFF
+    shl     r8d, 8
+    or      edx, r8d
+    ; R byte (bits 16..23) = t&0xFF
+    mov     r9d, r12d
+    and     r9d, 0xFF
+    shl     r9d, 16
+    or      edx, r9d
+    ; A byte (bits 24..31) = 0xFF
+    or      edx, 0xFF000000
+    ; store at palGlobalData[i]
+    lea     rdi, [rip + palGlobalData]
+    mov     eax, ecx
+    shl     eax, 2
+    mov     [rdi + rax], edx
+    inc     ecx
+    jmp     bp_ramp
+bp_ramp_done:
+
+    ; ---- per-line palette: palLineData[row*16 + c] for row=0..359, c=0..15.
+    ;      Make colour c at row r = HSV-ish wheel that rotates with r:
+    ;        base = cgaTable[c] but tinted: we just synthesize
+    ;          R = (c*16 + r) & 0xFF
+    ;          G = (c*8  + r*2) & 0xFF
+    ;          B = (255 - r*255/360) & 0xFF      (sky-ish gradient down)
+    ;      colour 0 we keep dark so it reads as a background.
+    lea     rdi, [rip + palLineData]
+    xor     r13d, r13d                       ; r = row (0..359)
+bp_line_row:
+    cmp     r13d, 360
+    jge     bp_line_done
+    ; precompute B for this row = 255 - (r*255/360)
+    mov     eax, r13d
+    imul    eax, eax, 255
+    mov     ecx, 360
+    cdq
+    idiv    ecx                              ; eax = r*255/360
+    mov     r14d, 255
+    sub     r14d, eax                        ; r14 = B for this row (0..255)
+    and     r14d, 0xFF
+    xor     r15d, r15d                       ; c = colour (0..15)
+bp_line_col:
+    cmp     r15d, 16
+    jge     bp_line_colend
+    test    r15d, r15d
+    jnz     bp_line_real
+    ; colour 0 = near-black background
+    mov     edx, 0xFF101018
+    jmp     bp_line_store
+bp_line_real:
+    ; R = (c*16 + r) & 0xFF
+    mov     eax, r15d
+    shl     eax, 4
+    add     eax, r13d
+    and     eax, 0xFF
+    mov     edx, eax                         ; R in low byte temporarily
+    shl     edx, 16                          ; -> bits 16..23
+    ; G = (c*8 + r*2) & 0xFF
+    mov     eax, r15d
+    shl     eax, 3
+    mov     ecx, r13d
+    shl     ecx, 1
+    add     eax, ecx
+    and     eax, 0xFF
+    shl     eax, 8
+    or      edx, eax
+    ; B = r14 (row gradient)
+    or      edx, r14d
+    or      edx, 0xFF000000                  ; A
+bp_line_store:
+    mov     [rdi], edx
+    add     rdi, 4
+    inc     r15d
+    jmp     bp_line_col
+bp_line_colend:
+    inc     r13d
+    jmp     bp_line_row
+bp_line_done:
+
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+; CGA-ish 16-colour table, 0xFFRRGGBB. (Index 0 black, classic 16.)
+cgaTable:
+    DWORD 0xFF000000, 0xFF0000AA, 0xFF00AA00, 0xFF00AAAA
+    DWORD 0xFFAA0000, 0xFFAA00AA, 0xFFAA5500, 0xFFAAAAAA
+    DWORD 0xFF555555, 0xFF5555FF, 0xFF55FF55, 0xFF55FFFF
+    DWORD 0xFFFF5555, 0xFFFF55FF, 0xFFFFFF55, 0xFFFFFFFF
+
+.balign 16
+srvArray   QWORD 0, 0, 0                     ; scratch: 3 SRV pointers for PSSetShaderResources
+featureLevel DWORD 0

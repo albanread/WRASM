@@ -1,0 +1,170 @@
+; gpu_spike.was — GPU Canvas G0 "spike" driver.
+;
+;   was examples\gpu_spike.was -o gpu_g0.exe   &&   gpu_g0.exe
+;
+; Opens a 1280x720 window, brings up the D3D11 LUT backend (gpu/canvas.was),
+; fills the 640x360 index buffer with a test pattern that exercises BOTH palette
+; resolve paths, presents every frame, and dumps examples/gpu_g0.bmp on frame 1.
+;
+; Test pattern (640 wide, 360 tall):
+;   LEFT half  (x 0..319)  : the GLOBAL ramp. index = 16 + (x*240/320), so the
+;                            whole 16..255 global palette sweeps left-to-right.
+;   RIGHT half (x 320..639): the PER-LINE path. 15 vertical bars cycling indices
+;                            1..15; because the per-line palette varies with the
+;                            scanline, each bar shows a visible top-to-bottom
+;                            colour gradient — proof the per-line LUT is live.
+;
+; Two verification gates (docs/gpucanvas.md §8): a live window (MainWindowHandle
+; != 0) AND the BMP readback we can Read.
+
+.include "../gpu/canvas.was"
+
+.DATA
+.balign 16
+className   WCHAR  "rasm_gpu_spike", 0
+titleText   WCHAR  "RASM — GPU Canvas G0 spike (640x360 indexed @ 720p)", 0
+wc          BYTE   80 dup(0)
+msg         BYTE   48 dup(0)
+hwndSave    QWORD  ?
+winRect     BYTE   16 dup(0)
+winW        DWORD  ?
+winH        DWORD  ?
+didSnap     DWORD  0
+
+.balign 16
+.CODE
+.globl main
+main:
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+
+    ; size the window so the CLIENT area is exactly 1280x720.
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 1280
+    mov     dword ptr [rdi + 12], 720
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + winH], eax
+
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail_window
+
+    call    FillPattern
+
+    ; bring up the GPU backend on this window (hwnd in rcx)
+    mov     rcx, [rip + hwndSave]
+    call    GpuInit
+
+    call    GpuPresent                       ; first frame
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail_window:
+    invoke  ExitProcess, 1
+
+; ---------------------------------------------------------------------------
+; FillPattern — write the 640x360 test pattern into idxBuf.
+;   rdi walks idxBuf row by row. For each (x,y):
+;     x < 320 : index = 16 + (x * 240 / 320)    -> global ramp (16..255)
+;     x >=320 : index = 1 + ((x-320) / 8) % 15  -> bars of 1..15 (per-line)
+; ---------------------------------------------------------------------------
+FillPattern:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    lea     rdi, [rip + idxBuf]
+    xor     r12d, r12d                        ; y
+fp_row:
+    cmp     r12d, 360
+    jge     fp_done
+    xor     r13d, r13d                        ; x
+fp_col:
+    cmp     r13d, 640
+    jge     fp_rowend
+    cmp     r13d, 320
+    jge     fp_right
+    ; left: index = 16 + x*240/320
+    mov     eax, r13d
+    imul    eax, eax, 240
+    mov     ecx, 320
+    cdq
+    idiv    ecx
+    add     eax, 16
+    jmp     fp_store
+fp_right:
+    ; right: bar = (x-320)/8 ; index = 1 + (bar % 15)
+    mov     eax, r13d
+    sub     eax, 320
+    shr     eax, 3                            ; /8  -> 0..39
+    xor     edx, edx
+    mov     ecx, 15
+    div     ecx                               ; edx = bar % 15  (0..14)
+    lea     eax, [edx + 1]                    ; 1..15
+fp_store:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     fp_col
+fp_rowend:
+    inc     r12d
+    jmp     fp_row
+fp_done:
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 2                            ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                          ; WM_TIMER
+    je      wp_timer
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    call    GpuPresent
+    ; dump the BMP exactly once, after the first presented frame is on the back buffer
+    mov     eax, [rip + didSnap]
+    test    eax, eax
+    jnz     wp_timer_done
+    mov     dword ptr [rip + didSnap], 1
+    call    GpuSnapshot
+wp_timer_done:
+    xor     eax, eax
+    ret

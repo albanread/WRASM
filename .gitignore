@@ -9,3 +9,9 @@ studio_shot_*.png
 *.bmp
 snap_*.png
 snap_*.bmp
+
+# GPU canvas verification scratch
+tmp_*.exe
+examples/gpu_*.bmp
+examples/gpu_*.png
+examples/snap_*.bmp
