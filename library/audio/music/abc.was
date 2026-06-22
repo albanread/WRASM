@@ -47,10 +47,13 @@
 ;   per-voice instruments via %%MIDI program <prog> / <chan> <prog> (emits a
 ;     0xC0 ProgramChange);  % line comments and %% stylesheet lines (skipped);
 ;   chords [CEG] — N notes share one onset + one duration + one offset, with the
-;     duration taken from AFTER the ']' (see abc_chord.was).
+;     duration taken from AFTER the ']' (see abc_chord.was);
+;   repeats |: :| and first/second endings |1 |2 — replayed by JUMPING the text
+;     cursor back and re-parsing, while curMs keeps advancing so the replay lands
+;     at later timestamps (see abc_repeat.was).  ONE level only — no nesting.
 ;
 ; --- DEFERRED (no-ops / skipped, NOT implemented) ---
-;   repeats |: :| , ties - , tuplets (p , broken rhythm > < ,
+;   ties - , tuplets (p , broken rhythm > < , nested repeats,
 ;   inline fields [K:..] , grace {} , trailing duration dots, minor/mode key
 ;   qualifiers (only the root letter + one optional #/b is read for the key sig).
 ; ============================================================================
@@ -62,6 +65,7 @@
 .include "abc_note.was"
 .include "abc_voice.was"
 .include "abc_chord.was"
+.include "abc_repeat.was"
 .include "abc_parse.was"
 .include "abc_finalize.was"
 .include "abc_play.was"

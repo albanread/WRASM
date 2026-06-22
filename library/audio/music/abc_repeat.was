@@ -1,0 +1,114 @@
+; abc_repeat.was — repeats |: :| and first/second endings |1 |2 (Sprint M-C).
+; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included in
+; the shell BEFORE abc_parse.was so the body bar/colon dispatch can call these.
+;
+; THE REPEAT MODEL — replay via a CURSOR JUMP-BACK -----------------------------
+; A repeated section is NOT copied.  We literally re-parse the text: on a ":|"
+; the cursor (the global `txtPtr`) is set back to the position just AFTER the
+; matching "|:" and pt_loop runs the same characters again.  Crucially the
+; running clock `curMs` is NOT rewound — it keeps advancing — so the replayed
+; notes get LATER timestamps.  FinalizeTune then sorts everything by time, so the
+; section simply appears twice, back-to-back, in the event stream.  No event
+; copying, no second buffer: the parser's own forward motion does the work.
+;
+; State (abc_data.inc):
+;   repStart  the cursor just AFTER the last "|:"   (the jump-back target)
+;   repArmed  1 = a "|:" was seen and the next ":|" will jump back
+;   repPass   1 = first pass through the section, 2 = the replay pass
+;
+; ONE LEVEL ONLY — no nesting.  A second "|:" simply overwrites repStart/arms
+; again; an inner ":|" jumps to the most recent "|:".  Nested repeats are NOT
+; supported (and not required by this sprint).
+;
+; ENDINGS — |1 (first) and |2 (second) select by pass:
+;   pass 1: play the |1 ending, then ":|" jumps back and sets pass 2.
+;   pass 2: at |1 we SKIP forward past the next ":|" (so the first ending is not
+;           replayed), landing on the |2 second ending, which is then played.
+; |2 itself is just a marker reached only on pass 2 (the dispatch consumes it and
+; continues); the notes after it play normally.
+; Both the pipe form (|1 |2) and the bracket form ([1 [2) are accepted; third+
+; endings (|3 etc.) are NOT supported (treated as a plain bar).
+; ----------------------------------------------------------------------------
+
+; ----------------------------------------------------------------------------
+; RepeatOpen: handle "|:".  txtPtr is already positioned JUST PAST the "|:".
+;   repStart = txtPtr   (replay target)
+;   repArmed = 1        (the next ":|" will jump)
+;   repPass  = 1        (we are on the first pass)
+; Leaf (no calls) -> no frame.
+; ----------------------------------------------------------------------------
+proc RepeatOpen
+    mov     rax, [rip + txtPtr]
+    mov     [rip + repStart], rax
+    mov     eax, [rip + curVoice]
+    mov     [rip + repVoice], eax      ; the repeat belongs to THIS voice
+    mov     dword ptr [rip + repArmed], 1
+    mov     dword ptr [rip + repPass], 1
+endproc
+
+; ----------------------------------------------------------------------------
+; RepeatClose: handle ":|".  txtPtr is already positioned JUST PAST the ":|".
+;   if repArmed == 1:  jump back -> txtPtr = repStart; repArmed = 0; repPass = 2.
+;   else:              do nothing (continue past it) — a stray ":|" must NOT loop.
+; Disarming (repArmed = 0) is what guarantees termination: the SECOND time we
+; reach this ":|" (now on pass 2) it is no longer armed, so we fall through and
+; the section is not replayed a third time.
+; Leaf (no calls) -> no frame.
+; ----------------------------------------------------------------------------
+proc RepeatClose
+    mov     eax, [rip + repArmed]
+    test    eax, eax
+    jz      rc_finish                  ; not armed -> repeat finished / stray ":|"
+    ; the repeat state is GLOBAL; only jump if THIS voice armed it — else a ":|"
+    ; reached after a V: switch would replay voice 1's text on voice 2's channel.
+    mov     eax, [rip + repVoice]
+    cmp     eax, [rip + curVoice]
+    jne     rc_done                    ; armed by another voice -> ignore (leave state)
+    mov     rax, [rip + repStart]
+    mov     [rip + txtPtr], rax        ; jump the cursor back to after "|:"
+    mov     dword ptr [rip + repArmed], 0
+    mov     dword ptr [rip + repPass], 2
+    jmp     rc_done
+rc_finish:
+    ; repeat done (disarmed 2nd pass) or a stray ":|": reset the pass so a later
+    ; orphan "|1"/"|2" (no enclosing "|:") is a normal first ending, not a skip.
+    mov     dword ptr [rip + repPass], 1
+rc_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; EndingFirst: handle "|1".  txtPtr is already positioned JUST PAST the "|1".
+;   if repPass == 2:  SKIP this first ending — scan txtPtr forward until a ":|"
+;                     is found AND consumed, then continue (lands on "|2").
+;   else:             do nothing (continue) — pass 1 plays the first ending.
+; Robustness: the forward scan stops at NUL or newline (a malformed "|1" with no
+; later ":|") without running off the buffer — txtPtr is left at the stop point.
+; Leaf (no calls) -> no frame.  rsi is the scan cursor (saved by `uses`).
+; ----------------------------------------------------------------------------
+proc EndingFirst uses rsi
+    mov     eax, [rip + repPass]
+    cmp     eax, 2
+    jne     ef_done                    ; pass 1 -> play the first ending
+
+    ; pass 2 -> scan forward for ":|" and consume it.
+    mov     rsi, [rip + txtPtr]
+ef_scan:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      ef_stop                    ; NUL -> stop gracefully (malformed)
+    cmp     al, 10                     ; newline -> stop gracefully (malformed)
+    je      ef_stop
+    cmp     al, ':'
+    jne     ef_next
+    movzx   eax, byte ptr [rsi + 1]
+    cmp     al, '|'
+    jne     ef_next                    ; a bare ':' -> keep scanning
+    add     rsi, 2                     ; consume the ":|"
+    jmp     ef_stop
+ef_next:
+    inc     rsi
+    jmp     ef_scan
+ef_stop:
+    mov     [rip + txtPtr], rsi
+ef_done:
+endproc

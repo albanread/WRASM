@@ -19,6 +19,11 @@ proc ParseTune uses rsi rbx frame in rcx
     mov     dword ptr [rip + tsD], 4
     mov     dword ptr [rip + inBody], 0
 
+    ; --- reset repeat / ending state (Sprint M-C) ---
+    mov     qword ptr [rip + repStart], 0
+    mov     dword ptr [rip + repArmed], 0
+    mov     dword ptr [rip + repPass], 1
+
     ; --- reset per-voice state: active voice 0, vChan[i]=i, clocks/programs 0 ---
     mov     dword ptr [rip + curVoice], 0
     mov     dword ptr [rip + curChan], 0
@@ -256,6 +261,8 @@ pt_body:
     movzx   eax, byte ptr [rsi]
     cmp     al, '|'
     je      pt_b_bar
+    cmp     al, ':'                   ; ":|" close-repeat (a bare ':' is skipped)
+    je      pt_b_colon
     cmp     al, 'z'
     je      pt_b_rest
     cmp     al, 'Z'
@@ -317,10 +324,28 @@ pt_b_lbrack:
     cmp     al, 'g'
     jbe     pt_b_chord
 pt_b_lbrack_other:
-    ; not a note start: voice switch [V:..] or an inline field [X:..]
+    ; not a note start: voice switch [V:..], bracket ending [1/[2, or inline field
     cmp     al, 'V'
     je      pt_b_inlineV
+    cmp     al, '1'                   ; "[1" first ending (bracket form of |1)
+    je      pt_b_lend1
+    cmp     al, '2'                   ; "[2" second ending (bracket form of |2)
+    je      pt_b_lend2
     jmp     pt_b_inlinefield          ; any other [X:..] -> skip through ']'
+
+pt_b_lend1:
+    call    ResetBar
+    mov     rsi, [rip + txtPtr]
+    add     rsi, 2                    ; past "[1"
+    mov     [rip + txtPtr], rsi
+    call    EndingFirst               ; pass 2 -> skip forward past the next ":|"
+    jmp     pt_loop
+pt_b_lend2:
+    call    ResetBar
+    mov     rsi, [rip + txtPtr]
+    add     rsi, 2                    ; past "[2"
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
 
 pt_b_chord:
     add     rsi, 1                    ; past '['
@@ -381,18 +406,65 @@ pt_b_inlineV_done:
     jmp     pt_loop
 
 pt_b_bar:
+    ; A bar token starting with '|'.  Look at the NEXT char to classify:
+    ;   "|:"  -> open-repeat   (RepeatOpen: arm + record jump target)
+    ;   "|1"  -> first ending  (EndingMark 1: skip-the-ending on the 2nd pass)
+    ;   "|2"  -> second ending (EndingMark 2: a marker; just continue)
+    ;   "||"  -> double bar    (plain bar: ResetBar, eat both)
+    ;   "|"   -> plain bar     (ResetBar, eat one)
+    ; All cases ResetBar first (a bar boundary clears bar accidentals), then the
+    ; cursor is advanced past the consumed token by the helper / inline code.
     call    ResetBar
-    inc     rsi
+    mov     rsi, [rip + txtPtr]
+    inc     rsi                       ; past '|'
     movzx   eax, byte ptr [rsi]
-    cmp     al, ':'                   ; |:
+    cmp     al, ':'                   ; "|:"  open-repeat
+    je      pt_b_open
+    cmp     al, '1'                   ; "|1"  first ending
+    je      pt_b_end1
+    cmp     al, '2'                   ; "|2"  second ending
+    je      pt_b_end2
+    cmp     al, '|'                   ; "||"  double bar
     je      pt_b_bar_eat
-    cmp     al, '|'                   ; ||
-    je      pt_b_bar_eat
-    mov     [rip + txtPtr], rsi
+    mov     [rip + txtPtr], rsi       ; plain '|' -> just past it
     jmp     pt_loop
 pt_b_bar_eat:
-    inc     rsi
+    inc     rsi                       ; past the 2nd '|' of "||"
     mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
+pt_b_open:
+    ; "|:"  — consume both chars, then RepeatOpen records the jump target.
+    inc     rsi                       ; past ':'
+    mov     [rip + txtPtr], rsi
+    call    RepeatOpen                ; repStart = txtPtr; repArmed = 1; repPass = 1
+    jmp     pt_loop
+
+pt_b_end1:
+    ; "|1"  — consume both chars, then EndingFirst decides (skip on pass 2).
+    inc     rsi                       ; past '1'
+    mov     [rip + txtPtr], rsi
+    call    EndingFirst               ; pass 2 -> skip forward past the next ":|"
+    jmp     pt_loop
+
+pt_b_end2:
+    ; "|2"  — consume both chars; second ending is just a marker, continue.
+    inc     rsi                       ; past '2'
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
+pt_b_colon:
+    ; A token starting with ':'.  ":|" is a close-repeat; a bare ':' is skipped.
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi + 1]
+    cmp     al, '|'
+    jne     pt_b_skip                 ; bare ':' (not ":|") -> skip one char
+    ; ":|"  — ResetBar, consume both chars, then RepeatClose may jump back.
+    call    ResetBar
+    mov     rsi, [rip + txtPtr]
+    add     rsi, 2                    ; past ":|"
+    mov     [rip + txtPtr], rsi
+    call    RepeatClose               ; armed -> txtPtr = repStart, repPass = 2
     jmp     pt_loop
 
 pt_b_rest:

@@ -20,6 +20,16 @@ tsN       DWORD ?                     ; meter numerator    (M:)
 tsD       DWORD ?                     ; meter denominator
 inBody    DWORD ?                     ; 0 = header, 1 = body (set by K:)
 
+; ---- repeat / first-second-ending state (Sprint M-C) ----
+; ONE level of repeat only (no nesting).  The repeat is replayed by JUMPING the
+; text cursor back to repStart and letting pt_loop re-parse the section; curMs
+; keeps advancing across the jump, so the replayed notes land at LATER
+; timestamps (FinalizeTune sorts everything by time).  No event copying.
+repStart  QWORD ?                     ; cursor just AFTER the last "|:" (jump target)
+repArmed  DWORD ?                     ; 1 = the next ":|" will jump back to repStart
+repPass   DWORD ?                     ; 1 = first pass, 2 = second pass (after a jump)
+repVoice  DWORD ?                     ; which voice armed the repeat (don't cross voices)
+
 ; ---- per-voice state (MAXVOICE = 16, one per MIDI channel) ----
 ; Voices play SIMULTANEOUSLY: each has its OWN running time starting at 0.
 ; The global curMs is just the ACTIVE voice's working time; SwitchVoice

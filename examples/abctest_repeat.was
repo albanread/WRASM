@@ -1,0 +1,46 @@
+; abctest_repeat.was — repeat / first-second-ending test (Sprint M-C).
+;
+;   was examples\abctest_repeat.was -o abc_repeat.exe  &&  abc_repeat.exe
+;   (writes tune_rep1.bin and tune_rep2.bin — verify offline, 20-byte records)
+;
+; Two tunes, parsed + dumped one after the other (ParseTune resets all state at
+; its top, so the second parse starts clean).  L=1/4, Q=120 -> quarter = 500 ms.
+;
+; TUNE 1 — basic repeat  "|: C D E F :|"
+;   The 4-note section plays TWICE (the ":|" jumps the cursor back to after "|:"
+;   while curMs keeps advancing).  NoteOns C D E F C D E F:
+;     pitches [60,62,64,65, 60,62,64,65]
+;     times   0/500/1000/1500/ 2000/2500/3000/3500 ms
+;   16 events total; tuneEndMs = 4000.
+;
+; TUNE 2 — first/second endings  "|: C D |1 E :| |2 F |"
+;   pass 1: C D (first ending) E, then ":|" jumps back.
+;   pass 2: C D, "|1" SKIPS forward past ":|", then "|2" F.
+;   NoteOns C D E C D F:
+;     pitches [60,62,64, 60,62,65]
+;     times   0/500/1000/ 1500/2000/2500 ms
+
+.DATA
+tune1  BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "|: C D E F :|", 10, 0
+tune2  BYTE "X:1", 10, "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "|: C D |1 E :| |2 F |", 10, 0
+binName1 WCHAR "tune_rep1.bin", 0
+binName2 WCHAR "tune_rep2.bin", 0
+
+.CODE
+.globl main
+main:
+    ; --- tune 1: basic repeat ---
+    lea     rcx, [rip + tune1]
+    call    ParseTune
+    lea     rcx, [rip + binName1]
+    call    WriteTune
+
+    ; --- tune 2: first/second endings ---
+    lea     rcx, [rip + tune2]
+    call    ParseTune
+    lea     rcx, [rip + binName2]
+    call    WriteTune
+
+    invoke  ExitProcess, 0
+
+.include "../library/audio/music/abc.was"
