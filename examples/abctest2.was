@@ -1,0 +1,12 @@
+.DATA
+tune  BYTE "L:1/4", 10, "M:4/4", 10, "Q:120", 10, "K:C", 10, "^F G2 z c C, C/2", 10, 0
+binName WCHAR "tune2.bin", 0
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + tune]
+    call    ParseTune
+    lea     rcx, [rip + binName]
+    call    WriteTune
+    invoke  ExitProcess, 0
+.include "../library/audio/music/abc.was"
