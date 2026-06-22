@@ -65,8 +65,9 @@
 ;   nested repeats, trailing duration dots (the `>`/`<` broken rhythm is handled,
 ;   but a `.`-dotted duration is not), and minor/mode key qualifiers beyond the
 ;   root letter + one optional #/b for the key sig (modes ARE handled in ParseKey).
-;   Slurs ( ) are accepted but inert (skipped); `>>`/`<<` are read as two single
-;   broken marks; a `(` not followed by a digit is a slur, not a tuplet.
+;   Slurs ( ) are accepted but inert (skipped); only the FIRST `>`/`<` after a note
+;   is honoured — any extra `>`/`<` (e.g. `>>`) is ignored, NOT double-dotted; a
+;   `(` not followed by a digit is a slur, not a tuplet.
 ; ============================================================================
 
 .DATA

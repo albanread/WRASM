@@ -158,8 +158,8 @@ endproc
 ;
 ; Order of trailing markers parsed after the duration: broken `>`/`<` first,
 ; then tie `-` (the common forms are `a>b` and `C-C`; `a>-b` is tolerated).
-; A single `>`/`<` only — `>>` is read as two separate broken marks (the second
-; arms brokenMul for a third note); document, not an error.
+; Only the FIRST trailing `>`/`<` on a note is honoured; any extra `>`/`<` is
+; ignored (NOT treated as a double-dot / second broken mark).
 ;
 ; Tie continuation rule when pitches DIFFER: if tiePend is open but THIS note's
 ; pitch != tiePitch, we close the held note (emit its suppressed NoteOff) at
@@ -177,19 +177,8 @@ proc ParseNote uses rbx rsi r12 frame
     ; --- duration (writes txtPtr) ---
     call    ParseDuration             ; xmm0 = durWholes, txtPtr advanced
 
-    ; --- tuplet: scale by tupMul while a tuplet is active, then count it down ---
-    mov     eax, [rip + tupCount]
-    test    eax, eax
-    jz      pn_no_tuplet
-    mulsd   xmm0, [rip + tupMul]
-    dec     eax
-    mov     [rip + tupCount], eax
-pn_no_tuplet:
-
-    ; --- broken rhythm: apply the PENDING multiplier, then reset it to 1.0 ---
-    mulsd   xmm0, [rip + brokenMul]
-    movsd   xmm1, [rip + fOne]
-    movsd   [rip + brokenMul], xmm1
+    ; --- tuplet + pending-broken scaling (shared with chords/rests) ---
+    call    ApplyRhythm               ; xmm0 *= tupMul (if active) then *= brokenMul
 
     ; --- peek a trailing >/< on THIS note: scale it, arm brokenMul for NEXT ---
     movsd   [rip + pnDur], xmm0        ; park durWholes across the byte peek

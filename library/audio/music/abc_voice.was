@@ -26,6 +26,17 @@
 ; Clamp ecx to 1..16.  Calls ResetBar -> frame.  rbx holds slot across the call.
 ; ----------------------------------------------------------------------------
 proc SwitchVoice uses rbx frame in rcx
+    ; (0) the incoming voice number lives in ecx (volatile across the calls below);
+    ; park it in ebx FIRST.  Then, while curMs/curChan still belong to the LEAVING
+    ; voice, flush any open tie on its channel and reset the per-note rhythm state
+    ; so ornament state never leaks across a V: switch.
+    mov     ebx, ecx                  ; rbx = incoming 1-based voice number
+    call    FlushTie                  ; close an open tie on the LEAVING voice/channel
+    mov     dword ptr [rip + tupCount], 0
+    movsd   xmm0, [rip + fOne]
+    movsd   [rip + brokenMul], xmm0
+    mov     ecx, ebx                  ; restore the voice number for the clamp
+
     ; clamp ecx to 1..16
     cmp     ecx, 1
     jge     sv_lo_ok

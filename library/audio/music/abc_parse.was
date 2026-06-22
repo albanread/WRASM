@@ -476,6 +476,7 @@ pt_b_rest:
     inc     rsi
     mov     [rip + txtPtr], rsi
     call    ParseDuration             ; xmm0 = durWholes
+    call    ApplyRhythm               ; tuplet/pending-broken scaling (same as a note)
     call    AdvanceCurMs              ; curMs += durWholes * msPerWhole
     jmp     pt_loop
 
@@ -499,6 +500,7 @@ pt_b_grace:
     jmp     pt_loop
 
 pt_end:
+    call    FlushTie                  ; close the last active voice's open tie (if any)
     call    FinalizeTune
 endproc
 

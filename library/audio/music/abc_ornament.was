@@ -174,3 +174,48 @@ pg_close:
     mov     [rip + txtPtr], rsi
 pg_done:
 endproc
+
+; ----------------------------------------------------------------------------
+; ApplyRhythm(xmm0 = durWholes in/out): consume the tuplet + pending-broken
+; scaling that rides on ONE note/chord/rest.  Factored out of ParseNote so that
+; chords (ParseChord) and rests (pt_b_rest) get the SAME rhythm treatment.
+;   * tuplet: while tupCount>0, scale by tupMul and count it down.
+;   * broken: apply the pending brokenMul, then reset it to 1.0.
+; INERT at defaults (tupCount=0, brokenMul=1.0) -> an ornament-free duration is
+; returned BYTE-IDENTICAL (xmm0 *= 1.0).  Uses xmm0/xmm1 + eax (all volatile) and
+; makes NO calls -> leaf, no frame.
+; ----------------------------------------------------------------------------
+proc ApplyRhythm
+    mov     eax, [rip + tupCount]     ; tuplet: scale + count down
+    test    eax, eax
+    jz      ar_nt
+    mulsd   xmm0, [rip + tupMul]
+    dec     eax
+    mov     [rip + tupCount], eax
+ar_nt:
+    mulsd   xmm0, [rip + brokenMul]   ; broken: apply pending, reset to 1.0
+    movsd   xmm1, [rip + fOne]
+    movsd   [rip + brokenMul], xmm1
+endproc
+
+; ----------------------------------------------------------------------------
+; FlushTie: if a tie is currently open, close it by emitting the suppressed
+; NoteOff @ round(curMs) on the LIVE curChan (the held note's own channel),
+; then clear tiePend.  Called on a V: voice switch (BEFORE the clock/channel
+; swap, so curMs/curChan still belong to the LEAVING voice) and at end-of-tune
+; (flushes the last active voice's open tie) so the event stream stays balanced.
+; Calls RoundCurMs/EmitEvent -> frame.
+; ----------------------------------------------------------------------------
+proc FlushTie frame
+    mov     eax, [rip + tiePend]
+    test    eax, eax
+    jz      ft_d
+    call    RoundCurMs                ; eax = round(curMs)
+    mov     ecx, eax
+    mov     edx, 0x80                 ; NoteOff
+    mov     r8d, [rip + tiePitch]
+    xor     r9d, r9d
+    call    EmitEvent                 ; stamps the live curChan (leaving/active voice)
+    mov     dword ptr [rip + tiePend], 0
+ft_d:
+endproc

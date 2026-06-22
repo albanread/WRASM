@@ -94,6 +94,7 @@ pc_close:
 pc_close_missing:
     ; (4) duration AFTER ']' applies to the whole chord
     call    ParseDuration             ; xmm0 = durWholes, txtPtr advanced
+    call    ApplyRhythm               ; tuplet/pending-broken scaling (same as a note)
     movsd   [rip + fChDur], xmm0      ; stash across AdvanceCurMs / RoundCurMs
 
     ; (5) advance curMs ONCE; capture the shared offset
