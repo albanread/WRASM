@@ -1,18 +1,85 @@
 ; gpu/introspect.was — the GPU canvas's self-portrait, mirroring library/introspect.was.
 ;
 ;   .include "../gpu/introspect.was"     ; after canvas
-;   call Snapshot                        ; writes the BMP at bmpPathPtr
+;   call Snapshot                        ; writes an ORDERED snap_<seq>.bmp (filmstrip)
 ;
-; The library introspect resolves the 320x200 CPU framebuffer into a BMP. The GPU
-; backend already owns that machinery in gpu/canvas.was's GpuSnapshot (back buffer
-; -> staging -> 24-bit BMP at bmpPathPtr). This file just exposes it under the
-; library's `Snapshot` name so a game's `.include "../*/introspect.was"` resolves
-; with zero source changes.
+; The library introspect resolves the 320x200 CPU framebuffer into a BMP NAMED
+; snap_<seq>.bmp — an ORDERED, collision-free sequence so you can SAMPLE a run (a
+; filmstrip), not just snap one frame (library/introspect.was: snapSeq increments,
+; the 8 hex digits at char offset 5 are patched). The GPU backend already owns the
+; readback machinery in gpu/canvas.was's GpuSnapshot (back buffer -> staging ->
+; 24-bit BMP at bmpPathPtr).
+;
+; G5 AUDIT FIX (G6): the original `Snapshot` jmp'd straight to GpuSnapshot, which
+; writes whatever single fixed path bmpPathPtr holds (defaulted to gpu_g0.bmp in
+; GpuInit). A driver that called Snapshot in a loop therefore OVERWROTE one file —
+; a filmstrip lost all but the last frame. Now `Snapshot` mirrors the library: it
+; stamps gpuSnapName = snap_<seq>.bmp with an incrementing snapSeq, points
+; bmpPathPtr at it, and only THEN calls GpuSnapshot. Successive Snapshot calls thus
+; produce snap_00000000.bmp, snap_00000001.bmp, … in order — a real filmstrip.
+;
+; The SINGLE-SHOT path is preserved: GpuSnapshot (gpu/canvas.was) still writes to
+; bmpPathPtr verbatim, so existing gate scripts that set bmpPathPtr to a fixed name
+; and call GpuSnapshot directly (examples/gpu_g4.was, the parity drivers) are
+; UNCHANGED. Only the library-named `Snapshot` entry now sequences.
 ;
 ; GameSelfTest (in gpu/harness.was) calls Snapshot to film a headless run.
 
+.DATA
+.balign 16
+; the sequenced wide name. The 8 hex digits live at wide-char offset 5 (= byte 10),
+; exactly like library/introspect.was's snapName. Patched per Snapshot call.
+.globl gpuSnapName
+gpuSnapName  WCHAR "snap_00000000.bmp", 0
+.globl gpuSnapSeq
+gpuSnapSeq   DWORD 0                        ; ordered sequence number (filmstrip-safe)
+
+.balign 16
 .CODE
-; ---- Snapshot: dump the current GPU back buffer to bmpPathPtr (= GpuSnapshot) ----
+; ===========================================================================
+; Snapshot — write the current GPU back buffer to an ORDERED snap_<seq>.bmp.
+; Mirrors library/introspect.was Snapshot's naming: stamp the 8 hex digits at
+; wide-char offset 5 from the running snapSeq (high nibble first), bump the seq,
+; point bmpPathPtr at gpuSnapName, then delegate to GpuSnapshot (back buffer ->
+; staging -> 24-bit BMP). Successive calls never clobber — a true filmstrip.
+; ===========================================================================
 .globl Snapshot
 Snapshot:
-    jmp     GpuSnapshot
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    sub     rsp, 40
+
+    mov     r12d, [rip + gpuSnapSeq]          ; ordered sequence number
+    inc     dword ptr [rip + gpuSnapSeq]
+    lea     rdi, [rip + gpuSnapName]
+    add     rdi, 10                           ; past L"snap_" (5 wide chars = 10 bytes)
+    mov     ecx, 8
+sn_hex:
+    rol     r12d, 4                           ; next nibble (high first) -> low 4 bits
+    mov     eax, r12d
+    and     eax, 0xF
+    cmp     eax, 10
+    jb      sn_dig
+    add     eax, 55                           ; 'A'..'F'
+    jmp     sn_put
+sn_dig:
+    add     eax, 48                           ; '0'..'9'
+sn_put:
+    mov     [rdi], ax                         ; one UTF-16 code unit (high byte 0)
+    add     rdi, 2
+    dec     ecx
+    jnz     sn_hex
+
+    ; point the snapshot path at the sequenced name, then dump.
+    lea     rax, [rip + gpuSnapName]
+    mov     [rip + bmpPathPtr], rax
+    call    GpuSnapshot
+
+    add     rsp, 40
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret

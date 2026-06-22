@@ -79,6 +79,20 @@ canvasOY  DWORD 80
 PhysW     DWORD 640
 PhysH     DWORD 360
 
+; ---- the SWAPCHAIN pixel-double scale (G6 "1440p pixel-double", docs §1). The
+; canvas physical buffer is 640x360; the swapchain integer-scales it. scale 2 =
+; 1280x720 (the DEFAULT), scale 4 = 2560x1440 ("pixel-double"). A driver sets
+; GpuPixelScale BEFORE calling GpuInit; GpuInit patches the swapchain desc, the
+; viewport, and the staging readback to BackW x BackH = 640*scale x 360*scale. The
+; LUT shader is resolution-independent (it samples idxBuf at uv*640/360), so the
+; larger backbuffer just gives crisper nearest-neighbour at no per-frame cost.
+.globl GpuPixelScale
+GpuPixelScale DWORD 2                     ; 2 = 720p (default), 4 = 1440p pixel-double
+.globl BackW
+.globl BackH
+BackW     DWORD 1280                      ; actual backbuffer extents (set in GpuInit)
+BackH     DWORD 720
+
 ; ---- the index buffer the game draws into (640x360, one byte = one index) ----
 .globl idxBuf
 idxBuf    BYTE 230400 dup(0)            ; 640*360
@@ -240,6 +254,7 @@ bmpName   WCHAR "E:/RASM/examples/gpu_g0.bmp", 0
 .globl bmpPathPtr
 bmpPathPtr QWORD 0                       ; set to bmpName in GpuInit (a driver may override)
 bmpWrote  DWORD ?
+bmpRowBytes DWORD ?                       ; BackW*3 (set per GpuSnapshot from BackW)
 bmpFile   QWORD ?
 bmpHdr:
     BYTE 0x42, 0x4D                       ; "BM"
@@ -258,8 +273,9 @@ bmpHdr:
     BYTE 0x00, 0x00, 0x00, 0x00           ; biClrUsed
     BYTE 0x00, 0x00, 0x00, 0x00           ; biClrImportant
 
-; one 1280*3 = 3840-byte BGR scratch row (already 4-byte aligned, no pad needed)
-bmpRow    BYTE 3840 dup(0)
+; BGR scratch row — sized for the WIDEST backbuffer (2560*3 = 7680, also 4-aligned).
+; At 720p only the first 3840 bytes are used per row; at 1440p all 7680.
+bmpRow    BYTE 7680 dup(0)
 
 .balign 16
 .CODE
@@ -277,6 +293,24 @@ GpuInit:
     sub     rsp, 40                       ; align + shadow space
 
     mov     [rip + scd + DXGI_SWAP_CHAIN_DESC.OutputWindow], rcx
+
+    ; ---- apply the pixel-double scale (G6 §1). Default scale 2 = 1280x720; scale 4
+    ; = 2560x1440. Patch the swapchain desc, the viewport (float), the staging
+    ; readback dims, and BackW/BackH so GpuSnapshot captures at the real size. Only
+    ; the scale-4 path overwrites the scale-2 defaults already baked into the descs.
+    mov     eax, [rip + GpuPixelScale]
+    cmp     eax, 4
+    jne     gi_scale_done
+    ; 2560x1440 swapchain + staging + backbuffer extents.
+    mov     dword ptr [rip + scd + DXGI_SWAP_CHAIN_DESC.BufferDesc.Width], 2560
+    mov     dword ptr [rip + scd + DXGI_SWAP_CHAIN_DESC.BufferDesc.Height], 1440
+    mov     dword ptr [rip + tdStaging + D3D11_TEXTURE2D_DESC.Width], 2560
+    mov     dword ptr [rip + tdStaging + D3D11_TEXTURE2D_DESC.Height], 1440
+    mov     dword ptr [rip + vp + D3D11_VIEWPORT.Width], 0x45200000   ; 2560.0f
+    mov     dword ptr [rip + vp + D3D11_VIEWPORT.Height], 0x44B40000  ; 1440.0f
+    mov     dword ptr [rip + BackW], 2560
+    mov     dword ptr [rip + BackH], 1440
+gi_scale_done:
 
     ; default the snapshot path to the G0 name (a driver may override afterwards).
     lea     rax, [rip + bmpName]
@@ -455,6 +489,23 @@ GpuSnapshot:
     test    eax, eax
     js      gs_fail_map
 
+    ; ---- patch the BMP header from the real backbuffer size (BackW x BackH) so the
+    ; same proc captures 720p (scale 2) AND 1440p (scale 4). 24bpp, top-down (height
+    ; stored NEGATIVE). rowBytes = BackW*3 (BackW is even*640 so it's 4-aligned);
+    ; image = rowBytes*BackH; bfSize = 54 + image; bfOffBits = 54. ----
+    mov     ebx, [rip + BackW]
+    mov     [rip + bmpHdr + 18], ebx         ; biWidth = BackW
+    mov     eax, [rip + BackH]
+    neg     eax
+    mov     [rip + bmpHdr + 22], eax         ; biHeight = -BackH (top-down)
+    mov     eax, ebx
+    imul    eax, eax, 3                      ; rowBytes = BackW*3
+    mov     [rip + bmpRowBytes], eax
+    imul    eax, [rip + BackH]               ; biSizeImage = rowBytes*BackH
+    mov     [rip + bmpHdr + 34], eax
+    add     eax, 54                          ; bfSize = 54 + image
+    mov     [rip + bmpHdr + 2], eax
+
     ; open the file (path is bmpPathPtr — overridable per driver)
     invoke  CreateFileW, [rip + bmpPathPtr], 0x40000000, 0, 0, 2, 0x80, 0
     mov     [rip + bmpFile], rax            ; keep handle in memory (invoke clobbers rbx)
@@ -467,16 +518,16 @@ GpuSnapshot:
     ; rsi = mapped.pData ; r13 = RowPitch (src stride, RGBA, may be padded)
     mov     rsi, [rip + mapped + 0]
     mov     r13d, dword ptr [rip + mapped + 8]
-    xor     r12d, r12d                      ; r12 = row counter (0..719)
+    xor     r12d, r12d                      ; r12 = row counter (0..BackH-1)
 gs_row:
-    cmp     r12d, 720
+    cmp     r12d, [rip + BackH]
     jge     gs_endrows
-    ; build one 3840-byte BGR row from this RGBA source row
+    ; build one (BackW*3)-byte BGR row from this RGBA source row
     lea     rdi, [rip + bmpRow]             ; dst BGR
     mov     rcx, rsi                        ; src RGBA for this row
-    xor     r14d, r14d                      ; pixel x (0..1279)
+    xor     r14d, r14d                      ; pixel x (0..BackW-1)
 gs_px:
-    cmp     r14d, 1280
+    cmp     r14d, [rip + BackW]
     jge     gs_emit
     ; src RGBA at rcx: [0]=R [1]=G [2]=B [3]=A ; dst BGR = B,G,R
     mov     al, [rcx + 2]                   ; B
@@ -490,7 +541,7 @@ gs_px:
     inc     r14d
     jmp     gs_px
 gs_emit:
-    invoke  WriteFile, [rip + bmpFile], bmpRow, 3840, bmpWrote, 0
+    invoke  WriteFile, [rip + bmpFile], bmpRow, [rip + bmpRowBytes], bmpWrote, 0
     add     rsi, r13                        ; next source row (RowPitch bytes)
     inc     r12d
     jmp     gs_row

@@ -1,0 +1,815 @@
+; gpu_g6.was — GPU Canvas G6 "Bonuses + the payoff demo" — THE FINALE.
+;
+;   was examples\gpu_g6.was -o gpu_g6.exe   &&   gpu_g6.exe
+;
+; The demo the CPU canvas could NEVER do. Brings up the WHOLE stack — G0
+; (canvas), G1 (blit), G2 (tile), G3 (sprite), G4 (fx + text + harness), G5
+; (introspect) — plus the NEW G6 module gpu/mode7.was, and flexes the brakes-off all
+; at once, animating with ZERO scene redraw (only CB constants + a swarm-position
+; bump + a palette rotation per frame):
+;
+;   * FX BACKGROUND    — the plasma/tunnel pixel shader (the BACK of the stack, the
+;                        sky ABOVE the horizon), time-animated.
+;   * MODE-7 FLOOR     — a tile world composited through a per-pixel perspective +
+;                        2x2 rotate/scale, receding to a HORIZON. The floor uses a
+;                        16-colour palette BAND (indices 32..47) that we CYCLE each
+;                        frame, so the floor itself is a flowing, GPU-palette-cycled
+;                        plane. Driven purely by CB constants (angle/scale/horizon/
+;                        cam) -> it rotates + the camera flies forward with no redraw.
+;   * SPRITE SWARM     — THOUSANDS of instanced sprites over the scene, one
+;                        DrawInstanced (no per-scanline cap — the 16-bit limits gone).
+;   * PALETTE CYCLING  — CyclePalette rotates the floor's 32..47 LUT band + re-uploads
+;                        the global LUT every frame (the classic waterfall/plasma-by-
+;                        palette), visibly flowing across the mode-7 floor.
+;   * TITLE            — a text layer on top.
+;
+; Then Present + dump an ORDERED snap_<seq>.bmp FILMSTRIP via the G6-fixed Snapshot
+; (gpu/introspect.was), so the cycling + rotation are visible across frames. Two
+; gates (docs/gpucanvas.md §8): a LIVE window AND the BMP(s).
+;
+; 1440p OPTION: set GpuPixelScale = 4 before GpuInit (here behind g6Use1440p) to
+; bring up the 2560x1440 pixel-double swapchain instead of the 1280x720 default; the
+; snapshot captures at the real size automatically (gpu/canvas.was BackW/BackH).
+
+.include "../gpu/canvas.was"
+.include "../gpu/blit.was"
+.include "../gpu/tile.was"
+.include "../gpu/sprite.was"
+.include "../gpu/fx.was"
+.include "../gpu/text.was"
+.include "../gpu/mode7.was"      ; G6: the per-layer affine / mode-7 floor
+.include "../gpu/input.was"      ; the harness's library-contract path references input
+.include "../gpu/introspect.was" ; G6: the SEQUENCED Snapshot (snap_<seq>.bmp filmstrip)
+.include "../gpu/harness.was"
+
+.DATA
+.balign 16
+titleTextW  WCHAR  "RASM - GPU Canvas G6 (mode-7 floor + swarm + fx + palette cycle)", 0
+
+; the mode-7 floor layer RT (G1 LAYER).
+hFloorRT    DWORD  ?
+
+; sprite frame ids.
+fidBall     DWORD  ?
+fidStar     DWORD  ?
+
+; mode-7 animation state.
+m7Angle256  DWORD  0              ; fixed-point rotation angle (0..255 = a turn)
+m7CamZf     DWORD  0              ; camera Z (float bits), advances = flying forward
+frameNo     DWORD  0
+snapEvery   DWORD  ?
+
+; toggle the 1440p pixel-double (set to 1 to bring up the 2560x1440 swapchain).
+g6Use1440p  DWORD  0
+
+bmpNameG6   WCHAR  "E:/RASM/examples/gpu_g6.bmp", 0
+
+.balign 16
+; the swarm: 2000 sprites (THOUSANDS — well past any 16-bit per-scanline cap, and
+; well under SprMaxInst=8192). They fly in the SKY band (y 0..230, above + around the
+; horizon at y=110) so the mode-7 FLOOR below stays clearly readable — both at once.
+SWARM_N     DWORD  2000
+SWARM_YMAX  DWORD  230            ; swarm confined to the top (px); floor owns below
+swarmX      DWORD  2000 dup(0)    ; x position, fixed-point (<<8)
+swarmY      DWORD  2000 dup(0)    ; y position, fixed-point (<<8)
+swarmVX     DWORD  2000 dup(0)
+swarmVY     DWORD  2000 dup(0)
+swarmFrame  DWORD  2000 dup(0)    ; 0..1 frame id
+swarmSlot   DWORD  2000 dup(0)    ; 0..7 palette slot
+
+rngState    DWORD  0x2468ACE1
+
+.balign 16
+; the mode-7 floor tilemap: a 32x32 grid world (32*8 = 256 px each way; the tile
+; shader/mode-7 wrap make it tile to infinity). Each cell gets a tile-id whose
+; pixels use the cycling palette band (indices 32..47) in a checker/grid pattern.
+mapFloor    BYTE   1024 dup(0)    ; 32*32
+
+.balign 16
+; one 8x8 floor tile per palette-band colour (16 tiles, indices 32..47). AddTile
+; appends them in order, so tile-id k uses band colour 32+k.
+floorTile   BYTE   64 dup(0)      ; scratch 8x8 builder (reused per band colour)
+
+.balign 16
+; sprite frame pixel buffers (16x16 indexed).
+sprBall     BYTE   256 dup(0)
+sprStarF    BYTE   256 dup(0)
+
+.balign 16
+f256        DWORD  0x43800000     ; 256.0f
+; instance alpha = 0.6 (translucent) so the fx plasma SKY (the BACK layer) reads
+; THROUGH the 2000-sprite swarm — otherwise opaque sprites blanket the sky band and
+; the advertised fx-background gate is invisible. Alpha-over via the G1 blend state.
+fAlpha      DWORD  0x3F19999A     ; 0.6f instance alpha
+; mode-7 params (floats).
+m7Scale     DWORD  0x45FA0000     ; 8000.0f   (perspective depth gain)
+m7Horizon   DWORD  0x42F00000     ; 120.0f    (horizon screen row)
+m7CamX      DWORD  0x00000000     ; 0.0f      (camera X)
+m7CamZStep  DWORD  0x3F000000     ; 0.5f      (forward fly per frame)
+
+.balign 16
+hudTitle    BYTE   "GPU CANVAS G6 - THE FINALE", 0
+hudLine2    BYTE   "MODE-7 FLOOR + 2000 SPRITES + FX + PALETTE CYCLE", 0
+
+.balign 16
+.CODE
+.globl main
+main:
+    call    BuildFloorTiles
+    call    BuildFloorMap
+    call    BuildSpriteFrames
+
+    lea     rcx, [rip + titleTextW]
+    lea     rdx, [rip + Init]
+    lea     r8,  [rip + Step]
+    lea     r9,  [rip + Present]
+    call    GpuGameRun
+    invoke  ExitProcess, 0
+
+; ===========================================================================
+; Init(rcx=hwnd) — bring up every module, build the GPU assets, spawn the swarm.
+; ===========================================================================
+Init:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    ; ---- select the swapchain scale BEFORE GpuInit (G6 1440p pixel-double) ----
+    mov     eax, [rip + g6Use1440p]
+    test    eax, eax
+    jz      in_scale2
+    mov     dword ptr [rip + GpuPixelScale], 4   ; 2560x1440
+    jmp     in_scale_done
+in_scale2:
+    mov     dword ptr [rip + GpuPixelScale], 2   ; 1280x720 (default)
+in_scale_done:
+
+    ; rcx = hwnd (from the harness).
+    call    GpuInit
+    call    BlitInit
+    call    TileInit
+    call    SprInit
+    call    FxInit
+    call    TxtInit
+    call    Mode7Init
+
+    ; ---- the cycling palette band: global indices 32..47 = a 16-colour rainbow.
+    ; CyclePalette rotates this band each frame; the mode-7 floor samples it. ----
+    call    BuildCycleBand
+
+    ; ---- floor tile atlas: 16 tiles, tile-id k uses band colour 32+k ----
+    call    AddFloorTiles
+
+    ; ---- the mode-7 floor layer RT (G1 LAYER) ----
+    mov     ecx, 2
+    xor     edx, edx
+    call    PoolAlloc
+    mov     [rip + hFloorRT], eax
+
+    ; ---- bake the floor map into layer slot 0's world buffer (32x32) ----
+    mov     ecx, 0
+    lea     rdx, [rip + mapFloor]
+    mov     r8d, 32
+    mov     r9d, 32
+    call    DrawTiles
+    mov     ecx, 0
+    call    TileUpload
+
+    ; ---- the mode-7 toroidal WRAP = the PAINTED map's pixel period (32 tiles * 8 =
+    ; 256 px each way), NOT the wider/taller world buffer (1024x360). DrawTiles bakes
+    ; the 32-tall map across 45 world rows (a partial repeat in rows 32..44), so
+    ; wrapping at worldH=360 would cross that content discontinuity (a horizon-
+    ; direction seam) and any pan/long fly-forward into world x>=256 / z>=256 would
+    ; sample index-0 -> magenta holes. Wrapping at 256x256 (the painted square) makes
+    ; the floor tile seamlessly to infinity. Mirrors tile.was's layerWrapW=mapW*8. ----
+    mov     ecx, 256                          ; mapW(32) * 8
+    mov     edx, 256                          ; mapH(32) * 8
+    call    Mode7SetWrap
+
+    ; colour key = magenta (the mode-7 PS emits magenta above the horizon / index-0).
+    mov     ecx, 0x00FF00FF
+    call    BlitSetKey
+
+    ; ---- sprite atlas: 2 frames (ball=0, star=1), 16x16 each ----
+    lea     rcx, [rip + sprBall]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fidBall], eax
+    lea     rcx, [rip + sprStarF]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fidStar], eax
+    call    SprUploadAtlas
+
+    call    BuildSpritePalettes
+    call    SprUploadPalette
+
+    call    SpawnSwarm
+
+    ; sample a filmstrip every 4 frames (so cycling + rotation show across frames).
+    mov     dword ptr [rip + snapEvery], 4
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; Step — per-frame logic: advance the mode-7 rotation + forward fly, the fx time,
+; the swarm, and ROTATE the floor's palette band (palette cycling). Zero redraw —
+; only constants + the swarm positions change.
+; ===========================================================================
+Step:
+    push    rbx
+    sub     rsp, 32
+
+    ; advance the mode-7 angle (wraps at 256) — the floor rotates.
+    mov     eax, [rip + m7Angle256]
+    inc     eax
+    and     eax, 255
+    mov     [rip + m7Angle256], eax
+
+    ; advance the camera Z (fly forward): camZf += m7CamZStep (float add).
+    movss   xmm0, [rip + m7CamZf]
+    addss   xmm0, [rip + m7CamZStep]
+    movss   [rip + m7CamZf], xmm0
+
+    call    FxSetTime                     ; advance the plasma time
+    call    MoveSwarm
+
+    ; ---- PALETTE CYCLING: rotate the floor's 32..47 band + re-upload the LUT ----
+    mov     ecx, 32
+    mov     edx, 47
+    call    CyclePalette
+
+    inc     dword ptr [rip + frameNo]
+
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; Present — the FULL G6 compositor, in spec order:
+;   fx plasma (clears the back buffer = the sky) -> the mode-7 floor (colour-keyed
+;   over the plasma, so above the horizon the plasma shows) -> the 2000-sprite swarm
+;   -> text title -> Present. Then a sequenced snapshot every snapEvery frames.
+; ===========================================================================
+Present:
+    push    rbx
+    push    rsi
+    sub     rsp, 40
+
+    ; ===== LAYER 0: fx plasma into the back buffer (the BACK / the sky) =====
+    pContext.OMSetRenderTargets(1, pRTV, 0)
+    pContext.RSSetViewports(1, vp)
+    mov     rcx, [rip + pRTV]
+    call    FxRender
+
+    ; ===== MODE-7 FLOOR: set the affine params, render the floor layer, key-composite =====
+    ; Mode7SetCamZ wants the camZ float bits in ecx.
+    mov     ecx, [rip + m7CamZf]
+    call    Mode7SetCamZ
+    ; Mode7SetParams(ecx=angle256, xmm1=scale, xmm2=horizonY, xmm3=camX).
+    mov     ecx, [rip + m7Angle256]
+    movss   xmm1, [rip + m7Scale]
+    movss   xmm2, [rip + m7Horizon]
+    movss   xmm3, [rip + m7CamX]
+    call    Mode7SetParams
+
+    ; render the floor world (slot 0) through mode-7 into the floor RT.
+    mov     ecx, 0
+    mov     ebx, [rip + hFloorRT]
+    lea     rax, [rip + poolRTV]
+    mov     rdx, [rax + rbx*8]
+    call    Mode7RenderLayer
+
+    ; composite the floor over the plasma (colour-key: magenta above-horizon -> plasma).
+    mov     ebx, [rip + hFloorRT]
+    lea     rax, [rip + poolSRV]
+    mov     rcx, [rax + rbx*8]
+    mov     edx, 1                         ; colour-key mode
+    call    BlitToBack
+
+    ; ===== SPRITE SWARM over the scene (one DrawInstanced, 2000 sprites) =====
+    call    BuildSwarmInstances
+    call    SprUpload
+    pContext.RSSetViewports(1, vp)
+    mov     rcx, [rip + pRTV]
+    call    DrawSprites
+
+    ; ===== TEXT title — the TOP layer =====
+    call    BuildText
+    call    TxtUpload
+    pContext.RSSetViewports(1, vp)
+    mov     rcx, [rip + pRTV]
+    call    TxtFlush
+
+    ; ---- sequenced filmstrip: every snapEvery frames, dump snap_<seq>.bmp. Capture
+    ; BEFORE Present so we read the just-rendered back buffer while its contents are
+    ; still defined — under SWAP_EFFECT_DISCARD (canvas.was scd) the back buffer is
+    ; undefined AFTER Present, so snapshot-then-flip is the correct order. Skip a
+    ; couple of warm-up frames so the scene is fully up. ----
+    mov     eax, [rip + frameNo]
+    cmp     eax, 2
+    jl      pr_present
+    xor     edx, edx
+    mov     ecx, [rip + snapEvery]
+    test    ecx, ecx
+    jz      pr_present
+    div     ecx                            ; edx = frameNo % snapEvery
+    test    edx, edx
+    jnz     pr_present
+    ; cap the filmstrip at 8 frames so a long run doesn't spam files.
+    mov     eax, [rip + gpuSnapSeq]
+    cmp     eax, 8
+    jge     pr_present
+    call    Snapshot                       ; sequenced snap_<seq>.bmp (G6 fix)
+pr_present:
+    ; ===== flip =====
+    pSwap.Present(1, 0)
+pr_done:
+    add     rsp, 40
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildText — queue the title + subtitle for this frame.
+; ===========================================================================
+BuildText:
+    push    rbx
+    sub     rsp, 32
+    call    TxtClear
+    mov     ecx, 0x00FFE040               ; gold
+    call    TxtSetColour
+    mov     ecx, 12
+    mov     edx, 10
+    lea     r8, [rip + hudTitle]
+    call    DrawText
+    mov     ecx, 0x0040FFFF               ; cyan
+    call    TxtSetColour
+    mov     ecx, 12
+    mov     edx, 22
+    lea     r8, [rip + hudLine2]
+    call    DrawText
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildSwarmInstances — SprClear, then SprPush each swarm sprite (fixed-point .8).
+; ===========================================================================
+BuildSwarmInstances:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    sub     rsp, 8
+    call    SprClear
+    mov     r12d, [rip + SWARM_N]
+    xor     r13d, r13d
+bsi_loop:
+    cmp     r13d, r12d
+    jge     bsi_done
+    lea     rax, [rip + swarmX]
+    mov     eax, [rax + r13*4]
+    cvtsi2ss xmm1, eax
+    divss   xmm1, [rip + f256]
+    lea     rax, [rip + swarmY]
+    mov     eax, [rax + r13*4]
+    cvtsi2ss xmm2, eax
+    divss   xmm2, [rip + f256]
+    lea     rax, [rip + swarmFrame]
+    mov     ecx, [rax + r13*4]
+    lea     rax, [rip + swarmSlot]
+    mov     r8d, [rax + r13*4]
+    movss   xmm3, [rip + fAlpha]
+    call    SprPush
+    inc     r13d
+    jmp     bsi_loop
+bsi_done:
+    add     rsp, 8
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; rng — xorshift32 in eax (state in rngState).
+; ===========================================================================
+rng:
+    mov     eax, [rip + rngState]
+    mov     edx, eax
+    shl     edx, 13
+    xor     eax, edx
+    mov     edx, eax
+    shr     edx, 17
+    xor     eax, edx
+    mov     edx, eax
+    shl     edx, 5
+    xor     eax, edx
+    mov     [rip + rngState], eax
+    ret
+
+; ===========================================================================
+; SpawnSwarm — randomise each swarm sprite (x,y,vx,vy,frame,slot).
+; ===========================================================================
+SpawnSwarm:
+    push    rbx
+    push    r12
+    push    r13
+    mov     r12d, [rip + SWARM_N]
+    xor     r13d, r13d
+ss_loop:
+    cmp     r13d, r12d
+    jge     ss_done
+    call    rng
+    xor     edx, edx
+    mov     ecx, 640
+    div     ecx
+    mov     eax, edx
+    shl     eax, 8
+    lea     rbx, [rip + swarmX]
+    mov     [rbx + r13*4], eax
+    call    rng
+    xor     edx, edx
+    mov     ecx, [rip + SWARM_YMAX]       ; confine to the sky band (top)
+    div     ecx
+    mov     eax, edx
+    shl     eax, 8
+    lea     rbx, [rip + swarmY]
+    mov     [rbx + r13*4], eax
+    call    rng
+    xor     edx, edx
+    mov     ecx, 512
+    div     ecx
+    mov     eax, edx
+    sub     eax, 256
+    lea     rbx, [rip + swarmVX]
+    mov     [rbx + r13*4], eax
+    call    rng
+    xor     edx, edx
+    mov     ecx, 512
+    div     ecx
+    mov     eax, edx
+    sub     eax, 256
+    lea     rbx, [rip + swarmVY]
+    mov     [rbx + r13*4], eax
+    call    rng
+    xor     edx, edx
+    mov     ecx, 2
+    div     ecx
+    lea     rbx, [rip + swarmFrame]
+    mov     [rbx + r13*4], edx
+    call    rng
+    and     eax, 7
+    lea     rbx, [rip + swarmSlot]
+    mov     [rbx + r13*4], eax
+    inc     r13d
+    jmp     ss_loop
+ss_done:
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ===========================================================================
+; MoveSwarm — advance each sprite by its velocity; wrap at the 640x360 field.
+; ===========================================================================
+MoveSwarm:
+    push    rbx
+    push    r12
+    push    r13
+    mov     r12d, [rip + SWARM_N]
+    xor     r13d, r13d
+ms_loop:
+    cmp     r13d, r12d
+    jge     ms_done
+    lea     rbx, [rip + swarmX]
+    mov     eax, [rbx + r13*4]
+    lea     rcx, [rip + swarmVX]
+    add     eax, [rcx + r13*4]
+    cmp     eax, 0
+    jge     ms_x_hi
+    add     eax, 163840
+ms_x_hi:
+    cmp     eax, 163840
+    jl      ms_x_ok
+    sub     eax, 163840
+ms_x_ok:
+    mov     [rbx + r13*4], eax
+    lea     rbx, [rip + swarmY]
+    mov     eax, [rbx + r13*4]
+    lea     rcx, [rip + swarmVY]
+    add     eax, [rcx + r13*4]
+    cmp     eax, 0
+    jge     ms_y_hi
+    add     eax, 58880                     ; SWARM_YMAX(230) << 8 — wrap in the sky band
+ms_y_hi:
+    cmp     eax, 58880
+    jl      ms_y_ok
+    sub     eax, 58880
+ms_y_ok:
+    mov     [rbx + r13*4], eax
+    inc     r13d
+    jmp     ms_loop
+ms_done:
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildSpriteFrames — synthesize the 2 sprite frames (16x16 indexed). ball=disc
+; (index 1), star=diamond/cross (index 2). (As G3/G4.)
+; ===========================================================================
+BuildSpriteFrames:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    ; ---- ball: filled disc (index 1) ----
+    lea     rdi, [rip + sprBall]
+    xor     r12d, r12d
+bf_ball_y:
+    cmp     r12d, 16
+    jge     bf_ball_done
+    xor     r13d, r13d
+bf_ball_x:
+    cmp     r13d, 16
+    jge     bf_ball_yend
+    mov     eax, r13d
+    add     eax, eax
+    sub     eax, 15
+    imul    eax, eax
+    mov     ebx, r12d
+    add     ebx, ebx
+    sub     ebx, 15
+    imul    ebx, ebx
+    add     eax, ebx
+    cmp     eax, 196
+    jg      bf_ball_zero
+    mov     byte ptr [rdi], 1
+    jmp     bf_ball_adv
+bf_ball_zero:
+    mov     byte ptr [rdi], 0
+bf_ball_adv:
+    inc     rdi
+    inc     r13d
+    jmp     bf_ball_x
+bf_ball_yend:
+    inc     r12d
+    jmp     bf_ball_y
+bf_ball_done:
+    ; ---- star (index 2): cross + diagonals ----
+    lea     rdi, [rip + sprStarF]
+    mov     ecx, 256
+    xor     al, al
+bf_star_clr:
+    mov     [rdi], al
+    inc     rdi
+    dec     ecx
+    jnz     bf_star_clr
+    lea     rdi, [rip + sprStarF]
+    xor     r12d, r12d
+bf_star_y:
+    cmp     r12d, 16
+    jge     bf_star_done
+    xor     r13d, r13d
+bf_star_x:
+    cmp     r13d, 16
+    jge     bf_star_yend
+    cmp     r13d, 7
+    je      bf_star_on
+    cmp     r13d, 8
+    je      bf_star_on
+    cmp     r12d, 7
+    je      bf_star_on
+    cmp     r12d, 8
+    je      bf_star_on
+    cmp     r13d, r12d
+    je      bf_star_on
+    mov     eax, 15
+    sub     eax, r12d
+    cmp     r13d, eax
+    je      bf_star_on
+    jmp     bf_star_adv
+bf_star_on:
+    mov     byte ptr [rdi], 2
+bf_star_adv:
+    inc     rdi
+    inc     r13d
+    jmp     bf_star_x
+bf_star_yend:
+    inc     r12d
+    jmp     bf_star_y
+bf_star_done:
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildSpritePalettes — 8 per-sprite palette slots, each a distinct hue. (G3/G4.)
+; ===========================================================================
+BuildSpritePalettes:
+    push    rbx
+    push    r12
+    push    r13
+    xor     r12d, r12d
+bsp_slot:
+    cmp     r12d, 8
+    jge     bsp_done
+    lea     rax, [rip + slotHue]
+    mov     r13d, [rax + r12*4]
+    mov     ecx, r12d
+    mov     edx, 1
+    mov     r8d, r13d
+    call    SprSetPalette
+    mov     ecx, r12d
+    mov     edx, 2
+    mov     r8d, r13d
+    or      r8d, 0x00808080
+    call    SprSetPalette
+    inc     r12d
+    jmp     bsp_slot
+bsp_done:
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildCycleBand — fill the GLOBAL palette indices 32..47 with a 16-colour HSV
+; rainbow (the band the mode-7 floor samples + Step cycles). Stored as BGRA in
+; palGlobalData (0xFFRRGGBB lands B,G,R,A). A simple 6-sector hue wheel.
+; ===========================================================================
+BuildCycleBand:
+    push    rbx
+    push    r12
+    push    r13
+    lea     r13, [rip + palGlobalData]
+    xor     r12d, r12d                    ; k = 0..15 (band slot)
+bcb_loop:
+    cmp     r12d, 16
+    jge     bcb_done
+    ; hue index 0..15 -> a rainbow. Use a small table for clarity.
+    lea     rax, [rip + bandHue]
+    mov     ebx, [rax + r12*4]            ; 0xFFRRGGBB
+    ; store at palGlobalData[32 + k]
+    mov     eax, r12d
+    add     eax, 32
+    mov     [r13 + rax*4], ebx
+    inc     r12d
+    jmp     bcb_loop
+bcb_done:
+    ; upload the global LUT once so the band is live before the first cycle.
+    pContext.UpdateSubresource([rip + pTexGlobal], 0, 0, palGlobalData, 1024, 0)
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ===========================================================================
+; AddFloorTiles — append 16 floor tiles to the tile atlas. Tile-id k (0..15) is an
+; 8x8 solid block of palette index (32 + k) — one tile per band colour. The floor
+; map (BuildFloorMap) places these so the floor is a grid of the cycling band.
+; A 1px darker border (index 16, a fixed dark global) gives a visible tile grid.
+; ===========================================================================
+AddFloorTiles:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    xor     r12d, r12d                    ; k = 0..15
+aft_loop:
+    cmp     r12d, 16
+    jge     aft_done
+    ; build floorTile: fill with index (32+k), border = 16 (dark grid line).
+    lea     rdi, [rip + floorTile]
+    mov     r13d, r12d
+    add     r13d, 32                      ; band index for this tile
+    xor     ebx, ebx                      ; cell index 0..63
+aft_px:
+    cmp     ebx, 64
+    jge     aft_store
+    ; row = ebx>>3, col = ebx&7. border if row/col is 0 or 7.
+    mov     ecx, ebx
+    shr     ecx, 3                        ; row
+    mov     edx, ebx
+    and     edx, 7                        ; col
+    mov     eax, r13d                     ; default = band colour
+    test    ecx, ecx
+    jz      aft_border
+    cmp     ecx, 7
+    je      aft_border
+    test    edx, edx
+    jz      aft_border
+    cmp     edx, 7
+    je      aft_border
+    jmp     aft_put
+aft_border:
+    mov     eax, 16                       ; dark grid line (global index 16)
+aft_put:
+    mov     [rdi + rbx], al
+    inc     ebx
+    jmp     aft_px
+aft_store:
+    lea     rcx, [rip + floorTile]
+    call    AddTile                       ; id k (map value k+1)
+    inc     r12d
+    jmp     aft_loop
+aft_done:
+    ; make global index 16 a dark slate so the grid lines read (BGRA).
+    lea     rax, [rip + palGlobalData]
+    mov     dword ptr [rax + 64], 0xFF202830   ; index 16
+    ; re-upload the global LUT so index 16 is LIVE before the first Present — not just
+    ; after the first CyclePalette in Step (frame 1). Otherwise frame 0's grid lines
+    ; would sample whatever BuildPalettes left at index 16 (a latent ordering bug if
+    ; the snapshot cadence/warm-up count ever changes).
+    pContext.UpdateSubresource([rip + pTexGlobal], 0, 0, palGlobalData, 1024, 0)
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildFloorTiles — no-op placeholder kept for call-site symmetry with G4 (the
+; floor tiles are built in AddFloorTiles at Init, after the atlas exists).
+; ===========================================================================
+BuildFloorTiles:
+    ret
+
+; ===========================================================================
+; BuildFloorMap — the 32x32 floor tilemap. Every cell is filled (1..16) in a
+; pattern that cycles the 16 tile-ids by position, so the floor is a colourful grid
+; of the cycling band — the classic mode-7 chequer/grid plane. (map value = tile-id+1)
+; ===========================================================================
+BuildFloorMap:
+    push    rbx
+    push    rdi
+    push    r12
+    push    r13
+    lea     rdi, [rip + mapFloor]
+    xor     r12d, r12d                    ; y = 0..31
+bfm_y:
+    cmp     r12d, 32
+    jge     bfm_done
+    xor     r13d, r13d                    ; x = 0..31
+bfm_x:
+    cmp     r13d, 32
+    jge     bfm_ye
+    ; tile-id = ((x>>1) + (y>>1)) & 15  -> a diagonal banding of the 16 band colours,
+    ; 2x2 cell blocks so each colour reads as a chunky tile. map value = id+1.
+    mov     eax, r13d
+    shr     eax, 1
+    mov     ecx, r12d
+    shr     ecx, 1
+    add     eax, ecx
+    and     eax, 15
+    inc     eax                           ; map value = tile-id + 1
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     bfm_x
+bfm_ye:
+    inc     r12d
+    jmp     bfm_y
+bfm_done:
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+; 8 base hues for the sprite palette slots (0x00RRGGBB).
+slotHue:
+    DWORD 0x00FF4040, 0x0040FF40, 0x004080FF, 0x00FFD040
+    DWORD 0x00FF40FF, 0x0040FFFF, 0x00FF8020, 0x00FFFFFF
+
+.balign 16
+; the 16-colour rainbow band (0xFFRRGGBB, BGRA in memory) for global 32..47.
+bandHue:
+    DWORD 0xFFFF0000, 0xFFFF6000, 0xFFFFC000, 0xFFE0FF00
+    DWORD 0xFF80FF00, 0xFF00FF20, 0xFF00FF80, 0xFF00FFE0
+    DWORD 0xFF00C0FF, 0xFF0060FF, 0xFF2000FF, 0xFF8000FF
+    DWORD 0xFFE000FF, 0xFFFF00C0, 0xFFFF0060, 0xFFFF0030
+.balign 16

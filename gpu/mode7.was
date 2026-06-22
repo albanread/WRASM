@@ -1,0 +1,408 @@
+; gpu/mode7.was — GPU Canvas G6 "per-layer affine / MODE-7" (the marquee feature).
+;
+; Built ON TOP of gpu/canvas.was (G0: device, the palette LUT textures pTexGlobal/
+; pTexLine + their SRVs, the comobj/.Method idioms, the .ASCIISTRING + D3DCompile
+; path, pRast, vsTarget/psTarget, pErrBlob), gpu/blit.was (G1: pBlendOpaque,
+; blendFactor, vpLayer, the colour-key composite + keyClear pattern) and gpu/tile.was
+; (G2: the per-layer R8_UINT WORLD index buffers layerWorldTex/layerWorldSRV that
+; DrawTiles bakes into — mode-7 SAMPLES the SAME indexed world the flat tile layer
+; uses). Include AFTER all three. (docs/gpucanvas.md §3: "composited into the back
+; buffer with its blend + optional AFFINE transform (mode-7)".)
+;
+; THE IDEA — the SNES/Genesis mode-7 floor with the brakes off. A tile layer (an
+; indexed R8_UINT world buffer, exactly like G2's bg layers) is composited through a
+; PER-PIXEL screen->world transform so it reads as a textured plane receding to a
+; HORIZON, rotating + scaling — and because the whole transform is driven by CB
+; CONSTANTS (angle, scale, horizonY, camX, camZ), it animates with ZERO redraw: the
+; CPU just bumps five floats per frame.
+;
+; THE MATH (the classic mode-7 perspective floor):
+;   For a screen pixel (sx, sy) with the floor occupying sy in (horizonY .. 360]:
+;     dy   = sy - horizonY            // rows below the horizon (>0 for floor pixels)
+;     dist = scale / dy               // perspective divide: near the horizon dy->0,
+;                                     //   dist->inf (far away); at the bottom dy big,
+;                                     //   dist small (close). This is the 1/y depth.
+;     cx   = (sx - 320)               // screen-centred horizontal offset (640 wide)
+;     // ground-plane camera ray, before rotation:
+;     gx   = cx * dist                // horizontal world span widens with depth
+;     gz   = dist                     // depth into the world
+;     // 2x2 rotate by `angle` (cos/sin in the CB) + translate by the camera:
+;     wx   = camX + gx*cos - gz*sin
+;     wz   = camZ + gx*sin + gz*cos
+;   Above the horizon (sy <= horizonY) the floor is absent -> emit the colour KEY
+;   (magenta) so the G1 colour-key composite reveals the layers BEHIND (the fx / sky).
+;   The world sample wraps (toroidal floor) so a small tile world tiles to infinity.
+;
+;   Index 0 in the world (empty cell) ALSO emits the key -> the composite shows the
+;   background through the gaps, same convention as gpu/tile.was. A non-zero index
+;   resolves through the palettes (low 16 per-line at the SCREEN scanline so a sky/
+;   horizon gradient stays screen-relative; 16..255 global) — the indexed soul lives.
+;
+; CB layout (b0) — 8 floats (32 bytes, one cbuffer register-bank slot):
+;   float angleCos, angleSin;   // the 2x2 rotation (CPU computes cos/sin)
+;   float scale;                // the perspective scale (depth gain)
+;   float horizonY;             // screen row of the horizon (0..360)
+;   float camX, camZ;           // camera position in world space
+;   float worldW, worldH;       // the world index buffer extents (for the wrap)
+;
+; winkb supplied every D3D11 detail (all reused from G0/G1/G2):
+;   D3D11_BUFFER_DESC{ByteWidth@0,Usage@4,BindFlags@8,...} (24 bytes, winkb skel),
+;   D3D11_BIND_CONSTANT_BUFFER=4, D3D11_USAGE_DEFAULT=0,
+;   D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST=4, the R8_UINT world SRV is gpu/tile.was's.
+;
+; Every .DATA block opens with .balign 16 (trap #8).
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The MODE-7 floor shader.
+;   VS  — fullscreen triangle from SV_VertexID, forwards a 0..1 uv (identical to G0).
+;   PS  — reconstruct the screen pixel, apply the perspective + 2x2 affine, sample
+;         the world index buffer, resolve through the palettes. Above the horizon or
+;         on an index-0 cell -> the colour KEY (magenta) for the colour-key composite.
+; m7Idx   : Texture2D<uint>   at t0  (R8_UINT, worldW x worldH — a baked tile world)
+; palGlobal: Texture2D<float4> at t1 (B8G8R8A8_UNORM, 256x1)
+; palLine  : Texture2D<float4> at t2 (B8G8R8A8_UNORM, 16x360)
+; CB (b0): { angleCos, angleSin, scale, horizonY, camX, camZ, worldW, worldH }
+; ---------------------------------------------------------------------------
+m7Src:
+.ASCIISTRING
+Texture2D<uint> m7Idx:register(t0);
+Texture2D<float4> palGlobal:register(t1);
+Texture2D<float4> palLine:register(t2);
+cbuffer M7CB:register(b0){float angleCos;float angleSin;float scale;float horizonY;float camX;float camZ;float worldW;float worldH;};
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO M7VS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float4 M7PS(VO v):SV_Target{
+float sx=v.uv.x*640.0;
+float sy=v.uv.y*360.0;
+int syi=(int)sy;
+float dy=sy-horizonY;
+if(dy<=2.0){return float4(1.0,0.0,1.0,1.0);}
+float dist=scale/dy;
+float cx=(sx-320.0)*(1.0/256.0);
+float gx=cx*dist;
+float gz=dist;
+float wx=camX+gx*angleCos-gz*angleSin;
+float wz=camZ+gx*angleSin+gz*angleCos;
+int ww=(int)worldW;int wh=(int)worldH;
+int ix=(int)wx;int iz=(int)wz;
+ix=ix%ww;if(ix<0)ix+=ww;
+iz=iz%wh;if(iz<0)iz+=wh;
+uint c=m7Idx.Load(int3(ix,iz,0));
+if(c==0u){return float4(1.0,0.0,1.0,1.0);}
+float4 col;
+if(c<16u){col=palLine.Load(int3((int)c,syi,0));}else{col=palGlobal.Load(int3((int)c,0,0));}
+return float4(col.rgb,1.0);}
+.ENDASCIISTRING
+m7End:
+    BYTE 0
+
+m7vsEntry BYTE "M7VS", 0
+m7psEntry BYTE "M7PS", 0
+m7Name    BYTE "gpumode7", 0
+
+.balign 16
+; ---- mode-7 COM objects + scalar state ----
+comobj pVSBlobM7 : ID3DBlob
+comobj pPSBlobM7 : ID3DBlob
+
+pM7VS     QWORD ?
+pM7PS     QWORD ?
+pM7CB     QWORD ?                         ; the affine constant buffer (b0)
+m7SrcLen  QWORD ?
+tmpPtrM7  QWORD ?
+tmpSizeM7 QWORD ?
+
+.balign 16
+; the affine CB mirror: 8 floats { cos, sin, scale, horizonY, camX, camZ, ww, wh }.
+; defaults: identity rotation (cos=1,sin=0), scale=20000, horizon at row 120, camera
+; at (0,0), world 1024x360 (TileWorldW x TileWorldH). M7SetParams overwrites these.
+m7CB:
+    DWORD 0x3F800000          ; angleCos = 1.0
+    DWORD 0x00000000          ; angleSin = 0.0
+    DWORD 0x469C4000          ; scale    = 20000.0
+    DWORD 0x42F00000          ; horizonY = 120.0
+    DWORD 0x00000000          ; camX     = 0.0
+    DWORD 0x00000000          ; camZ     = 0.0
+    DWORD 0x44800000          ; worldW   = 1024.0
+    DWORD 0x43B40000          ; worldH   = 360.0
+.balign 16
+m7CBArr   QWORD 0                         ; single-element CB array for PSSetConstantBuffers
+m7SrvArr  QWORD 0, 0, 0                   ; t0=world, t1=palGlobal, t2=palLine
+m7RTVTmp  QWORD ?
+
+.balign 16
+; ---- a 256-entry sine LUT (one full turn), float. Built at Mode7Init. The
+; assembler has no x87/libm, so cos/sin come from this table: a fixed-point angle
+; (0..255 = 0..2pi) indexes it; cos = sin(angle + 64). Mode7SetAngle takes the
+; fixed-point angle and fills the CB's cos/sin from here — no FPU needed. ----
+m7SinLUT  DWORD 256 dup(0)
+
+; the affine CB descriptor (32 bytes, BIND_CONSTANT_BUFFER).
+m7cbDesc struct D3D11_BUFFER_DESC
+    ByteWidth = 32
+    Usage     = 0                         ; D3D11_USAGE_DEFAULT
+    BindFlags = 4                         ; D3D11_BIND_CONSTANT_BUFFER
+ends
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; Mode7Init — compile the mode-7 VS/PS, create the affine constant buffer.
+; Returns 0 in eax; on D3D failure exits with a small distinct code. Call AFTER
+; GpuInit + BlitInit + TileInit (needs pDevice + the per-layer world SRVs live).
+; ===========================================================================
+.globl Mode7Init
+Mode7Init:
+    push    rbx
+    sub     rsp, 40
+
+    ; ---- compile the mode-7 VS/PS ----
+    lea     rax, [rip + m7End]
+    lea     rcx, [rip + m7Src]
+    sub     rax, rcx
+    mov     [rip + m7SrcLen], rax
+    invoke  D3DCompile, m7Src, [rip + m7SrcLen], m7Name, 0, 0, m7vsEntry, vsTarget, 0, 0, pVSBlobM7, pErrBlob
+    test    eax, eax
+    js      m7i_fail_compile
+    invoke  D3DCompile, m7Src, [rip + m7SrcLen], m7Name, 0, 0, m7psEntry, psTarget, 0, 0, pPSBlobM7, pErrBlob
+    test    eax, eax
+    js      m7i_fail_compile
+
+    pVSBlobM7.GetBufferPointer()
+    mov     [rip + tmpPtrM7], rax
+    pVSBlobM7.GetBufferSize()
+    mov     [rip + tmpSizeM7], rax
+    pDevice.CreateVertexShader([rip + tmpPtrM7], [rip + tmpSizeM7], 0, pM7VS)
+    test    eax, eax
+    js      m7i_fail_d3d
+    pPSBlobM7.GetBufferPointer()
+    mov     [rip + tmpPtrM7], rax
+    pPSBlobM7.GetBufferSize()
+    mov     [rip + tmpSizeM7], rax
+    pDevice.CreatePixelShader([rip + tmpPtrM7], [rip + tmpSizeM7], 0, pM7PS)
+    test    eax, eax
+    js      m7i_fail_d3d
+
+    ; ---- the affine constant buffer (32 bytes, seeded from m7CB) ----
+    lea     rax, [rip + m7CB]
+    mov     [rip + m7cbInit + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateBuffer(m7cbDesc, m7cbInit, pM7CB)
+    test    eax, eax
+    js      m7i_fail_d3d
+
+    ; ---- build the 256-entry sine LUT (no FPU: the Bhaskara parabola approximation
+    ;      sin(x) ~= B*x + C*x*|x| on x in [-pi,pi], B=4/pi, C=-4/pi^2). ----
+    call    BuildSinLUT
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     rbx
+    ret
+m7i_fail_compile:
+    invoke  ExitProcess, 65
+m7i_fail_d3d:
+    invoke  ExitProcess, 63
+
+; ===========================================================================
+; BuildSinLUT — fill m7SinLUT[0..255] with sin( i*2pi/256 ) using the Bhaskara
+; parabola (SSE, no x87/libm). For each i: x = i*step (step=2pi/256), folded to
+; [-pi,pi]; y = B*x + C*x*|x|, B=4/pi, C=-4/pi^2. Good to ~1% — ample for a mode-7
+; rotation visual (cos comes from sin(angle+64) at lookup time).
+; ===========================================================================
+BuildSinLUT:
+    push    rbx
+    sub     rsp, 8
+    xor     ebx, ebx                         ; i = 0..255
+bsl_loop:
+    cmp     ebx, 256
+    jge     bsl_done
+    ; x = i * (2pi/256)
+    cvtsi2ss xmm0, ebx
+    mulss   xmm0, [rip + f2piOver256]        ; xmm0 = x in [0, 2pi)
+    ; fold to [-pi, pi]: if x > pi, x -= 2pi
+    movss   xmm1, [rip + fPi]
+    comiss  xmm0, xmm1
+    jbe     bsl_nofold
+    subss   xmm0, [rip + f2pi]
+bsl_nofold:
+    ; y = B*x + C*x*|x|   (B=4/pi, C=-4/pi^2)
+    movss   xmm2, xmm0                       ; |x|
+    andps   xmm2, [rip + fAbsMask]
+    movss   xmm3, xmm0
+    mulss   xmm3, xmm2                       ; x*|x|
+    mulss   xmm3, [rip + fBhaskaraC]         ; C * x*|x|
+    movss   xmm4, xmm0
+    mulss   xmm4, [rip + fBhaskaraB]         ; B * x
+    addss   xmm4, xmm3                       ; y
+    lea     rax, [rip + m7SinLUT]
+    movss   [rax + rbx*4], xmm4
+    inc     ebx
+    jmp     bsl_loop
+bsl_done:
+    add     rsp, 8
+    pop     rbx
+    ret
+
+; ===========================================================================
+; Mode7SetParams(ecx=angle256, xmm1=scale, xmm2=horizonY, xmm3=camX) — set the full
+; affine transform and re-upload the CB so it is LIVE this frame (zero scene redraw,
+; the marquee). angle256 is FIXED-POINT: 0..255 = one full turn (it wraps, so the
+; caller just adds a per-frame step and never range-reduces). cos/sin come from the
+; sine LUT (no x87/libm): sin = LUT[angle&255], cos = LUT[(angle+64)&255]. camZ comes
+; from m7CamZ (set by Mode7SetCamZ) so all 5 params fit the register ABI. worldW/
+; worldH come from TileWorldW/TileWorldH (the baked tile world extents).
+; ===========================================================================
+.globl Mode7SetParams
+Mode7SetParams:
+    push    rbx
+    sub     rsp, 40
+
+    mov     ebx, ecx                         ; angle256 (fixed-point: 0..255 = a turn)
+    movss   [rip + m7CB + 8], xmm1           ; scale
+    movss   [rip + m7CB + 12], xmm2          ; horizonY
+    movss   [rip + m7CB + 16], xmm3          ; camX
+    ; camZ from m7CamZ (caller-set) -> CB[20]
+    mov     eax, [rip + m7CamZ]
+    mov     [rip + m7CB + 20], eax
+
+    ; sin = LUT[angle & 255] ; cos = LUT[(angle+64) & 255] (a quarter turn ahead).
+    lea     rax, [rip + m7SinLUT]
+    mov     ecx, ebx
+    and     ecx, 255
+    mov     edx, [rax + rcx*4]               ; sin bits
+    mov     [rip + m7CB + 4], edx            ; angleSin
+    mov     ecx, ebx
+    add     ecx, 64
+    and     ecx, 255
+    mov     edx, [rax + rcx*4]               ; cos bits
+    mov     [rip + m7CB + 0], edx            ; angleCos
+
+    ; worldW/worldH = the per-layer WRAP extents (m7WrapW/m7WrapH px). These default
+    ; to the full tile world (TileWorldW/TileWorldH) but a caller sets them to the
+    ; PAINTED map's pixel period via Mode7SetWrap so the toroidal floor tiles at the
+    ; map period (e.g. 256x256), NOT the wider/taller buffer dims — mirroring
+    ; tile.was's layerWrapW[slot]=mapW*8 design. Wrapping at the buffer dims would
+    ; cross the DrawTiles vertical map-repeat discontinuity (a 32-tall map baked
+    ; across 45 world rows) and sweep into unpainted world on a pan/long fly-forward.
+    cvtsi2ss xmm0, dword ptr [rip + m7WrapW]
+    movss   [rip + m7CB + 24], xmm0
+    cvtsi2ss xmm0, dword ptr [rip + m7WrapH]
+    movss   [rip + m7CB + 28], xmm0
+
+    ; re-upload the CB so the new transform is live this frame (zero redraw).
+    pContext.UpdateSubresource([rip + pM7CB], 0, 0, m7CB, 0, 0)
+
+    add     rsp, 40
+    pop     rbx
+    ret
+
+; ===========================================================================
+; Mode7SetCam(ecx = camZ as a raw float bit pattern) — convenience setter for the
+; camZ field consumed by Mode7SetParams (so a caller can pass all 5 params without a
+; 6th xmm arg). Stores the float bits into m7CamZ. (The caller computes the float and
+; passes its 32-bit pattern, or just movss into m7CamZ directly.)
+; ===========================================================================
+.globl Mode7SetCamZ
+Mode7SetCamZ:
+    mov     [rip + m7CamZ], ecx
+    ret
+
+; ===========================================================================
+; Mode7SetWrap(ecx = mapWpx, edx = mapHpx) — set the toroidal wrap period (in world
+; pixels) the mode-7 PS tiles the floor at. Mirrors tile.was's per-layer layerWrapW
+; (= mapW*8): the PAINTED map's pixel period, NOT the wider world-buffer dims. For a
+; 32x32-tile floor map that is 256x256. With this set, iz%256 / ix%256 tile the
+; painted square seamlessly to infinity, with no horizon-direction seam from the
+; DrawTiles vertical map-repeat and no magenta holes when the camera pans/flies far.
+; Defaults are TileWorldW/TileWorldH until a caller sets them. Apply BEFORE
+; Mode7SetParams (which folds these into the CB).
+; ===========================================================================
+.globl Mode7SetWrap
+Mode7SetWrap:
+    mov     [rip + m7WrapW], ecx
+    mov     [rip + m7WrapH], edx
+    ret
+
+; ===========================================================================
+; Mode7RenderLayer(rcx=slot, rdx=dstRTV) — render layer `slot`'s baked world through
+; the mode-7 affine into the RGBA layer RT dstRTV (a G1 pool LAYER RTV). Binds the
+; world SRV (t0, from gpu/tile.was layerWorldSRV) + the palette SRVs (t1,t2), the
+; affine CB (b0), runs the fullscreen mode-7 pass. Index-0 / above-horizon pixels
+; come out as the magenta key, ready for the colour-key composite over the fx/sky.
+; The viewport is the 640x360 layer viewport (vpLayer, from blit.was).
+; ===========================================================================
+.globl Mode7RenderLayer
+Mode7RenderLayer:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     ebx, ecx                         ; slot
+    mov     rdi, rdx                         ; dstRTV
+
+    ; bind the dst RT FIRST (unbinds any prior RT so its texture is safe to sample).
+    mov     [rip + m7RTVTmp], rdi
+    pContext.OMSetRenderTargets(1, m7RTVTmp, 0)
+    pContext.RSSetViewports(1, vpLayer)
+    ; clear to the colour KEY (magenta) — above-horizon pixels write the key anyway,
+    ; this just makes any uncovered region keyed-out too (tidy; pass fully covers).
+    pContext.ClearRenderTargetView([rip + m7RTVTmp], keyClear)
+
+    ; ---- SRV array t0=world[slot], t1=palGlobal, t2=palLine ----
+    lea     rax, [rip + layerWorldSRV]
+    mov     rax, [rax + rbx*8]
+    mov     [rip + m7SrvArr + 0], rax
+    mov     rax, [rip + pSRVglobal]
+    mov     [rip + m7SrvArr + 8], rax
+    mov     rax, [rip + pSRVline]
+    mov     [rip + m7SrvArr + 16], rax
+    pContext.PSSetShaderResources(0, 3, m7SrvArr)
+
+    ; ---- bind the affine CB at b0 (already uploaded by Mode7SetParams) ----
+    mov     rax, [rip + pM7CB]
+    mov     [rip + m7CBArr], rax
+    pContext.PSSetConstantBuffers(0, 1, m7CBArr)
+
+    ; ---- shaders + raster + opaque (the pass fully writes the layer RT) ----
+    pContext.VSSetShader([rip + pM7VS], 0, 0)
+    pContext.PSSetShader([rip + pM7PS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+    pContext.OMSetBlendState([rip + pBlendOpaque], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(4)       ; TRIANGLELIST
+    pContext.Draw(3, 0)
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+m7CamZ    DWORD 0                          ; camZ float bits (set by Mode7SetCamZ)
+
+; per-layer toroidal WRAP period (world px). Default = full tile world; a caller
+; sets these to the painted map's pixel period via Mode7SetWrap (see there).
+m7WrapW   DWORD 1024                       ; default TileWorldW
+m7WrapH   DWORD 360                        ; default TileWorldH
+
+; ---- float constants for BuildSinLUT's Bhaskara sine approximation ----
+f2piOver256 DWORD 0x3CC90FDB              ; 2pi/256 = 0.024543693
+fPi         DWORD 0x40490FDB              ; pi
+f2pi        DWORD 0x40C90FDB              ; 2pi
+fBhaskaraB  DWORD 0x3FA2F983              ; 4/pi   =  1.2732395
+fBhaskaraC  DWORD 0xBECF817B             ; -4/pi^2 = -0.4052847
+.balign 16
+fAbsMask    DWORD 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF   ; clear sign bit
+
+; init subresource for the affine constant buffer (pSysMem patched in Mode7Init).
+m7cbInit struct D3D11_SUBRESOURCE_DATA
+    SysMemPitch      = 0
+    SysMemSlicePitch = 0
+ends
