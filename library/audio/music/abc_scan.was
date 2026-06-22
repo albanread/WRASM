@@ -1,0 +1,288 @@
+; abc_scan.was — lexing helpers + key/accidental/duration/timing procs.
+; Part of the abc.was shell (.CODE). Shares state via abc_data.inc.
+
+; ----------------------------------------------------------------------------
+; ApplyKey(ecx = sharps): seed keyAcc[0..6] from a key signature.
+;   sharps > 0 -> that many sharps in order F C G D A E B
+;   sharps < 0 -> that many flats  in order B E A D G C F
+; Pitch-class index map (C=0 D=1 E=2 F=3 G=4 A=5 B=6).  No calls -> no frame.
+; ----------------------------------------------------------------------------
+proc ApplyKey in rcx
+    lea     r9, [rip + keyAcc]
+    xor     eax, eax
+    mov     [r9 + 0], eax
+    mov     [r9 + 4], eax
+    mov     [r9 + 8], eax
+    mov     [r9 + 12], eax
+    mov     [r9 + 16], eax
+    mov     [r9 + 20], eax
+    mov     [r9 + 24], eax
+
+    mov     edx, ecx                  ; edx = signed sharp count
+    test    edx, edx
+    jz      ak_done
+    jl      ak_flats
+
+    ; --- sharps in order F C G D A E B ---
+    lea     r10, [rip + sharpOrd]
+    mov     ecx, edx
+    cmp     ecx, 7
+    jbe     ak_s_ok
+    mov     ecx, 7
+ak_s_ok:
+    xor     r8d, r8d
+ak_s_loop:
+    movsx   rax, byte ptr [r10 + r8]
+    mov     dword ptr [r9 + rax*4], 1
+    inc     r8d
+    cmp     r8d, ecx
+    jb      ak_s_loop
+    jmp     ak_done
+
+ak_flats:
+    neg     edx
+    lea     r10, [rip + flatOrd]
+    mov     ecx, edx
+    cmp     ecx, 7
+    jbe     ak_f_ok
+    mov     ecx, 7
+ak_f_ok:
+    xor     r8d, r8d
+ak_f_loop:
+    movsx   rax, byte ptr [r10 + r8]
+    mov     dword ptr [r9 + rax*4], -1
+    inc     r8d
+    cmp     r8d, ecx
+    jb      ak_f_loop
+ak_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; ResetBar: clear the per-bar accidental override tables (barAcc/barSet).
+; ----------------------------------------------------------------------------
+proc ResetBar
+    lea     r9, [rip + barAcc]
+    lea     r10, [rip + barSet]
+    xor     eax, eax
+    mov     ecx, 7
+rb_loop:
+    mov     [r9], eax
+    mov     [r10], eax
+    add     r9, 4
+    add     r10, 4
+    dec     ecx
+    jnz     rb_loop
+endproc
+
+; ----------------------------------------------------------------------------
+; EmitEvent(ecx = timeMs, edx = status, r8d = d1 note, r9d = d2 vel):
+;   append a MidiEvent (chan 0) to tuneEv; bumps tuneCount (capped at 4096).
+; ----------------------------------------------------------------------------
+proc EmitEvent in rcx rdx r8 r9
+    mov     eax, [rip + tuneCount]
+    cmp     eax, 4096
+    jae     ee_done
+    imul    r10d, eax, 20
+    lea     r11, [rip + tuneEv]
+    add     r11, r10
+    mov     [r11 + 0], ecx            ; timeMs
+    mov     [r11 + 4], edx            ; status
+    mov     dword ptr [r11 + 8], 0    ; chan
+    mov     [r11 + 12], r8d           ; d1
+    mov     [r11 + 16], r9d           ; d2
+    inc     eax
+    mov     [rip + tuneCount], eax
+ee_done:
+endproc
+
+; ----------------------------------------------------------------------------
+; SkipSpaces: advance txtPtr past spaces/tabs.  No calls.
+; ----------------------------------------------------------------------------
+proc SkipSpaces uses rsi
+    mov     rsi, [rip + txtPtr]
+ss_loop:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, ' '
+    je      ss_next
+    cmp     al, 9
+    je      ss_next
+    mov     [rip + txtPtr], rsi
+    ret
+ss_next:
+    inc     rsi
+    jmp     ss_loop
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseUInt -> eax = parsed non-negative integer; advances txtPtr past digits.
+; If no digits, returns 0 and leaves txtPtr unmoved.  No calls.
+; ----------------------------------------------------------------------------
+proc ParseUInt uses rsi
+    mov     rsi, [rip + txtPtr]
+    xor     eax, eax
+pu_loop:
+    movzx   ecx, byte ptr [rsi]
+    cmp     cl, '0'
+    jb      pu_done
+    cmp     cl, '9'
+    ja      pu_done
+    imul    eax, eax, 10
+    sub     ecx, '0'
+    add     eax, ecx
+    inc     rsi
+    jmp     pu_loop
+pu_done:
+    mov     [rip + txtPtr], rsi
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseKey: read a key from txtPtr (e.g. "C","G","F","Bb","F#"); compute signed
+; sharp count via circle of fifths and call ApplyKey.  Only the root letter +
+; one optional #/b is honoured (mode/minor DEFERRED).  Calls -> frame.
+; ----------------------------------------------------------------------------
+proc ParseKey uses rsi rbx frame
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    ; uppercase the letter
+    cmp     al, 'a'
+    jb      pk_haveU
+    cmp     al, 'z'
+    ja      pk_haveU
+    sub     al, 32
+pk_haveU:
+    cmp     al, 'A'
+    jb      pk_default
+    cmp     al, 'G'
+    ja      pk_default
+
+    movzx   ecx, al
+    sub     ecx, 'A'                  ; letter index 0..6 (A..G)
+    lea     r9, [rip + keyFifths]
+    movsx   ebx, byte ptr [r9 + rcx]  ; base fifths (signed)
+    inc     rsi                       ; consume root letter
+
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '#'
+    je      pk_sharp
+    cmp     al, 'b'
+    je      pk_flat
+    jmp     pk_apply
+pk_sharp:
+    add     ebx, 7
+    inc     rsi
+    jmp     pk_apply
+pk_flat:
+    sub     ebx, 7
+    inc     rsi
+pk_apply:
+    mov     [rip + txtPtr], rsi
+    mov     ecx, ebx
+    call    ApplyKey
+    ret
+
+pk_default:
+    mov     [rip + txtPtr], rsi
+    xor     ecx, ecx
+    call    ApplyKey
+endproc
+
+; ----------------------------------------------------------------------------
+; ParseDuration -> xmm0 = whole-note duration = (N/M)*(unitN/unitD).
+; Consumes an optional duration suffix at txtPtr: bare N, /, /M, N/M, //.
+; Calls ParseUInt -> frame.
+; ----------------------------------------------------------------------------
+proc ParseDuration uses rsi frame
+    mov     r10d, 1                   ; num
+    mov     r11d, 1                   ; den
+    mov     rsi, [rip + txtPtr]
+
+    ; leading number?
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '0'
+    jb      pd_no_lead
+    cmp     al, '9'
+    ja      pd_no_lead
+    call    ParseUInt                 ; eax = N, txtPtr advanced
+    test    eax, eax
+    jz      pd_after_lead
+    mov     r10d, eax
+pd_after_lead:
+    mov     rsi, [rip + txtPtr]
+pd_no_lead:
+    ; slash?
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '/'
+    jne     pd_compute
+    inc     rsi                       ; consume '/'
+    mov     [rip + txtPtr], rsi
+    mov     r11d, 2                   ; first slash -> /2 baseline
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '0'
+    jb      pd_more_slash
+    cmp     al, '9'
+    ja      pd_more_slash
+    call    ParseUInt                 ; eax = M
+    test    eax, eax
+    jz      pd_compute
+    mov     r11d, eax
+    jmp     pd_compute
+pd_more_slash:
+    mov     rsi, [rip + txtPtr]
+pd_more_loop:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '/'
+    jne     pd_more_done
+    inc     rsi
+    add     r11d, r11d                ; den *= 2
+    jmp     pd_more_loop
+pd_more_done:
+    mov     [rip + txtPtr], rsi
+
+pd_compute:
+    ; durWholes = (num*unitN) / (den*unitD)
+    mov     eax, r10d
+    imul    eax, [rip + unitN]
+    cvtsi2sd xmm0, eax
+    mov     eax, r11d
+    imul    eax, [rip + unitD]
+    cvtsi2sd xmm1, eax
+    divsd   xmm0, xmm1                ; xmm0 = durWholes
+endproc
+
+; ----------------------------------------------------------------------------
+; MsPerWhole -> xmm0 = tsD * 60000 / bpm   (f64).  No frame.
+; ----------------------------------------------------------------------------
+proc MsPerWhole
+    mov     eax, [rip + tsD]
+    cvtsi2sd xmm0, eax
+    mulsd   xmm0, [rip + f60000]
+    mov     eax, [rip + bpmVal]
+    cvtsi2sd xmm1, eax
+    divsd   xmm0, xmm1
+endproc
+
+; ----------------------------------------------------------------------------
+; RoundCurMs -> eax = round(curMs) = floor(curMs + 0.5).  No frame.
+; ----------------------------------------------------------------------------
+proc RoundCurMs
+    movsd   xmm0, [rip + curMs]
+    addsd   xmm0, [rip + fHalf]
+    roundsd xmm0, xmm0, 1             ; floor
+    cvttsd2si eax, xmm0
+endproc
+
+; ----------------------------------------------------------------------------
+; AdvanceCurMs(xmm0 = durWholes): curMs += durWholes * msPerWhole.
+; Calls MsPerWhole -> frame.  durWholes parked in the global fTmp across the call
+; (xmm6+ are callee-saved but `uses` does not track xmm; a global avoids any
+; manual rsp juggling that would break the frame's alignment guarantee).
+; ----------------------------------------------------------------------------
+proc AdvanceCurMs frame
+    movsd   [rip + fTmp], xmm0        ; durWholes
+    call    MsPerWhole                ; xmm0 = msPerWhole
+    mulsd   xmm0, [rip + fTmp]        ; * durWholes = deltaMs
+    movsd   xmm1, [rip + curMs]
+    addsd   xmm1, xmm0
+    movsd   [rip + curMs], xmm1
+endproc
+

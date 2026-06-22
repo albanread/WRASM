@@ -1,0 +1,224 @@
+; abc_parse.was — ParseTune: the single-pass header/body char state machine.
+; Part of the abc.was shell (.CODE).
+; ----------------------------------------------------------------------------
+; ParseTune(rcx = asciiz textPtr): single-pass char-by-char state machine.
+; Calls everything -> frame.  Cursor lives in txtPtr; rsi is a local view.
+; ----------------------------------------------------------------------------
+proc ParseTune uses rsi rbx frame in rcx
+    mov     [rip + txtPtr], rcx
+
+    ; --- reset working state to defaults ---
+    movsd   xmm0, [rip + fZero]
+    movsd   [rip + curMs], xmm0
+    mov     dword ptr [rip + tuneCount], 0
+    mov     dword ptr [rip + tuneEndMs], 0
+    mov     dword ptr [rip + bpmVal], 120
+    mov     dword ptr [rip + unitN], 1
+    mov     dword ptr [rip + unitD], 8
+    mov     dword ptr [rip + tsN], 4
+    mov     dword ptr [rip + tsD], 4
+    mov     dword ptr [rip + inBody], 0
+    xor     ecx, ecx
+    call    ApplyKey
+    call    ResetBar
+
+pt_loop:
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pt_end
+
+    cmp     dword ptr [rip + inBody], 0
+    jne     pt_body
+
+    ; ---------- HEADER MODE ---------- (rsi at line start)
+    movzx   ebx, byte ptr [rsi + 1]
+    cmp     bl, ':'
+    jne     pt_h_skipline
+
+    cmp     al, 'L'
+    je      pt_h_L
+    cmp     al, 'M'
+    je      pt_h_M
+    cmp     al, 'Q'
+    je      pt_h_Q
+    cmp     al, 'K'
+    je      pt_h_K
+    jmp     pt_h_skipline
+
+pt_h_L:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; N
+    test    eax, eax
+    jnz     pt_h_L_n_ok
+    mov     eax, 1
+pt_h_L_n_ok:
+    mov     [rip + unitN], eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pt_h_L_setd1
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; D
+    test    eax, eax
+    jnz     pt_h_L_d_ok
+    mov     eax, 1
+pt_h_L_d_ok:
+    mov     [rip + unitD], eax
+    jmp     pt_h_skipline
+pt_h_L_setd1:
+    mov     dword ptr [rip + unitD], 1
+    jmp     pt_h_skipline
+
+pt_h_M:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    mov     rsi, [rip + txtPtr]
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 'C'                   ; "C" / "C|" common/cut -> 4/4
+    jne     pt_h_M_num
+    mov     dword ptr [rip + tsN], 4
+    mov     dword ptr [rip + tsD], 4
+    jmp     pt_h_skipline
+pt_h_M_num:
+    call    ParseUInt                 ; N
+    test    eax, eax
+    jnz     pt_h_M_n_ok
+    mov     eax, 4
+pt_h_M_n_ok:
+    mov     [rip + tsN], eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pt_h_skipline
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; D
+    test    eax, eax
+    jnz     pt_h_M_d_ok
+    mov     eax, 4
+pt_h_M_d_ok:
+    mov     [rip + tsD], eax
+    jmp     pt_h_skipline
+
+pt_h_Q:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; first number
+    mov     ebx, eax
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '/'
+    jne     pt_h_Q_chkeq
+    inc     rsi                       ; skip "/D"
+    mov     [rip + txtPtr], rsi
+    call    ParseUInt                 ; discard denominator
+pt_h_Q_chkeq:
+    mov     rsi, [rip + txtPtr]
+    movzx   edx, byte ptr [rsi]
+    cmp     dl, '='
+    jne     pt_h_Q_use_first
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseUInt                 ; bpm after '='
+    test    eax, eax
+    jz      pt_h_Q_use_first
+    mov     [rip + bpmVal], eax
+    jmp     pt_h_skipline
+pt_h_Q_use_first:
+    test    ebx, ebx
+    jz      pt_h_skipline
+    mov     [rip + bpmVal], ebx
+    jmp     pt_h_skipline
+
+pt_h_K:
+    add     rsi, 2
+    mov     [rip + txtPtr], rsi
+    call    SkipSpaces
+    call    ParseKey                  ; sets keyAcc, advances txtPtr
+    mov     dword ptr [rip + inBody], 1
+    call    ResetBar
+    jmp     pt_h_skipline
+
+pt_h_skipline:
+    mov     rsi, [rip + txtPtr]
+pt_h_skip2:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      pt_end_sync
+    cmp     al, 10
+    je      pt_h_eol
+    inc     rsi
+    jmp     pt_h_skip2
+pt_h_eol:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+pt_end_sync:
+    mov     [rip + txtPtr], rsi
+    jmp     pt_end
+
+    ; ---------- BODY MODE ----------
+pt_body:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, '|'
+    je      pt_b_bar
+    cmp     al, 'z'
+    je      pt_b_rest
+    cmp     al, 'Z'
+    je      pt_b_rest
+    cmp     al, '^'
+    je      pt_b_note
+    cmp     al, '_'
+    je      pt_b_note
+    cmp     al, '='
+    je      pt_b_note
+    cmp     al, 'A'
+    jb      pt_b_skip
+    cmp     al, 'G'
+    jbe     pt_b_note
+    cmp     al, 'a'
+    jb      pt_b_skip
+    cmp     al, 'g'
+    jbe     pt_b_note
+pt_b_skip:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
+pt_b_bar:
+    call    ResetBar
+    inc     rsi
+    movzx   eax, byte ptr [rsi]
+    cmp     al, ':'                   ; |:
+    je      pt_b_bar_eat
+    cmp     al, '|'                   ; ||
+    je      pt_b_bar_eat
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+pt_b_bar_eat:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    jmp     pt_loop
+
+pt_b_rest:
+    inc     rsi
+    mov     [rip + txtPtr], rsi
+    call    ParseDuration             ; xmm0 = durWholes
+    call    AdvanceCurMs              ; curMs += durWholes * msPerWhole
+    jmp     pt_loop
+
+pt_b_note:
+    call    ParseNote                 ; emits NoteOn/NoteOff, advances txtPtr+curMs
+    jmp     pt_loop
+
+pt_end:
+    call    FinalizeTune
+endproc
+

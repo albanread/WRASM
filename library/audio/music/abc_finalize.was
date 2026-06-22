@@ -1,0 +1,118 @@
+; abc_finalize.was — FinalizeTune (stable sort by time,priority) + WriteTune dump.
+; Part of the abc.was shell (.CODE).
+; ----------------------------------------------------------------------------
+; FinalizeTune: stable insertion-sort tuneEv[0..count) by composite key
+;   key = timeMs*16 + priority,  priority NoteOff(1) < NoteOn(4).
+; Then tuneEndMs = max timeMs.  20-byte records moved whole.  Calls helpers ->
+; frame.  Non-volatiles: rbx (base), r12 (i), r13 (key i), r14 (j), r15 (count).
+; ----------------------------------------------------------------------------
+proc FinalizeTune uses rbx r12 r13 r14 r15 frame
+    mov     r15d, [rip + tuneCount]
+    cmp     r15d, 2
+    jb      ft_endms
+    lea     rbx, [rip + tuneEv]
+
+    mov     r12d, 1                   ; i = 1
+ft_outer:
+    cmp     r12d, r15d
+    jae     ft_endms
+
+    imul    eax, r12d, 20
+    lea     r8, [rbx + rax]           ; &rec[i]
+    call    ftKeyOf                   ; rax = key(i)
+    mov     r13, rax                  ; save key(i)
+    ; tempRec = rec[i]
+    imul    eax, r12d, 20
+    lea     rcx, [rbx + rax]
+    lea     rdx, [rip + ftTemp]
+    call    ftCopy20
+
+    mov     r14d, r12d
+    dec     r14d                      ; j = i-1
+ft_inner:
+    cmp     r14d, 0
+    jl      ft_place
+    imul    eax, r14d, 20
+    lea     r8, [rbx + rax]           ; &rec[j]
+    call    ftKeyOf                   ; rax = key(j)
+    cmp     rax, r13
+    jle     ft_place                  ; key(j) <= key(i) -> stable: place after j
+    ; rec[j+1] = rec[j]
+    imul    eax, r14d, 20
+    lea     rcx, [rbx + rax]          ; src = rec[j]
+    add     eax, 20
+    lea     rdx, [rbx + rax]          ; dst = rec[j+1]
+    call    ftCopy20
+    dec     r14d
+    jmp     ft_inner
+ft_place:
+    mov     eax, r14d
+    inc     eax
+    imul    eax, eax, 20
+    lea     rdx, [rbx + rax]          ; dst = rec[j+1]
+    lea     rcx, [rip + ftTemp]
+    call    ftCopy20
+    inc     r12d
+    jmp     ft_outer
+
+ft_endms:
+    xor     r9d, r9d                  ; max
+    mov     ecx, [rip + tuneCount]
+    test    ecx, ecx
+    jz      ft_store_end
+    lea     rbx, [rip + tuneEv]
+    xor     r8d, r8d
+ft_max_loop:
+    imul    eax, r8d, 20
+    mov     edx, [rbx + rax]
+    cmp     edx, r9d
+    jbe     ft_max_next
+    mov     r9d, edx
+ft_max_next:
+    inc     r8d
+    cmp     r8d, ecx
+    jb      ft_max_loop
+ft_store_end:
+    mov     [rip + tuneEndMs], r9d
+    mov     eax, [rip + bpmVal]
+    mov     [rip + tuneBpm], eax
+endproc
+
+; ftKeyOf(r8 = &record) -> rax = timeMs*16 + priority.  No frame (leaf).
+proc ftKeyOf in r8
+    mov     eax, [r8 + 0]             ; timeMs (zero-extended into rax)
+    mov     ecx, [r8 + 4]             ; status
+    mov     edx, 1                    ; default priority (NoteOff / other)
+    cmp     ecx, 0x90
+    jne     fk_have
+    mov     edx, 4                    ; NoteOn
+fk_have:
+    shl     rax, 4                    ; timeMs*16
+    add     rax, rdx
+endproc
+
+; ftCopy20(rcx = src, rdx = dst): copy a 20-byte record.  No frame (leaf).
+proc ftCopy20 in rcx rdx
+    mov     rax, [rcx + 0]
+    mov     [rdx + 0], rax
+    mov     rax, [rcx + 8]
+    mov     [rdx + 8], rax
+    mov     eax, [rcx + 16]
+    mov     [rdx + 16], eax
+endproc
+
+; ----------------------------------------------------------------------------
+; WriteTune(rcx = pathPtrW): dump the first tuneCount events as raw 20-byte
+; records to a binary file (CreateFileW/WriteFile/CloseHandle).  Calls -> frame.
+; ----------------------------------------------------------------------------
+proc WriteTune uses rbx frame in rcx
+    mov     eax, [rip + tuneCount]
+    imul    eax, eax, 20
+    mov     [rip + twBytes], eax      ; byteCount via memory (invoke clobbers eax)
+
+    invoke  CreateFileW, rcx, 0x40000000, 0, 0, 2, 0x80, 0
+    mov     rbx, rax
+
+    invoke  WriteFile, rbx, tuneEv, [rip + twBytes], twWrote, 0
+    invoke  CloseHandle, rbx
+endproc
