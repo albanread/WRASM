@@ -70,6 +70,21 @@ Spiked before writing any synth, and it reshapes the math:
   Better than libm: fully self-contained, deterministic, transparent — no CRT
   dependency, the classic wavetable-synth approach.
 
+### Dialect gotchas (learned building Sprint 1 — read before writing audio asm)
+
+- **`invoke` uses `rax`/`eax` as scratch** to stage stack arguments (it emits
+  `mov rax, <stackarg>; mov [rsp+N], rax` *before* the register args). So **never pass
+  an `invoke` argument that lives in `rax`/`eax`** — it gets clobbered. Pass such a
+  value through memory (a `DWORD`/`QWORD` slot) or a non-rax register. (This silently
+  produced a header-only WAV until found.)
+- **XMM volatility (Win64): `xmm0..xmm5` are volatile, `xmm6..xmm15` are callee-saved.**
+  A `proc` may use `xmm0..xmm5` as free scratch; if it touches `xmm6..xmm15` it must save
+  them. The `uses` contract tracks *gp* registers only — it will NOT catch a clobbered
+  `xmm6+`. A caller can park loop state in `xmm6..xmm15` across a `call` only if the
+  callee honors them (ours do, by staying in `xmm0..xmm5`).
+- `proc … frame` is required for any proc that contains `invoke`/`call` (aligned shadow
+  space); `--check` enforces it. Float args to `invoke` need a `real4`/`real8` annotation.
+
 # sound/ — the SFX synth
 
 A sound is an **offline render** into a float PCM buffer, then written to `.wav` or

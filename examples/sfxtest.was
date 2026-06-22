@@ -1,0 +1,21 @@
+; sfxtest.was — Sprint 1 audio: render a 440 Hz sine Beep to beep.wav (offline).
+;
+;   was examples\sfxtest.was -o sfx.exe   &&   cd /tmp && sfx.exe   ; writes beep.wav
+;
+; Calls Beep(freqHz, durationMs) to fill the PCM buffer, then WriteWav(pathW) to
+; emit a 44.1 kHz / 16-bit / stereo .wav you can actually hear.
+
+.DATA
+wavName WCHAR "beep.wav", 0
+
+.CODE
+.globl main
+main:
+    mov     ecx, 440          ; A4
+    mov     edx, 500          ; 500 ms
+    call    Beep
+    lea     rcx, [rip + wavName]
+    call    WriteWav
+    invoke  ExitProcess, 0
+
+.include "../library/audio/sound/sound.was"
