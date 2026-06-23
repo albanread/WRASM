@@ -15,3 +15,8 @@ tmp_*.exe
 examples/gpu_*.bmp
 examples/gpu_*.png
 examples/snap_*.bmp
+
+# GPU verification scratch (gate PNGs + parity filmstrips + emit-asm dumps)
+_verify_out/
+examples/g6gate_*.png
+tmp_*.png

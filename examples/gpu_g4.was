@@ -29,6 +29,8 @@
 .include "../gpu/sprite.was"
 .include "../gpu/fx.was"
 .include "../gpu/text.was"
+.include "../gpu/input.was"     ; G5: the harness's library-contract path references input
+.include "../gpu/introspect.was" ; G5: the harness's GameSelfTest references Snapshot
 .include "../gpu/harness.was"
 
 .DATA
