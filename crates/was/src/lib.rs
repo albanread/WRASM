@@ -1661,9 +1661,47 @@ fn collect_equate_defs(src: &str) -> Vec<(String, usize)> {
     defs
 }
 
+/// Interpolate `{{NAME}}` placeholders inside a string span with the equate's
+/// integer value (decimal). Everything else — including multibyte UTF-8 — is copied
+/// verbatim. An unknown `{{NAME}}` (or one with no closing `}}`) is left untouched,
+/// so a literal `{{` only "activates" when it names a real equate.
+fn interpolate_equates(span: &str, eqs: &HashMap<String, i64>) -> String {
+    if !span.contains("{{") {
+        return span.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = span;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        match after.find("}}") {
+            Some(close) => {
+                let name = after[..close].trim();
+                match eqs.get(name) {
+                    Some(v) => out.push_str(&v.to_string()),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(&after[..close]);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after[close + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                out.push_str(after);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Replace whole-word equate names with their integer value, skipping the insides
 /// of double-quoted strings and (already stripped) comments. Single-char `'…'`
-/// literals are copied verbatim too.
+/// literals are copied verbatim too. A `"…"` string passes through
+/// [`interpolate_equates`] so `{{NAME}}` placeholders fold.
 fn substitute_equates(line: &str, eqs: &HashMap<String, i64>) -> String {
     if eqs.is_empty() {
         return line.to_string();
@@ -1687,7 +1725,14 @@ fn substitute_equates(line: &str, eqs: &HashMap<String, i64>) -> String {
                     break;
                 }
             }
-            out.push_str(&line[start..i]);
+            let span = &line[start..i];
+            // A "double-quoted" string interpolates `{{NAME}}`; a 'char' literal is
+            // copied verbatim.
+            if c == '"' {
+                out.push_str(&interpolate_equates(span, eqs));
+            } else {
+                out.push_str(span);
+            }
             continue;
         }
         if c.is_ascii_alphabetic() || c == '_' {
@@ -3364,6 +3409,26 @@ mod tests {
         let d = check(".code\n.globl main\nOFF equ 0\nmain:\n  mov eax, OFF\n  ret\n", &kb);
         assert!(!d.iter().any(|x| x.message.contains("unknown constant")), "no error: {d:?}");
         assert!(d.iter().any(|x| x.message.contains("shadows")), "a shadow note: {d:?}");
+    }
+
+    #[test]
+    fn string_interpolation_folds_equates_into_strings() {
+        let Some(kb) = kb() else { return };
+        // `{{NAME}}` inside a "double-quoted" string interpolates the equate's value;
+        // the rest of the string is verbatim. WCHAR 'v','3' lower to .word 118, .word 51.
+        let low = lower(
+            "VER equ 3\n.data\ns WCHAR \"v{{VER}}\", 0\n.code\n.globl m\nm:\n  ret\n",
+            &kb,
+        )
+        .unwrap();
+        assert!(!low.contains("{{"), "the placeholder is consumed: {low}");
+        // WCHAR "v3" lowers to `.word 118, 51` (v, 3) — the {{VER}} folded to 3.
+        assert!(low.contains("118, 51"), "v{{VER}} -> v3 interpolated: {low}");
+        // The interpolator folds a known name and leaves an unknown one untouched.
+        let mut eqs = std::collections::HashMap::new();
+        eqs.insert("VER".to_string(), 3i64);
+        assert_eq!(interpolate_equates("\"v{{VER}}\"", &eqs), "\"v3\"");
+        assert_eq!(interpolate_equates("\"{{NOPE}}\"", &eqs), "\"{{NOPE}}\"");
     }
 
     #[test]
