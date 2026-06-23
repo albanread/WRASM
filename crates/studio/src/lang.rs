@@ -43,6 +43,26 @@ pub enum Emit {
     Exe,
 }
 
+/// How serious a diagnostic is — mirrors [`was::Severity`] so the GUI/tests need
+/// not depend on `was`. The editor colours by this: Info → blue, Warn →
+/// yellow/amber, Error → red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<was::Severity> for Severity {
+    fn from(s: was::Severity) -> Self {
+        match s {
+            was::Severity::Info => Severity::Info,
+            was::Severity::Warn => Severity::Warn,
+            was::Severity::Error => Severity::Error,
+        }
+    }
+}
+
 /// A diagnostic, decoupled from `was::Diag` so the GUI/tests need not depend on
 /// `was`. `line`/`col` are 1-based; `line == 0` marks a whole-file message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +70,7 @@ pub struct Diag {
     pub line: usize,
     pub col: usize,
     pub message: String,
+    pub severity: Severity,
 }
 
 /// One instruction in the lowered listing: its bytes, a per-byte "unresolved"
@@ -445,7 +466,7 @@ fn handle(kb: &Kb, req: Request) -> Response {
         Request::Check { id, src } => {
             let diags = was::check(&src, kb)
                 .into_iter()
-                .map(|d| Diag { line: d.line, col: d.col, message: d.message })
+                .map(|d| Diag { line: d.line, col: d.col, message: d.message, severity: d.severity.into() })
                 .collect();
             Response::Check { id, diags }
         }

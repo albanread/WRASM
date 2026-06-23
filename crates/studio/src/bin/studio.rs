@@ -117,7 +117,21 @@ mod gui {
     const SEARCH_H: f32 = 40.0; // assistant search-box band
     const OUTPUT_H: f32 = 120.0; // bottom-left output pane
 
-    const SQUIGGLE: u32 = 0xF1_4C_4C; // VS Code error red
+    const SQUIGGLE: u32 = 0xF1_4C_4C; // VS Code error red (Error severity)
+    const DIAG_WARN: u32 = 0xE5_C0_7B; // amber/yellow (Warn severity)
+    const DIAG_INFO: u32 = 0x4F_A6_F1; // blue (Info severity)
+
+    /// The colour for a diagnostic of `sev`: Error → red, Warn → amber, Info →
+    /// blue. The editor squiggle and the output-pane line both use this so the
+    /// two views agree on what's an error vs. an advisory note.
+    fn diag_color(sev: studio::lang::Severity) -> u32 {
+        use studio::lang::Severity;
+        match sev {
+            Severity::Error => SQUIGGLE,
+            Severity::Warn => DIAG_WARN,
+            Severity::Info => DIAG_INFO,
+        }
+    }
     const CARET_COLOR: u32 = theme::TEXT_BRIGHT;
     const BYTE_COLOR: u32 = 0x6E_6E_6E; // listing bytes, dim gray
     const GHOST_COLOR: u32 = 0x86_86_86; // expanded ghost asm, gray
@@ -1094,7 +1108,7 @@ main:
                     let (s, e) = diagnostics::underline(line, d.col);
                     let ux = SRC_X + measure(&line[..s]);
                     let uw = (measure(&line[..e]) - measure(&line[..s])).max(3.0);
-                    render::fill_rect(t, ux, sy + LINE_H - 2.5, uw, 2.0, SQUIGGLE);
+                    render::fill_rect(t, ux, sy + LINE_H - 2.5, uw, 2.0, diag_color(d.severity));
                 }
 
                 // Macro expansion: gray ghost rows of `bytes : asm` beneath. Each
@@ -1158,7 +1172,7 @@ main:
                     };
                     render::draw_text(
                         t, pad, y, w - 2.0 * pad, 16.0, &s,
-                        theme::BODY_FONT, 12.0, false, false, SQUIGGLE, false,
+                        theme::BODY_FONT, 12.0, false, false, diag_color(d.severity), false,
                     );
                     y += 18.0;
                     if y > vh - 20.0 {

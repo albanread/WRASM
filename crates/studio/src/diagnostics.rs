@@ -93,6 +93,7 @@ mod tests {
             line: 3,
             col: 12, // 1-based column of OPEN_EXISTNG on row 2 ("  mov eax, " = 11 chars)
             message: "unknown constant 'OPEN_EXISTNG'".to_string(),
+            severity: crate::lang::Severity::Error,
         }];
         let u = underlines(&lines, &diags);
         assert_eq!(u.len(), 1);
@@ -104,7 +105,7 @@ mod tests {
     #[test]
     fn whole_file_diag_maps_to_first_row() {
         let lines = vec!["a", "b"];
-        let diags = vec![Diag { line: 0, col: 0, message: "file-level".to_string() }];
+        let diags = vec![Diag { line: 0, col: 0, message: "file-level".to_string(), severity: crate::lang::Severity::Info }];
         let u = underlines(&lines, &diags);
         assert_eq!(u[0].row, 0);
         assert_eq!((u[0].start, u[0].end), (0, 1));

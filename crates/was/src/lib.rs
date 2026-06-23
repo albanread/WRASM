@@ -17,12 +17,22 @@ use winkb::Kb;
 /// First four integer/pointer argument registers (Win64).
 const ARG_REGS: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
 
-/// One diagnostic: a 1-based line/column and a message.
+/// How serious a diagnostic is. The IDE colours by this: Info → blue,
+/// Warn → yellow/amber, Error → red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Warn,
+    Error,
+}
+
+/// One diagnostic: a 1-based line/column, a message, and a severity.
 #[derive(Debug, Clone)]
 pub struct Diag {
     pub line: usize,
     pub col: usize,
     pub message: String,
+    pub severity: Severity,
 }
 
 /// One of the six caller-saved general registers an `invoke`/`call`/COM call
@@ -157,6 +167,7 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
                             "proc `{}` reads `{r}` but never sets it — declare `in {r}` if it's an input",
                             p.name
                         ),
+                        severity: Severity::Error,
                     });
                 }
                 // out: declared but never written.
@@ -166,6 +177,7 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
                             line: p.line,
                             col: 1,
                             message: format!("proc `{}` declares `out {o}` but never sets it", p.name),
+                            severity: Severity::Error,
                         });
                     }
                 }
@@ -190,6 +202,7 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
                                 "rsp is off the frame level by {off} byte(s) at this call in framed proc `{}` — a stray push/sub broke the 16-byte alignment the frame guarantees",
                                 p.name
                             ),
+                            severity: Severity::Error,
                         });
                     }
                 }
@@ -207,6 +220,7 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
                         "proc `{}` modifies `{w}` (callee-saved) without saving it — add `{w}` to its `uses` list, or the caller's value is lost",
                         p.name
                     ),
+                    severity: Severity::Error,
                 });
             }
         }
@@ -411,6 +425,7 @@ pub fn clobber_diags(src: &str) -> Vec<Diag> {
             message: format!(
                 "`{reg}` may be clobbered by the call at line {call} — reload it before using it here (it's caller-saved)"
             ),
+            severity: Severity::Warn,
         });
     };
     for (i, raw) in src.lines().enumerate() {
@@ -528,6 +543,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                 message: format!(
                     "equate '{name}' shadows the Windows constant '{c}' — the equate value is used"
                 ),
+                severity: Severity::Warn,
             });
         }
     }
@@ -589,6 +605,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                         line,
                         col,
                         message: format!("{func} takes {} argument(s), got {nargs}", f.params.len()),
+                        severity: Severity::Error,
                     });
                 }
             }
@@ -602,7 +619,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                 match kb.interface(iface) {
                     Ok(None) => {
                         let col = body.find(iface).map(|c| c + 1).unwrap_or(1);
-                        diags.push(Diag { line, col, message: format!("unknown interface '{iface}'") });
+                        diags.push(Diag { line, col, message: format!("unknown interface '{iface}'"), severity: Severity::Error });
                     }
                     Ok(Some(_)) if matches!(vtable_index_of(kb, iface, method), Ok(None)) => {
                         let col = body.rfind(method).map(|c| c + 1).unwrap_or(1);
@@ -610,6 +627,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                             line,
                             col,
                             message: format!("{iface} has no method '{method}'"),
+                            severity: Severity::Error,
                         });
                     }
                     _ => {}
@@ -622,7 +640,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
             let iface = rest.trim();
             if matches!(kb.interface(iface), Ok(None)) {
                 let col = body.find(iface).map(|c| c + 1).unwrap_or(1);
-                diags.push(Diag { line, col, message: format!("unknown interface '{iface}'") });
+                diags.push(Diag { line, col, message: format!("unknown interface '{iface}'"), severity: Severity::Error });
             }
             continue;
         }
@@ -632,7 +650,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                 let iface = iface.trim();
                 if matches!(kb.interface(iface), Ok(None)) {
                     let col = body.find(iface).map(|c| c + 1).unwrap_or(1);
-                    diags.push(Diag { line, col, message: format!("unknown interface '{iface}'") });
+                    diags.push(Diag { line, col, message: format!("unknown interface '{iface}'"), severity: Severity::Error });
                 }
             }
             continue;
@@ -641,7 +659,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
         if let Some((_, iface, method, _)) = parse_method_call(t, &com_objs) {
             if matches!(vtable_index_of(kb, &iface, &method), Ok(None)) {
                 let col = body.rfind(&method).map(|c| c + 1).unwrap_or(1);
-                diags.push(Diag { line, col, message: format!("{iface} has no method '{method}'") });
+                diags.push(Diag { line, col, message: format!("{iface} has no method '{method}'"), severity: Severity::Error });
             }
             continue;
         }
@@ -658,6 +676,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                                 line,
                                 col,
                                 message: format!("{n} doesn't fit a {width}-byte {type_kw} field"),
+                                severity: Severity::Error,
                             });
                         }
                     }
@@ -682,7 +701,7 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
                 .map(|l| l.len() - l.trim_start().len() + 1)
                 .unwrap_or(1),
         };
-        Diag { line, col, message }
+        Diag { line, col, message, severity: Severity::Error }
     };
     match lower_mapped(src, kb) {
         Err(e) => {
@@ -760,6 +779,7 @@ fn check_idents(body: &str, line: usize, kb: &Kb, labels: &HashSet<String>, diag
                                 line,
                                 col,
                                 message: format!("{lhs} has no field '{field}'{near}"),
+                                severity: Severity::Error,
                             });
                         }
                     }
@@ -772,6 +792,7 @@ fn check_idents(body: &str, line: usize, kb: &Kb, labels: &HashSet<String>, diag
                                 line,
                                 col,
                                 message: format!("unknown constant '{tok}' — did you mean '{best}'?"),
+                                severity: Severity::Error,
                             });
                         }
                     }
@@ -3343,6 +3364,27 @@ mod tests {
         let d = check(".code\n.globl main\nOFF equ 0\nmain:\n  mov eax, OFF\n  ret\n", &kb);
         assert!(!d.iter().any(|x| x.message.contains("unknown constant")), "no error: {d:?}");
         assert!(d.iter().any(|x| x.message.contains("shadows")), "a shadow note: {d:?}");
+    }
+
+    #[test]
+    fn check_severity_separates_shadow_warnings_from_real_errors() {
+        let Some(kb) = kb() else { return };
+        // The equate-shadow note is advisory — it must carry Severity::Warn.
+        let d = check(".code\n.globl main\nOFF equ 0\nmain:\n  mov eax, OFF\n  ret\n", &kb);
+        let shadow = d
+            .iter()
+            .find(|x| x.message.contains("shadows"))
+            .expect("a shadow note");
+        assert_eq!(shadow.severity, Severity::Warn, "shadow note is a warning: {shadow:?}");
+        // A genuine unknown constant is a real error — Severity::Error. Use a
+        // near-miss of a real Windows constant (OPEN_EXISTING) so the "did you
+        // mean" suggestion fires and the diagnostic is produced.
+        let d = check(".code\n.globl main\nmain:\n  mov eax, OPEN_EXISTNG\n  ret\n", &kb);
+        let unknown = d
+            .iter()
+            .find(|x| x.message.contains("unknown constant 'OPEN_EXISTNG'"))
+            .expect("an unknown-constant error");
+        assert_eq!(unknown.severity, Severity::Error, "unknown constant is an error: {unknown:?}");
     }
 
     #[test]
