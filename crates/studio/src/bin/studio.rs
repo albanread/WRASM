@@ -69,12 +69,12 @@ mod gui {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
-        GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassExW, SetTimer,
+        GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer,
         SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA,
-        IDC_ARROW, MSG, SW_SHOW, WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
-        WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
-        WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN,
-        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        HTCLIENT, IDC_ARROW, IDC_SIZENS, IDC_SIZEWE, MSG, SW_SHOW, WINDOW_EX_STYLE, WM_CHAR,
+        WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER,
+        WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, GetMenuItemCount,
@@ -115,7 +115,17 @@ mod gui {
     const SRC_X: f32 = LN_W + BYTES_W + 8.0; // where source / ghost asm begins
 
     const SEARCH_H: f32 = 40.0; // assistant search-box band
-    const OUTPUT_H: f32 = 120.0; // bottom-left output pane
+    const OUTPUT_H: f32 = 120.0; // bottom-left output pane — the default/restore height
+
+    // Draggable splitters between the three panes (editor | assistant, editor / output).
+    const SPLIT_W: f32 = 8.0; // splitter grab + glow band width (DIPs)
+    const SPLIT_HALF: f32 = SPLIT_W * 0.5;
+    const TOGGLE_LEN: f32 = 36.0; // collapse button length along the splitter
+    const TOGGLE_THICK: f32 = 16.0; // collapse button thickness across the splitter
+    const MIN_PANE: f32 = 90.0; // smallest a pane may be dragged to
+    const SPLIT_GLOW: u32 = 0x4F_A6_F1; // hover/drag accent (the Info blue)
+    const SPLIT_GLOW_BG: u32 = 0x21_33_45; // dim wash behind the glow line
+    const TOGGLE_BG: u32 = 0x33_33_3D; // resting collapse-button background
 
     const SQUIGGLE: u32 = 0xF1_4C_4C; // VS Code error red (Error severity)
     const DIAG_WARN: u32 = 0xE5_C0_7B; // amber/yellow (Warn severity)
@@ -389,6 +399,14 @@ main:
         }
     }
 
+    /// The two draggable splitters: `Col` is the vertical editor | assistant
+    /// divider; `Row` is the horizontal editor / output divider (left column).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Split {
+        Col,
+        Row,
+    }
+
     struct App {
         hwnd: HWND,
         dpi: u32,
@@ -450,6 +468,18 @@ main:
         comp_start: usize,
         /// The in-flight completion request id (matches a `Completions` reply).
         pending_complete: u64,
+
+        /// Vertical split position as a fraction of the viewport width.
+        split_frac: f32,
+        /// Output-pane height in DIPs (restored when reopened).
+        output_h: f32,
+        /// Pane visibility — a collapsed pane shows only its splitter + toggle.
+        assistant_open: bool,
+        output_open: bool,
+        /// The splitter the pointer is over (drives the glow + resize cursor).
+        hover_split: Option<Split>,
+        /// The splitter being dragged, if any.
+        drag_split: Option<Split>,
     }
 
     impl App {
@@ -499,6 +529,12 @@ main:
                 comp_sel: 0,
                 comp_start: 0,
                 pending_complete: 0,
+                split_frac: SPLIT_FRAC,
+                output_h: OUTPUT_H,
+                assistant_open: true,
+                output_open: true,
+                hover_split: None,
+                drag_split: None,
             };
             unsafe { app.build_menu() };
             app.update_title();
@@ -519,6 +555,65 @@ main:
         }
         fn invalidate(&self) {
             let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        }
+
+        // ── splitter geometry (single source of truth for pane bounds) ───────
+
+        /// X of the vertical splitter (editor | assistant). Collapsed → the
+        /// splitter parks at the right edge so only its toggle shows.
+        fn split_x(&self, vw: f32) -> f32 {
+            if !self.assistant_open {
+                return (vw - SPLIT_W).max(0.0);
+            }
+            let hi = (vw - MIN_PANE).max(MIN_PANE);
+            (vw * self.split_frac).clamp(MIN_PANE, hi)
+        }
+
+        /// Y of the horizontal splitter (editor / output). Collapsed → it parks
+        /// at the bottom so only its toggle shows.
+        fn split_y(&self, vh: f32) -> f32 {
+            if !self.output_open {
+                return (vh - SPLIT_W).max(0.0);
+            }
+            let hi = (vh - MIN_PANE).max(MIN_PANE);
+            (vh - self.output_h).clamp(MIN_PANE, hi)
+        }
+
+        /// The splitter whose grab band contains the point (a touch wider than the
+        /// drawn line for easy grabbing), or `None`.
+        fn splitter_at(&self, x: f32, y: f32) -> Option<Split> {
+            let (vw, vh) = self.viewport();
+            let sx = self.split_x(vw);
+            if (x - sx).abs() <= SPLIT_HALF + 1.5 {
+                return Some(Split::Col);
+            }
+            let sy = self.split_y(vh);
+            if x < sx && (y - sy).abs() <= SPLIT_HALF + 1.5 {
+                return Some(Split::Row);
+            }
+            None
+        }
+
+        /// The collapse-toggle rect `(x, y, w, h)` for a splitter — `< >` midway
+        /// down the vertical one, `^ v` midway across the horizontal one.
+        fn toggle_rect(&self, s: Split, vw: f32, vh: f32) -> (f32, f32, f32, f32) {
+            let sx = self.split_x(vw);
+            match s {
+                Split::Col => (sx - TOGGLE_THICK * 0.5, vh * 0.5 - TOGGLE_LEN * 0.5, TOGGLE_THICK, TOGGLE_LEN),
+                Split::Row => {
+                    let sy = self.split_y(vh);
+                    (sx * 0.5 - TOGGLE_LEN * 0.5, sy - TOGGLE_THICK * 0.5, TOGGLE_LEN, TOGGLE_THICK)
+                }
+            }
+        }
+
+        /// The splitter whose toggle button contains the point, or `None`.
+        fn toggle_at(&self, x: f32, y: f32) -> Option<Split> {
+            let (vw, vh) = self.viewport();
+            [Split::Col, Split::Row].into_iter().find(|&s| {
+                let (rx, ry, rw, rh) = self.toggle_rect(s, vw, vh);
+                x >= rx && x < rx + rw && y >= ry && y < ry + rh
+            })
         }
 
         // ── language-thread refresh (synchronous; sub-ms on a small buffer) ──
@@ -903,16 +998,18 @@ main:
         /// a viewport size in DIPs. Shared by the live window and the offscreen
         /// [`snapshot`](App::snapshot); owns `BeginDraw`/`EndDraw`.
         unsafe fn render_frame(&mut self, target: &ID2D1RenderTarget, vw: f32, vh: f32) {
-            let split = vw * SPLIT_FRAC;
-            let editor_h = (vh - OUTPUT_H).max(0.0);
+            let split = self.split_x(vw);
+            let editor_h = self.split_y(vh);
 
             // Assistant card: laid out below the search band, right of the split.
-            let card_x = split + theme::H_PAD;
-            let card_w = (vw - card_x - theme::H_PAD).max(80.0);
-            self.relayout_card(card_x, card_w, SEARCH_H + 4.0);
-            let total = self.card_layout.as_ref().map(|l| l.total_h).unwrap_or(0.0);
-            self.card_max_scroll = (total - vh).max(0.0);
-            self.card_scroll = self.card_scroll.min(self.card_max_scroll);
+            if self.assistant_open {
+                let card_x = split + theme::H_PAD;
+                let card_w = (vw - card_x - theme::H_PAD).max(80.0);
+                self.relayout_card(card_x, card_w, SEARCH_H + 4.0);
+                let total = self.card_layout.as_ref().map(|l| l.total_h).unwrap_or(0.0);
+                self.card_max_scroll = (total - vh).max(0.0);
+                self.card_scroll = self.card_scroll.min(self.card_max_scroll);
+            }
 
             target.BeginDraw();
             let bg = theme::hex(theme::BG);
@@ -920,17 +1017,79 @@ main:
 
             self.draw_editor(target, split, editor_h);
             self.draw_completion(target, split, editor_h);
-            self.draw_output(target, split, editor_h, vh);
-
-            if let Some(c) = self.card_layout.as_ref() {
-                let _ = render::draw_document(target, c, self.card_scroll, vh);
+            if self.output_open {
+                self.draw_output(target, split, editor_h, vh);
             }
-            self.draw_search(target, split, vw);
 
-            // Column divider on top of everything.
-            render::fill_rect(target, split, 0.0, 1.5, vh, theme::BORDER);
+            if self.assistant_open {
+                if let Some(c) = self.card_layout.as_ref() {
+                    let _ = render::draw_document(target, c, self.card_scroll, vh);
+                }
+                self.draw_search(target, split, vw);
+            }
+
+            // The draggable splitters (glow + collapse toggles), on top of all.
+            self.draw_splitters(target, vw, vh);
 
             let _ = target.EndDraw(None, None);
+        }
+
+        /// Draw the two splitters: a thin divider normally, a glowing band when
+        /// hovered or dragged, each with a collapse toggle midway along it.
+        unsafe fn draw_splitters(&self, t: &ID2D1RenderTarget, vw: f32, vh: f32) {
+            let sx = self.split_x(vw);
+            let sy = self.split_y(vh);
+
+            let col_lit =
+                self.hover_split == Some(Split::Col) || self.drag_split == Some(Split::Col);
+            if col_lit {
+                render::fill_rect(t, sx - SPLIT_HALF, 0.0, SPLIT_W, vh, SPLIT_GLOW_BG);
+                render::fill_rect(t, sx - 0.9, 0.0, 1.8, vh, SPLIT_GLOW);
+            } else {
+                render::fill_rect(t, sx - 0.75, 0.0, 1.5, vh, theme::BORDER);
+            }
+
+            // The horizontal splitter spans the editor/output column only.
+            let row_lit =
+                self.hover_split == Some(Split::Row) || self.drag_split == Some(Split::Row);
+            if row_lit {
+                render::fill_rect(t, 0.0, sy - SPLIT_HALF, sx, SPLIT_W, SPLIT_GLOW_BG);
+                render::fill_rect(t, 0.0, sy - 0.9, sx, 1.8, SPLIT_GLOW);
+            } else {
+                render::fill_rect(t, 0.0, sy - 0.75, sx, 1.5, theme::BORDER);
+            }
+
+            self.draw_toggle(t, Split::Col, vw, vh, col_lit);
+            self.draw_toggle(t, Split::Row, vw, vh, row_lit);
+        }
+
+        /// Draw one collapse toggle: a small button with a chevron whose
+        /// direction shows what a click does (collapse when open, reveal when not).
+        unsafe fn draw_toggle(&self, t: &ID2D1RenderTarget, s: Split, vw: f32, vh: f32, lit: bool) {
+            let (rx, ry, rw, rh) = self.toggle_rect(s, vw, vh);
+            render::fill_rect(t, rx, ry, rw, rh, if lit { SPLIT_GLOW } else { TOGGLE_BG });
+            let glyph = match s {
+                Split::Col => {
+                    if self.assistant_open {
+                        ">"
+                    } else {
+                        "<"
+                    }
+                }
+                Split::Row => {
+                    if self.output_open {
+                        "v"
+                    } else {
+                        "^"
+                    }
+                }
+            };
+            let sz = EDITOR_SIZE * 0.95;
+            let gw = render::measure_text(glyph, EDITOR_FONT, sz, true, false);
+            let gx = rx + (rw - gw) * 0.5;
+            let gy = ry + (rh - sz) * 0.5 - 1.0;
+            let fg = if lit { 0x10_14_18 } else { theme::TEXT };
+            render::draw_text(t, gx, gy, rw, rh, glyph, EDITOR_FONT, sz, true, false, fg, false);
         }
 
         /// Render the current state into an offscreen WIC bitmap and write it to a
@@ -1018,7 +1177,7 @@ main:
         /// column and its byte column, so a wide string's long `.word` line (and
         /// its many bytes) gets the vertical room it wraps into.
         fn ghost_line_rows(&self, bytes: &[u8], mask: &[bool], asm: &str) -> f32 {
-            let asm_w = (self.viewport().0 * SPLIT_FRAC - 6.0 - SRC_X - 14.0).max(20.0);
+            let asm_w = (self.split_x(self.viewport().0) - 6.0 - SRC_X - 14.0).max(20.0);
             let asm_rows = wrap_rows(asm, asm_w, EDITOR_SIZE * 0.92);
             let byte_rows = wrap_rows(&hex_masked(bytes, mask), BYTES_W - 10.0, BYTE_SIZE);
             asm_rows.max(byte_rows)
@@ -1676,7 +1835,7 @@ main:
 
         /// Visible height of the editor pane in DIPs (above the output pane).
         fn editor_viewport_h(&self) -> f32 {
-            (self.viewport().1 - OUTPUT_H).max(0.0)
+            self.split_y(self.viewport().1).max(0.0)
         }
         /// Total height of all rows (including macro expansions), plus a margin.
         fn editor_content_h(&self) -> f32 {
@@ -1745,17 +1904,34 @@ main:
         /// the selection from the current caret. Ctrl+click over an equate jumps
         /// to its definition (go-to-definition).
         fn on_press(&mut self, x: f32, y: f32, shift: bool, ctrl: bool) {
+            // A splitter toggle collapses or reveals its pane at the default size.
+            if let Some(s) = self.toggle_at(x, y) {
+                match s {
+                    Split::Col => self.assistant_open = !self.assistant_open,
+                    Split::Row => self.output_open = !self.output_open,
+                }
+                self.card_layout = None; // the editor/card width changed
+                self.clamp_editor_scroll();
+                self.invalidate();
+                return;
+            }
+            // Pressing a splitter band begins a drag-resize.
+            if let Some(s) = self.splitter_at(x, y) {
+                self.drag_split = Some(s);
+                return;
+            }
+
             let (vw, vh) = self.viewport();
-            let split = vw * SPLIT_FRAC;
-            let editor_h = (vh - OUTPUT_H).max(0.0);
-            if x >= split {
+            let split = self.split_x(vw);
+            let editor_h = self.split_y(vh);
+            if self.assistant_open && x >= split {
                 if y < SEARCH_H {
                     self.search_active = true;
                     self.invalidate();
                 } else {
                     self.follow_card_link(x, y);
                 }
-            } else if y < editor_h {
+            } else if x < split && y < editor_h {
                 self.search_active = false;
                 // Ctrl+click: if the clicked token is a defined equate, jump to
                 // its definition instead of placing an editing caret.
@@ -1776,6 +1952,35 @@ main:
                 }
                 self.dragging = true;
             }
+        }
+
+        /// Pointer move: resize a splitter being dragged, else refresh the
+        /// splitter hover (glow + resize cursor), else extend a text selection.
+        fn on_mouse_move(&mut self, x: f32, y: f32) {
+            if let Some(s) = self.drag_split {
+                let (vw, vh) = self.viewport();
+                match s {
+                    Split::Col => {
+                        self.split_frac = (x / vw.max(1.0)).clamp(0.05, 0.95);
+                        self.assistant_open = true;
+                        self.card_layout = None;
+                    }
+                    Split::Row => {
+                        let hi = (vh - MIN_PANE).max(MIN_PANE);
+                        self.output_h = (vh - y).clamp(MIN_PANE, hi);
+                        self.output_open = true;
+                        self.clamp_editor_scroll();
+                    }
+                }
+                self.invalidate();
+                return;
+            }
+            let hov = if self.dragging { None } else { self.splitter_at(x, y) };
+            if hov != self.hover_split {
+                self.hover_split = hov;
+                self.invalidate();
+            }
+            self.on_drag(x, y);
         }
 
         /// Go-to-definition for an equate: if the token at `(row, col)` names a
@@ -2053,18 +2258,34 @@ main:
                     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
                 }
             }
+            WM_SETCURSOR => {
+                // Over a splitter, show the resize cursor; otherwise the default.
+                if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                    if let Some(s) = app.hover_split {
+                        let id = match s {
+                            Split::Col => IDC_SIZEWE,
+                            Split::Row => IDC_SIZENS,
+                        };
+                        if let Ok(c) = unsafe { LoadCursorW(None, id) } {
+                            unsafe { SetCursor(Some(c)) };
+                        }
+                        return LRESULT(1);
+                    }
+                }
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
             WM_MOUSEMOVE => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 * scale;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 * scale;
                 app.last_mouse = (x, y);
-                app.on_drag(x, y);
+                app.on_mouse_move(x, y);
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32;
                 let dips = -(delta / 120.0) * WHEEL_STEP;
                 // The wheel scrolls whichever pane the pointer is over.
-                if app.last_mouse.0 >= app.viewport().0 * SPLIT_FRAC {
+                if app.assistant_open && app.last_mouse.0 >= app.split_x(app.viewport().0) {
                     app.scroll_card(dips);
                 } else {
                     app.scroll_editor(dips);
@@ -2081,6 +2302,7 @@ main:
             }
             WM_LBUTTONUP => {
                 app.dragging = false;
+                app.drag_split = None;
                 LRESULT(0)
             }
             WM_DESTROY => {
