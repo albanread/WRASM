@@ -163,6 +163,9 @@ mod gui {
     const VK_K: VIRTUAL_KEY = VIRTUAL_KEY(0x4B); // 'K' (Ctrl+Shift+K = delete line)
     const VK_BACK: VIRTUAL_KEY = VIRTUAL_KEY(0x08);
     const VK_TAB: VIRTUAL_KEY = VIRTUAL_KEY(0x09);
+    const VK_SLASH: VIRTUAL_KEY = VIRTUAL_KEY(0xBF); // VK_OEM_2 '/' (Ctrl+/ = comment)
+    const CUR_LINE: u32 = 0x1B_1B_24; // current-line highlight (subtle)
+    const BRACKET_HL: u32 = 0x3A_5A_3A; // matching-bracket box
 
     // The go-to-label palette.
     const FIND_ITEM_H: f32 = 22.0;
@@ -248,6 +251,21 @@ main:
         } else {
             render::measure_text(s, EDITOR_FONT, EDITOR_SIZE, false, false)
         }
+    }
+
+    /// The byte column of a bracket at, or just before, `col` on `line`.
+    fn bracket_near(line: &str, col: usize) -> Option<usize> {
+        const B: &str = "([{)]}";
+        if line[col..].chars().next().is_some_and(|c| B.contains(c)) {
+            return Some(col);
+        }
+        if col > 0 {
+            let prev = line[..col].chars().next_back().unwrap();
+            if B.contains(prev) {
+                return Some(col - prev.len_utf8());
+            }
+        }
+        None
     }
 
     /// How many visual rows `text` wraps to in `max_w` at `size` — a greedy
@@ -504,6 +522,10 @@ main:
         find_query: String,
         find_sel: usize,
         find_labels: Vec<Label>,
+
+        /// Multi-click (double = word, triple = line) detection.
+        click_count: u32,
+        last_click: Option<(std::time::Instant, f32, f32)>,
     }
 
     impl App {
@@ -563,6 +585,8 @@ main:
                 find_query: String::new(),
                 find_sel: 0,
                 find_labels: Vec::new(),
+                click_count: 0,
+                last_click: None,
             };
             unsafe { app.build_menu() };
             app.update_title();
@@ -1318,6 +1342,23 @@ main:
                     }
                 }
 
+                // Current-line highlight (behind everything; hidden by a selection).
+                if row == self.doc.caret.row && !self.doc.has_selection() {
+                    render::fill_rect(t, SRC_X - 4.0, sy, text_right - (SRC_X - 4.0), LINE_H, CUR_LINE);
+                }
+
+                // Matching-bracket boxes (same-line pairs at the caret).
+                if row == self.doc.caret.row {
+                    if let Some((_, mc)) = self.doc.matching_bracket(row, self.doc.caret.col) {
+                        let near = bracket_near(line, self.doc.caret.col);
+                        for bc in near.into_iter().chain(std::iter::once(mc)) {
+                            let bx = SRC_X + measure(&line[..bc]);
+                            let bw = measure(&line[bc..bc + 1]).max(4.0);
+                            render::fill_rect(t, bx, sy, bw, LINE_H, BRACKET_HL);
+                        }
+                    }
+                }
+
                 // Selection highlight (behind the source text).
                 if let Some((s, e)) = self.doc.selection() {
                     if row >= s.row && row <= e.row {
@@ -1588,6 +1629,32 @@ main:
 
         // ── input ──────────────────────────────────────────────────────────
 
+        /// Auto-close `[`/`(`/`{`/`"`/`'` (insert the pair, caret between) and
+        /// skip over a just-typed closer. Returns whether it handled `ch`.
+        fn auto_pair(&mut self, ch: char) -> bool {
+            if self.doc.has_selection() {
+                return false;
+            }
+            let line = self.doc.line(self.doc.caret.row);
+            let next = line[self.doc.caret.col..].chars().next();
+            if matches!(ch, ']' | ')' | '}' | '"' | '\'') && next == Some(ch) {
+                let c = self.doc.caret;
+                self.doc.set_caret(c.row, c.col + ch.len_utf8());
+                return true;
+            }
+            let close = match ch {
+                '[' => ']',
+                '(' => ')',
+                '{' => '}',
+                '"' | '\'' if !next.is_some_and(|n| n.is_alphanumeric()) => ch,
+                _ => return false,
+            };
+            self.doc.type_char(ch);
+            self.doc.type_char(close);
+            self.doc.move_left();
+            true
+        }
+
         /// A printable / editing character from WM_CHAR — routed to the search box
         /// when it has focus, otherwise to the editor.
         fn on_char(&mut self, ch: u32) {
@@ -1645,7 +1712,9 @@ main:
                 0x0D => self.doc.insert_newline(), // auto-indent to the previous line
                 c if c >= 0x20 && c != 0x7f => {
                     if let Some(c) = char::from_u32(c) {
-                        self.doc.type_char(c); // coalesced typing → one undo step
+                        if !self.auto_pair(c) {
+                            self.doc.type_char(c); // coalesced typing → one undo step
+                        }
                     }
                 }
                 _ => return,
@@ -1744,6 +1813,7 @@ main:
                     VK_DELETE => return self.edit(|d| d.delete_word_right()),
                     VK_D => return self.edit(|d| d.duplicate_line()),
                     VK_K if shift => return self.edit(|d| d.delete_line()),
+                    VK_SLASH => return self.edit(|d| d.toggle_comment()),
                     VK_F => self.search_active = true,
                     VK_G => self.find_open(),
                     VK_A => self.doc.select_all(),
@@ -2209,6 +2279,24 @@ main:
                         return;
                     }
                 }
+                // Double-click selects a word, triple-click a line.
+                let now = std::time::Instant::now();
+                let near = self.last_click.is_some_and(|(t, lx, ly)| {
+                    now.duration_since(t).as_millis() < 450 && (lx - x).abs() < 4.0 && (ly - y).abs() < 4.0
+                });
+                self.click_count = if near { self.click_count + 1 } else { 1 };
+                self.last_click = Some((now, x, y));
+                if self.click_count >= 2 {
+                    let (row, col) = self.caret_at_xy(x, y);
+                    if self.click_count == 2 {
+                        self.doc.select_word_at(row, col);
+                    } else {
+                        self.doc.select_line(row);
+                    }
+                    self.after_caret();
+                    self.invalidate();
+                    return;
+                }
                 if shift {
                     self.doc.start_selection();
                 } else {
@@ -2419,6 +2507,7 @@ main:
             "end" => 0x23,
             "pageup" | "prior" => 0x21,
             "pagedown" | "next" => 0x22,
+            "/" | "slash" => 0xBF, // VK_OEM_2
             s if s.len() == 1 => s.chars().next().unwrap().to_ascii_uppercase() as u16,
             _ => return None,
         };

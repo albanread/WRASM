@@ -629,9 +629,147 @@ impl Doc {
         }
         hits
     }
+
+    /// Select the word at `(row, col)` (double-click); no-op on whitespace.
+    pub fn select_word_at(&mut self, row: usize, col: usize) {
+        self.goal_col = None;
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let col = self.snap(row, col);
+        let (s, e) = (word_start(&self.lines[row], col), word_end(&self.lines[row], col));
+        if e > s {
+            self.anchor = Some(Caret { row, col: s });
+            self.caret = Caret { row, col: e };
+        } else {
+            self.set_caret(row, col);
+        }
+    }
+
+    /// Select the whole of `row` (triple-click).
+    pub fn select_line(&mut self, row: usize) {
+        self.goal_col = None;
+        let row = row.min(self.lines.len().saturating_sub(1));
+        self.anchor = Some(Caret { row, col: 0 });
+        self.caret = if row + 1 < self.lines.len() {
+            Caret { row: row + 1, col: 0 }
+        } else {
+            Caret { row, col: self.lines[row].len() }
+        };
+    }
+
+    /// Toggle a `;` line comment on the selected lines (or the caret line). If
+    /// every non-blank affected line is already commented, uncomment; else
+    /// comment them all (at each line's indent). One undo step.
+    pub fn toggle_comment(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        let (r0, r1) = self.selected_rows();
+        let commented = (r0..=r1).all(|r| {
+            let t = self.lines[r].trim_start();
+            t.is_empty() || t.starts_with(';')
+        });
+        for r in r0..=r1 {
+            if self.lines[r].trim().is_empty() {
+                continue;
+            }
+            let indent = self.lines[r].len() - self.lines[r].trim_start().len();
+            if commented {
+                let rest = self.lines[r][indent..].to_string();
+                let s = rest.strip_prefix("; ").or_else(|| rest.strip_prefix(';')).unwrap_or(&rest);
+                self.lines[r].replace_range(indent.., s);
+            } else {
+                self.lines[r].insert_str(indent, "; ");
+            }
+        }
+        self.caret.col = self.snap(self.caret.row, self.caret.col);
+        if let Some(a) = self.anchor.as_mut() {
+            a.col = a.col.min(self.lines[a.row].len());
+        }
+    }
+
+    /// The position of the bracket matching the one at (or just before) `(row,
+    /// col)`, searched on the same line (asm brackets don't span lines). For the
+    /// matching-bracket highlight. `()`/`[]`/`{}`.
+    pub fn matching_bracket(&self, row: usize, col: usize) -> Option<(usize, usize)> {
+        const OPEN: &str = "([{";
+        const CLOSE: &str = ")]}";
+        let line = self.line(row);
+        let col = self.snap(row, col);
+        let (ch, bcol) = match line[col..].chars().next() {
+            Some(c) if OPEN.contains(c) || CLOSE.contains(c) => (c, col),
+            _ => {
+                let prev = line[..col].chars().next_back()?;
+                if OPEN.contains(prev) || CLOSE.contains(prev) {
+                    (prev, col - prev.len_utf8())
+                } else {
+                    return None;
+                }
+            }
+        };
+        let mut depth = 0i32;
+        if let Some(i) = OPEN.find(ch) {
+            let close = CLOSE.as_bytes()[i] as char;
+            let mut c = bcol;
+            while c < line.len() {
+                let cc = line[c..].chars().next().unwrap();
+                if cc == ch {
+                    depth += 1;
+                } else if cc == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((row, c));
+                    }
+                }
+                c += cc.len_utf8();
+            }
+        } else if let Some(i) = CLOSE.find(ch) {
+            let open = OPEN.as_bytes()[i] as char;
+            let mut c = bcol + ch.len_utf8();
+            while c > 0 {
+                let cc = line[..c].chars().next_back().unwrap();
+                c -= cc.len_utf8();
+                if cc == ch {
+                    depth += 1;
+                } else if cc == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((row, c));
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 const INDENT: &str = "  ";
+
+/// First byte of the word containing `col` on `line`.
+fn word_start(line: &str, col: usize) -> usize {
+    let mut c = col;
+    while c > 0 {
+        let ch = line[..c].chars().next_back().unwrap();
+        if is_word(ch) {
+            c -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    c
+}
+
+/// One past the last byte of the word containing `col` on `line`.
+fn word_end(line: &str, col: usize) -> usize {
+    let mut c = col;
+    while c < line.len() {
+        let ch = line[c..].chars().next().unwrap();
+        if is_word(ch) {
+            c += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    c
+}
 
 /// Whether `c` is part of a "word" for word-wise movement.
 fn is_word(c: char) -> bool {
@@ -1012,5 +1150,35 @@ mod tests {
         assert_eq!(d.find_all("foo", true), vec![(0, 0, 3), (1, 4, 7)]);
         assert_eq!(d.find_all("foo", false), vec![(0, 0, 3), (1, 0, 3), (1, 4, 7)]);
         assert!(d.find_all("", false).is_empty());
+    }
+
+    #[test]
+    fn toggle_comment_round_trips() {
+        let mut d = Doc::from_str("  mov rax, 1\n  ret");
+        d.set_caret(0, 0);
+        d.start_selection();
+        d.set_caret(1, 5);
+        d.toggle_comment();
+        assert_eq!(d.text(), "  ; mov rax, 1\n  ; ret");
+        d.toggle_comment();
+        assert_eq!(d.text(), "  mov rax, 1\n  ret");
+    }
+
+    #[test]
+    fn select_word_and_line() {
+        let mut d = Doc::from_str("foo bar_baz qux");
+        d.select_word_at(0, 6);
+        assert_eq!(d.selected_text().as_deref(), Some("bar_baz"));
+        let mut d = Doc::from_str("a\nb\nc");
+        d.select_line(1);
+        assert_eq!(d.selected_text().as_deref(), Some("b\n"));
+    }
+
+    #[test]
+    fn matching_bracket_same_line() {
+        let d = Doc::from_str("lea rax, [rbx + rcx*2]");
+        assert_eq!(d.matching_bracket(0, 9), Some((0, 21))); // on '['
+        assert_eq!(d.matching_bracket(0, 21), Some((0, 9))); // on ']'
+        assert_eq!(d.matching_bracket(0, 0), None);
     }
 }
