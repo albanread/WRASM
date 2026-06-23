@@ -108,6 +108,7 @@ trailMode DWORD ?                  ; 1 = BALL-TRAIL pack active (the glow trail 
 ballLost  DWORD ?                  ; the core sets this when the scratch ball drains off-bottom
 packMsgTimer DWORD ?               ; frames left to show the pack-pickup banner (0 = none)
 gTick     DWORD ?                  ; global animation tick (gem twinkle phase)
+freezeTimer DWORD ?                ; >0 = gameplay frozen on a bat explosion (the dramatic beat)
 
 ; ---- the brick grid: 8 cols x 5 rows = 40 bricks. STRENGTH BRICKS: each entry is
 ; the brick's HEALTH (hit points), not a 1/0 alive flag. 0 = broken. Initial health
@@ -130,6 +131,9 @@ explodeFrames DWORD ?
 .balign 16
 coinBuf     real8 88200 dup(0.0)   ; power-up pickup SFX (Coin preset)
 coinFrames  DWORD ?
+.balign 16
+boomBuf     real8 88200 dup(0.0)   ; the BIG bat-explosion boom (long deep Explode)
+boomFrames  DWORD ?
 
 ; ---- HUD label strings -----------------------------------------------------
 sScore    BYTE "SCORE", 0
@@ -192,6 +196,13 @@ GameInit:
     lea     rdx, [rip + coinFrames]
     call    CopySfx
 
+    ; --- pre-render a BIG boom → boomBuf (long deep Explode for the bat blowing up) ---
+    mov     edx, 900                 ; 900 ms — a long, deep detonation
+    call    Explode
+    lea     rcx, [rip + boomBuf]
+    lea     rdx, [rip + boomFrames]
+    call    CopySfx
+
     ; --- bake the two melodic jingles (note sequences -> stereo buffers) ---
     lea     rcx, [rip + powerUpBuf]
     lea     rdx, [rip + powerUpFrames]
@@ -244,6 +255,7 @@ proc ResetGame frame
     mov     dword ptr [rip + stickyMode], 0      ; no STICKY pack active
     mov     dword ptr [rip + trailMode], 0       ; ball trail OFF until a TRAIL pack is caught
     mov     dword ptr [rip + packMsgTimer], 0    ; no pickup banner
+    mov     dword ptr [rip + freezeTimer], 0     ; not mid-explosion
     mov     dword ptr [rip + musicVol], 127      ; soundtrack back to full
     mov     dword ptr [rip + musicTarget], 127
     mov     dword ptr [rip + duckHold], 0
@@ -326,6 +338,15 @@ endproc
 ; GameStep — the whole frame: branch on state, update, then draw into idxBuf.
 ; ===========================================================================
 GameStep:
+    ; FREEZE beat: after a bat explosion, hold all gameplay for a few frames so the
+    ; detonation lands — still draw (the debris keeps flying via PtUpdate), just don't
+    ; advance paddle/ball/mines/packs or take input.
+    mov     eax, [rip + freezeTimer]
+    test    eax, eax
+    jz      gs_live
+    dec     dword ptr [rip + freezeTimer]
+    jmp     gs_draw
+gs_live:
     mov     eax, [rip + gameState]
     cmp     eax, 1
     je      gs_playing
@@ -1242,6 +1263,9 @@ endproc
 ; ---- BatPush — queue the bat sprite. Three width frames (NARROW/normal/WIDE) keep
 ;      the sprite size matched to paddleW; the bat is anchored top-left at the paddle. ----
 proc BatPush uses rbx frame
+    mov     eax, [rip + freezeTimer]     ; the bat is GONE during the explosion pause
+    test    eax, eax
+    jnz     bt_skip
     mov     eax, [rip + paddleW]
     mov     ecx, [rip + fidBat1]         ; default 40px paddle
     cmp     eax, 28
@@ -1262,10 +1286,14 @@ bt_have:
     mov     ecx, ebx
     mov     r8d, 7                       ; bat palette slot
     call    SprPush
+bt_skip:
 endproc
 
 ; ---- BallsPush — a round-ball sprite per active ball, centred on the ball. ----
 proc BallsPush uses rbx rsi frame
+    mov     eax, [rip + freezeTimer]     ; balls hidden during the explosion pause too
+    test    eax, eax
+    jnz     blp_done
     lea     rsi, [rip + ballPool]
     xor     ebx, ebx
 blp_loop:
@@ -1898,11 +1926,19 @@ proc LoseLife frame
     movss   xmm5, [rip + explG]
     movss   xmm6, [rip + explB]
     movss   xmm3, [rip + explSpeed]
-    mov     ecx, 40                      ; a big debris burst
+    mov     ecx, 110                     ; a HUGE debris burst
     call    PtBurst
-    lea     rcx, [rip + explodeBuf]
-    mov     edx, [rip + explodeFrames]
+    ; the explosion SOUND: layer the deep BOOM with the sharp zap CRACK (two voices).
+    lea     rcx, [rip + boomBuf]
+    mov     edx, [rip + boomFrames]
     call    Play
+    lea     rcx, [rip + zapBuf]
+    mov     edx, [rip + zapFrames]
+    call    Play
+    ; FREEZE the game for the dramatic beat + dip the music while it detonates.
+    mov     dword ptr [rip + freezeTimer], 48     ; ~0.8 s pause
+    mov     dword ptr [rip + musicTarget], 16
+    mov     dword ptr [rip + duckHold], 48
     ; reset EVERY pack benefit — a new life starts plain (user spec).
     mov     dword ptr [rip + paddleW], 40
     mov     dword ptr [rip + stickyMode], 0
@@ -1912,7 +1948,7 @@ proc LoseLife frame
     test    eax, eax
     jg      ll_repark
     mov     dword ptr [rip + gameState], 3   ; GAME OVER
-    call    PlayGameOver
+    call    PlayGameOver                     ; (overrides the duck with the sad-tune duck)
     jmp     ll_done
 ll_repark:
     call    ResetBall
