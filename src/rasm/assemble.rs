@@ -212,6 +212,23 @@ fn assemble_impl(text: &str, flatten: bool) -> Result<(EncodedModule, Vec<(usize
         }
     }
 
+    // ── Reject duplicate label definitions ─────────────────────────────────
+    // Labels are module-scoped symbols resolved through one namespace (both
+    // sections share it), so a second definition silently overwrites the first
+    // in `layout` and redirects every branch/call/RIP-rel reference to it. Catch
+    // it here, while `item_line` still maps each item back to its source line,
+    // before relaxation and emission consume the (now-ambiguous) label map.
+    let mut first_def: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (idx, it) in items.iter().enumerate() {
+        if let Item::Label(n) = it {
+            let line = item_line[idx] + 1;
+            if let Some(&prev) = first_def.get(n.as_str()) {
+                bail!("line {line}: duplicate label `{n}` (first defined on line {prev})");
+            }
+            first_def.insert(n.as_str(), line);
+        }
+    }
+
     // ── Pass 2: branch relaxation to a fixpoint ─────────────────────────────
     loop {
         let (places, labels) = layout(&items, &item_sect);
@@ -624,5 +641,23 @@ ret
         assert_eq!(m.code[s], 0x74, "short jz opcode");
         assert_eq!(m.code[s + 1], 0x01, "disp8 jumps over the 1-byte nop");
         assert!(m.relocs.is_empty(), "all-internal module has no relocs");
+    }
+
+    #[test]
+    fn duplicate_labels_are_rejected() {
+        // Two `foo:` on their own lines — the second silently overwrote the first
+        // before this check, redirecting every reference to it.
+        let err = assemble(".text\nfoo:\nret\nfoo:\nret\n").unwrap_err().to_string();
+        assert!(err.contains("duplicate label `foo`"), "{err}");
+        assert!(err.contains("first defined on line 2"), "{err}");
+
+        // Inline `label: insn` form is peeled into its own label Item, so it must
+        // be caught the same way.
+        let err = assemble(".text\nfoo: ret\nfoo: ret\n").unwrap_err().to_string();
+        assert!(err.contains("duplicate label `foo`"), "{err}");
+
+        // Cross-section duplicates collide too — labels share one namespace.
+        let err = assemble(".data\nx:\n.long 0\n.text\nx:\nret\n").unwrap_err().to_string();
+        assert!(err.contains("duplicate label `x`"), "{err}");
     }
 }
