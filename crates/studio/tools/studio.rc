@@ -1,0 +1,11 @@
+// Resources embedded into studio.exe by build.rs (the `embed-resource` crate,
+// which drives the platform RC compiler — rc.exe on MSVC, windres on MinGW).
+//
+// Currently just the application manifest: per-monitor-v2 DPI awareness, Common
+// Controls v6, UTF-8 active code page, and supportedOS GUIDs through Windows 11.
+
+#include <winuser.h>
+
+// Resource id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID: Windows reads this as the
+// activation manifest at process startup.
+1 RT_MANIFEST "studio.exe.manifest"

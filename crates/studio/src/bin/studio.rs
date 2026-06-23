@@ -18,6 +18,11 @@
 //! them to the async `post_*`/`poll` path is the natural next step, and the
 //! worker's request coalescing is already in place for when it does.
 
+// A GUI app — no console window flashes on launch. The CLI modes (--help,
+// --version, --script, --exec, --shot) reconnect to the parent terminal's
+// console at startup (see `reattach_console`) so they still print there.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("RASM Studio is Windows-only (it renders through Direct2D).");
@@ -3181,7 +3186,38 @@ TCL UI SCRIPTING (--script / --exec)
   Example script: crates/studio/scripts/ui_demo.tcl
 ";
 
+    /// GUI-subsystem apps get no console. For the CLI modes (--help/--version/
+    /// --script/--exec/--shot) launched from a terminal, attach to the parent's
+    /// console and point std{out,err} at it — but keep any handle already
+    /// redirected to a pipe/file (how the headless test harness captures output).
+    fn reattach_console() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Console::{
+            AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+            STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+                return; // launched without a parent console (Explorer) — stay headless
+            }
+            for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                if GetStdHandle(id).is_ok_and(|h| !h.is_invalid()) {
+                    continue; // already redirected to a pipe/file — keep it
+                }
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                    let _ = SetStdHandle(id, HANDLE(f.as_raw_handle()));
+                    std::mem::forget(f); // keep the console handle for the process' life
+                }
+            }
+        }
+    }
+
     pub fn run() -> anyhow::Result<()> {
+        // GUI-subsystem build: reconnect the CLI modes' output to the terminal.
+        if std::env::args().len() > 1 {
+            reattach_console();
+        }
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // for WIC (snapshots)
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);

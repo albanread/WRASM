@@ -1,6 +1,6 @@
 [package]
 name = "studio"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "The assembler IDE front-end: renders the assistant's markdown (from `ide`) through docpane's DirectWrite engine. Headless render seam is unit-testable."
 
@@ -48,6 +48,7 @@ features = [
   "Win32_Graphics_Imaging",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
+  "Win32_System_Console",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
@@ -56,3 +57,8 @@ features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ]
+
+# Embeds the application manifest (tools/studio.exe.manifest): per-monitor-v2
+# DPI, Common Controls v6, UTF-8 code page. Same approach as WF66's wf64-ui.
+[build-dependencies]
+embed-resource = "3"
