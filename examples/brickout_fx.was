@@ -1730,16 +1730,25 @@ mnp_done:
 endproc
 
 ; ===========================================================================
-; MineScatter(ecx=centreX, edx=centreY logical) — spawn 3 mines from a broken RED
-; brick, each at a slightly different downward angle (LCG jitter). Stored x,y is the
-; mine CENTRE (board coords, fixed-point).
+; MineScatter(ecx=centreX, edx=centreY logical) — spawn a RANDOM 0..3 mines from a
+; broken RED brick (3 every time is a barrage), each at a slightly different downward
+; angle (LCG jitter). Stored x,y is the mine CENTRE (board coords, fixed-point).
 ; ===========================================================================
 proc MineScatter uses rbx rsi rdi r12 r13 in rcx rdx
     mov     r12d, ecx                    ; centre X
     mov     r13d, edx                    ; centre Y
-    xor     edi, edi                     ; spawned 0..2
+    ; roll how many mines this brick drops: 0..3, uniform.
+    mov     eax, [rip + dropSeed]
+    mov     ecx, 1103515245
+    imul    eax, ecx
+    add     eax, 12345
+    mov     [rip + dropSeed], eax
+    shr     eax, 8                       ; higher bits are better-mixed than the low ones
+    and     eax, 3                       ; 0..3
+    mov     r8d, eax                     ; mine count (held across the loop; no calls)
+    xor     edi, edi                     ; spawned so far
 mns_each:
-    cmp     edi, 3
+    cmp     edi, r8d
     jge     mns_done
     lea     rsi, [rip + minePool]
     xor     ecx, ecx
