@@ -792,6 +792,20 @@ main:
         /// Drain the language thread's replies, applying only those that still
         /// match the latest request id (the rest are superseded). Runs each
         /// poll-timer tick — the GUI thread never blocks on the worker.
+        /// Drain language-thread replies for up to `ms`, sleeping between polls so
+        /// async cards/checks/listings settle — lets headless scripts screenshot
+        /// async UI that the live window would update on its poll timer.
+        fn pump(&mut self, ms: u64) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            loop {
+                self.poll_lang();
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+
         fn poll_lang(&mut self) {
             while let Some(resp) = self.lang.as_ref().and_then(Lang::poll) {
                 match resp {
@@ -2508,6 +2522,12 @@ main:
             with_app(|app| app.file_new());
             Ok(Value::new(""))
         });
+        // Settle async replies (caret cards, checks) before a screenshot.
+        r.register("pump", Arity::range(0, 1), |_, a| {
+            let ms = a.first().and_then(|v| v.as_str().parse::<u64>().ok()).unwrap_or(400);
+            with_app(|app| app.pump(ms));
+            Ok(Value::new(""))
+        });
         r.register("size", Arity::exact(2), |_, a| {
             let (w, h) = (uint(a, 0)? as u32, uint(a, 1)? as u32);
             with_app(|app| {
@@ -2542,6 +2562,7 @@ main:
             Ok(Value::new(with_app(|app| app.doc.caret.col.to_string())))
         });
         r.register("notice", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.notice.clone()))));
+        r.register("card-md", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.card_md.clone()))));
         r.register("split-frac", Arity::exact(0), |_, _| {
             Ok(Value::new(with_app(|app| format!("{:.4}", app.split_frac))))
         });

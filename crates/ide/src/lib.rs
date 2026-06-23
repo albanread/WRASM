@@ -63,6 +63,11 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
     if let Some(md) = register_card(q) {
         return Ok(md);
     }
+    // DB-driven instruction explainer (broad, clean-room sourced); the curated
+    // `mnemonic_card` is the fallback for anything not (yet) in the db.
+    if let Some(md) = instruction_card(kb, q)? {
+        return Ok(md);
+    }
     if let Some(md) = mnemonic_card(q) {
         return Ok(md);
     }
@@ -237,6 +242,22 @@ fn abi_slot(n: u32, type_name: &str) -> String {
         }
         _ => format!("`[rsp+{}]`", 32 + 8 * (n - 5)),
     }
+}
+
+/// The DB-driven instruction explainer (the `instructions` table — broad,
+/// clean-room-sourced coverage). `None` if the mnemonic isn't in the db.
+fn instruction_card(kb: &Kb, name: &str) -> Result<Option<String>> {
+    let Some(i) = kb.instruction(name)? else { return Ok(None) };
+    let mut s = format!("# {}\n\n{}\n", i.summary, i.description);
+    if i.flags.trim().is_empty() || i.flags.eq_ignore_ascii_case("none") {
+        s.push_str("\n_Modifies no flags._\n");
+    } else {
+        s.push_str(&format!("\n**Flags set:** `{}`\n", i.flags.trim()));
+    }
+    if !i.category.trim().is_empty() {
+        s.push_str(&format!("\n_{}_\n", i.category.trim()));
+    }
+    Ok(Some(s))
 }
 
 /// The instruction card — the mnemonics that trip people up: the signed/unsigned

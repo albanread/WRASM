@@ -44,6 +44,19 @@ pub struct Completion {
     pub detail: String,
 }
 
+/// An x86-64 instruction explainer entry (from the `instructions` table).
+#[derive(Debug, Clone)]
+pub struct Instruction {
+    pub mnemonic: String,
+    /// `data` | `arithmetic` | `logic` | `shift` | `bit` | `control-flow` |
+    /// `stack` | `string` | `system` | `sse` | …
+    pub category: String,
+    /// Flags the instruction affects, e.g. `ZF SF CF OF` — or empty / `none`.
+    pub flags: String,
+    pub summary: String,
+    pub description: String,
+}
+
 /// A named integer value resolved from `constants` or `enum_members`.
 #[derive(Debug, Clone)]
 pub struct Value {
@@ -164,6 +177,43 @@ impl Kb {
             Ok(Completion { name: r.get(0)?, kind: r.get(1)?, detail: r.get(2)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The instruction explainer for `mnemonic`, or `None` if it isn't in the
+    /// `instructions` table (or the table is absent — an older db). Case- and
+    /// whitespace-insensitive.
+    pub fn instruction(&self, mnemonic: &str) -> Result<Option<Instruction>> {
+        // Tolerate a db built before the instructions table existed.
+        let has_table: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='instructions'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has_table {
+            return Ok(None);
+        }
+        let m = mnemonic.trim().to_ascii_lowercase();
+        self.conn
+            .query_row(
+                "SELECT mnemonic, category, flags, summary, description \
+                   FROM instructions WHERE mnemonic = ?1",
+                [m],
+                |r| {
+                    Ok(Instruction {
+                        mnemonic: r.get(0)?,
+                        category: r.get(1)?,
+                        flags: r.get(2)?,
+                        summary: r.get(3)?,
+                        description: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// ③ Resolve a bare name to its value(s), unifying constants and enum members.
