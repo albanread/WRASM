@@ -24,6 +24,7 @@
 .include "../gpu/blit.was"
 .include "../gpu/tile.was"
 .include "../gpu/sprite.was"
+.include "../gpu/text.was"      ; gpu/canvas.was references DrawText (added in G5); include it so the symbol resolves even though G3 draws no text
 
 .DATA
 .balign 16
