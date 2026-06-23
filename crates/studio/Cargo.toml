@@ -1,6 +1,6 @@
 [package]
 name = "studio"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "The assembler IDE front-end: renders the assistant's markdown (from `ide`) through docpane's DirectWrite engine. Headless render seam is unit-testable."
 
