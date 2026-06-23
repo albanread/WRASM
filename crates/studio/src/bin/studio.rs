@@ -91,6 +91,7 @@ mod gui {
 
     use studio::diagnostics;
     use studio::doc::Doc;
+    use studio::outline::{Label, LabelKind};
     use studio::lang::{Diag, Emit, Lang, ListingRow, Response};
     use studio::syntax::TokKind;
     use winkb::Completion;
@@ -157,6 +158,17 @@ mod gui {
     const VK_N: VIRTUAL_KEY = VIRTUAL_KEY(0x4E);
     const VK_O: VIRTUAL_KEY = VIRTUAL_KEY(0x4F);
     const VK_S: VIRTUAL_KEY = VIRTUAL_KEY(0x53);
+    const VK_G: VIRTUAL_KEY = VIRTUAL_KEY(0x47); // 'G' (Ctrl+G = go to label)
+
+    // The go-to-label palette.
+    const FIND_ITEM_H: f32 = 22.0;
+    const FIND_HEADER_H: f32 = 30.0;
+    const FIND_MAX_VIS: usize = 12;
+    const CODE_LABEL_COL: u32 = 0x61_AF_EF; // code labels — blue
+    const DATA_LABEL_COL: u32 = 0x98_C3_79; // data labels — green
+    const PALETTE_BG: u32 = 0x22_22_2B;
+    const PALETTE_HEADER_BG: u32 = 0x2C_2C_38;
+    const PALETTE_SEL: u32 = 0x2D_3D_55;
 
     // Menu command ids (WM_COMMAND low word).
     const IDM_NEW: u16 = 0x100;
@@ -481,6 +493,13 @@ main:
         hover_split: Option<Split>,
         /// The splitter being dragged, if any.
         drag_split: Option<Split>,
+
+        /// Go-to-label palette: open state, the filter query, the highlighted
+        /// match, and the buffer's labels (gathered when the palette opens).
+        find_active: bool,
+        find_query: String,
+        find_sel: usize,
+        find_labels: Vec<Label>,
     }
 
     impl App {
@@ -536,6 +555,10 @@ main:
                 output_open: true,
                 hover_split: None,
                 drag_split: None,
+                find_active: false,
+                find_query: String::new(),
+                find_sel: 0,
+                find_labels: Vec::new(),
             };
             unsafe { app.build_menu() };
             app.update_title();
@@ -1032,6 +1055,11 @@ main:
             // The draggable splitters (glow + collapse toggles), on top of all.
             self.draw_splitters(target, vw, vh);
 
+            // The go-to-label palette is a modal overlay — drawn last.
+            if self.find_active {
+                self.draw_find(target, split, vh);
+            }
+
             let _ = target.EndDraw(None, None);
         }
 
@@ -1419,11 +1447,155 @@ main:
             render::fill_rect(t, x0, SEARCH_H, w, 1.0, theme::BORDER);
         }
 
+        // ── go-to-label palette ────────────────────────────────────────────
+
+        /// Open the palette: gather the buffer's labels, reset the filter.
+        fn find_open(&mut self) {
+            self.find_labels = studio::outline::classified(&self.doc.text());
+            self.find_query.clear();
+            self.find_sel = 0;
+            self.find_active = true;
+            self.close_completion();
+            self.invalidate();
+        }
+
+        /// Labels matching the query (case-insensitive substring), prefix
+        /// matches first, then source order.
+        fn find_matches(&self) -> Vec<&Label> {
+            let q = self.find_query.to_ascii_lowercase();
+            let mut v: Vec<&Label> = self
+                .find_labels
+                .iter()
+                .filter(|l| q.is_empty() || l.name.to_ascii_lowercase().contains(&q))
+                .collect();
+            if !q.is_empty() {
+                v.sort_by_key(|l| (!l.name.to_ascii_lowercase().starts_with(&q), l.line));
+            }
+            v
+        }
+
+        /// Jump to the highlighted label and close the palette.
+        fn find_accept(&mut self) {
+            let target = self.find_matches().get(self.find_sel).map(|l| (l.name.clone(), l.line));
+            self.find_active = false;
+            if let Some((name, line)) = target {
+                self.doc.clear_selection();
+                self.doc.set_caret(line, 0);
+                self.ensure_caret_visible();
+                self.after_caret();
+                self.notice = format!("went to {name} (line {})", line + 1);
+            }
+            self.invalidate();
+        }
+
+        /// First visible match index (scroll so the selection stays in view).
+        fn find_first_visible(&self) -> usize {
+            self.find_sel.saturating_sub(FIND_MAX_VIS - 1)
+        }
+
+        /// The palette box `(x, y0, width)` within an editor pane of width `split`.
+        fn find_layout(&self, split: f32) -> (f32, f32, f32) {
+            let w = (split - 60.0).clamp(180.0, 460.0);
+            (((split - w) * 0.5).max(8.0), 54.0, w)
+        }
+
+        /// Draw the palette: a filter header over a colour-coded list — blue for
+        /// code labels, green for data — with the selected row highlighted.
+        unsafe fn draw_find(&self, t: &ID2D1RenderTarget, split: f32, _vh: f32) {
+            let (x, y0, w) = self.find_layout(split);
+            let matches = self.find_matches();
+            let first = self.find_first_visible();
+            let vis = matches.len().saturating_sub(first).min(FIND_MAX_VIS).max(1);
+            let box_h = FIND_HEADER_H + vis as f32 * FIND_ITEM_H + 6.0;
+
+            // Accent frame + panel + header band.
+            render::fill_rect(t, x - 1.0, y0 - 1.0, w + 2.0, box_h + 2.0, SPLIT_GLOW);
+            render::fill_rect(t, x, y0, w, box_h, PALETTE_BG);
+            render::fill_rect(t, x, y0, w, FIND_HEADER_H, PALETTE_HEADER_BG);
+
+            // Header: the query (or a hint) + a "matches/total" count.
+            let (label, lcol) = if self.find_query.is_empty() {
+                ("Go to label — type to filter".to_string(), theme::TEXT_DIM)
+            } else {
+                (self.find_query.clone(), theme::TEXT_BRIGHT)
+            };
+            render::draw_text(
+                t, x + 10.0, y0 + 6.0, w - 96.0, FIND_HEADER_H, &label, EDITOR_FONT, EDITOR_SIZE,
+                false, false, lcol, false,
+            );
+            if !self.find_query.is_empty() {
+                let qw = render::measure_text(&self.find_query, EDITOR_FONT, EDITOR_SIZE, false, false);
+                render::fill_rect(t, x + 10.0 + qw + 1.0, y0 + 7.0, 1.5, EDITOR_SIZE, CARET_COLOR);
+            }
+            let count = format!("{}/{}", matches.len(), self.find_labels.len());
+            let cw = render::measure_text(&count, EDITOR_FONT, EDITOR_SIZE * 0.85, false, false);
+            render::draw_text(
+                t, x + w - cw - 10.0, y0 + 8.0, cw + 6.0, FIND_HEADER_H, &count, EDITOR_FONT,
+                EDITOR_SIZE * 0.85, false, false, theme::TEXT_DIM, false,
+            );
+
+            if matches.is_empty() {
+                render::draw_text(
+                    t, x + 14.0, y0 + FIND_HEADER_H + 5.0, w - 20.0, FIND_ITEM_H, "no matching labels",
+                    EDITOR_FONT, EDITOR_SIZE, false, true, theme::TEXT_DIM, false,
+                );
+                return;
+            }
+
+            let mut iy = y0 + FIND_HEADER_H + 2.0;
+            for (k, lbl) in matches.iter().enumerate().skip(first).take(FIND_MAX_VIS) {
+                let sel = k == self.find_sel;
+                if sel {
+                    render::fill_rect(t, x + 2.0, iy, w - 4.0, FIND_ITEM_H, PALETTE_SEL);
+                }
+                let kcol = match lbl.kind {
+                    LabelKind::Code => CODE_LABEL_COL,
+                    LabelKind::Data => DATA_LABEL_COL,
+                };
+                // kind dot + the name (coloured by kind) + the line number.
+                render::fill_rect(t, x + 11.0, iy + FIND_ITEM_H * 0.5 - 4.0, 8.0, 8.0, kcol);
+                render::draw_text(
+                    t, x + 28.0, iy + 3.0, w - 96.0, FIND_ITEM_H, &lbl.name, EDITOR_FONT, EDITOR_SIZE,
+                    sel, false, kcol, false,
+                );
+                let ln = format!(":{}", lbl.line + 1);
+                let lw = render::measure_text(&ln, EDITOR_FONT, EDITOR_SIZE * 0.85, false, false);
+                render::draw_text(
+                    t, x + w - lw - 12.0, iy + 4.0, lw + 6.0, FIND_ITEM_H, &ln, EDITOR_FONT,
+                    EDITOR_SIZE * 0.85, false, false, theme::TEXT_DIM, false,
+                );
+                iy += FIND_ITEM_H;
+            }
+        }
+
         // ── input ──────────────────────────────────────────────────────────
 
         /// A printable / editing character from WM_CHAR — routed to the search box
         /// when it has focus, otherwise to the editor.
         fn on_char(&mut self, ch: u32) {
+            // Go-to-label palette: typing filters; Enter jumps; Esc closes.
+            if self.find_active {
+                match ch {
+                    0x08 => {
+                        self.find_query.pop();
+                        self.find_sel = 0;
+                    }
+                    0x0d => {
+                        self.find_accept();
+                        return;
+                    }
+                    0x1b => self.find_active = false,
+                    c if c >= 0x20 && c != 0x7f => {
+                        if let Some(c) = char::from_u32(c) {
+                            self.find_query.push(c);
+                            self.find_sel = 0;
+                        }
+                    }
+                    _ => return,
+                }
+                self.invalidate();
+                return;
+            }
             if self.search_active {
                 match ch {
                     0x08 => {
@@ -1473,6 +1645,26 @@ main:
 
         /// A navigation / command key from WM_KEYDOWN. Returns true if handled.
         fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> bool {
+            // Go-to-label palette: arrows move the selection, Esc closes; all
+            // keys are swallowed (text + Enter arrive via WM_CHAR / on_char).
+            if self.find_active {
+                match vk {
+                    VK_ESCAPE => {
+                        self.find_active = false;
+                        self.invalidate();
+                    }
+                    VK_UP if self.find_sel > 0 => {
+                        self.find_sel -= 1;
+                        self.invalidate();
+                    }
+                    VK_DOWN if self.find_sel + 1 < self.find_matches().len() => {
+                        self.find_sel += 1;
+                        self.invalidate();
+                    }
+                    _ => {}
+                }
+                return true;
+            }
             // Search box focused: swallow keys (text comes via WM_CHAR); Esc exits.
             if self.search_active {
                 if vk == VK_ESCAPE {
@@ -1508,6 +1700,7 @@ main:
             if ctrl {
                 match vk {
                     VK_F => self.search_active = true,
+                    VK_G => self.find_open(),
                     VK_A => self.doc.select_all(),
                     VK_C => self.clipboard_copy(),
                     VK_X => self.clipboard_cut(),
@@ -1912,6 +2105,25 @@ main:
         /// the selection from the current caret. Ctrl+click over an equate jumps
         /// to its definition (go-to-definition).
         fn on_press(&mut self, x: f32, y: f32, shift: bool, ctrl: bool) {
+            // Go-to-label palette open: a click on a row jumps there; a click
+            // anywhere else dismisses it.
+            if self.find_active {
+                let split = self.split_x(self.viewport().0);
+                let (px, py0, pw) = self.find_layout(split);
+                let first = self.find_first_visible();
+                let items_top = py0 + FIND_HEADER_H + 2.0;
+                let matches_len = self.find_matches().len();
+                let vis = matches_len.saturating_sub(first).min(FIND_MAX_VIS);
+                let row = if y >= items_top { ((y - items_top) / FIND_ITEM_H) as usize } else { usize::MAX };
+                if x >= px && x < px + pw && row < vis {
+                    self.find_sel = first + row;
+                    self.find_accept();
+                } else {
+                    self.find_active = false;
+                    self.invalidate();
+                }
+                return;
+            }
             // A splitter toggle collapses or reveals its pane at the default size.
             if let Some(s) = self.toggle_at(x, y) {
                 match s {
@@ -2164,6 +2376,24 @@ main:
         Some((VIRTUAL_KEY(code), ctrl, shift))
     }
 
+    /// The WM_CHAR a key produces, so the `key` verb mirrors Windows (a
+    /// char-yielding key generates both WM_KEYDOWN and WM_CHAR). `None` for keys
+    /// that produce no character (arrows, Home, F-keys, ...).
+    fn key_char(vk: VIRTUAL_KEY, shift: bool) -> Option<u32> {
+        Some(match vk.0 {
+            0x0D => 0x0D, // Enter
+            0x08 => 0x08, // Backspace
+            0x09 => 0x09, // Tab
+            0x1B => 0x1B, // Escape
+            c @ 0x41..=0x5A => {
+                let ch = c as u8 as char;
+                if shift { ch as u32 } else { ch.to_ascii_lowercase() as u32 }
+            }
+            c @ 0x30..=0x39 => c as u32, // digits
+            _ => return None,
+        })
+    }
+
     fn set_pane(pane: &str, open: bool) -> Result<Value, TclError> {
         match pane {
             "assistant" => with_app(|app| {
@@ -2198,6 +2428,13 @@ main:
                 .ok_or_else(|| TclError::runtime(format!("unknown key: {}", a[0].as_str())))?;
             with_app(|app| {
                 app.on_key(vk, ctrl, shift);
+                // Mirror Windows: a char-producing key also yields WM_CHAR (so
+                // Enter/typing reach on_char). Ctrl combos produce no usable char.
+                if !ctrl {
+                    if let Some(ch) = key_char(vk, shift) {
+                        app.on_char(ch);
+                    }
+                }
             });
             Ok(Value::new(""))
         });
@@ -2321,6 +2558,18 @@ main:
             })))
         });
 
+        // go-to-label palette
+        r.register("find-active", Arity::exact(0), |_, _| Ok(boolstr(with_app(|app| app.find_active))));
+        r.register("find-query", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.find_query.clone()))));
+        r.register("find-count", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.find_matches().len().to_string())))
+        });
+        r.register("find-selected", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| {
+                app.find_matches().get(app.find_sel).map(|l| l.name.clone()).unwrap_or_default()
+            })))
+        });
+
         // assertions (a failure aborts the script with a non-zero exit)
         r.register("assert", Arity::range(1, 2), |_, a| {
             let v = a[0].as_str();
@@ -2375,6 +2624,7 @@ TCL UI SCRIPTING (--script / --exec)
     * expr is integer-only here — use literal numbers for coordinates
     * use forward slashes in paths (TCL treats backslash as an escape)
     * an assert* failure exits non-zero, so scripts double as UI tests
+    * editor shortcuts: Ctrl+G = go-to-label palette, Ctrl+F = Windows API search
 
   input     type \"text\"            type characters into the editor
             key NAME               one key: Enter Backspace Delete Tab Escape
@@ -2401,6 +2651,10 @@ TCL UI SCRIPTING (--script / --exec)
             assistant-open         1/0 — is the assistant pane shown
             output-open            1/0 — is the output pane shown
             hover-split            col | row | none — splitter under the mouse
+            find-active            1/0 — is the go-to-label palette open
+            find-query             the palette's current filter text
+            find-count             labels matching the filter
+            find-selected          the highlighted label's name
             notice                 the status-line text
   assert    assert COND ?msg?      fail (exit 1) unless COND is true / non-zero
             assert-eq GOT WANT ?msg?   fail unless GOT equals WANT
