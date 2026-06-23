@@ -2354,6 +2354,60 @@ main:
         result.map(|r| r.output).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    const HELP: &str = "\
+RASM Studio — the WRASM x86-64 assembler IDE (Direct2D).
+
+USAGE
+  studio                       open the IDE window
+  studio --shot [dir]          render one offscreen frame to a PNG, then exit
+  studio --script <file.tcl>   run a TCL UI script headlessly, then exit
+  studio --exec \"<tcl>\"        run an inline TCL script, then exit
+  studio --help | -h           this help
+
+  The knowledge DB ($WINKB_DB, else E:\\windows_api\\windows_api.db) backs the
+  assistant cards, autocomplete, and invoke/struct/COM resolution.
+
+TCL UI SCRIPTING (--script / --exec)
+  An embedded TCL interpreter drives a windowless IDE, so UI behaviour is
+  scriptable and screenshots are reviewable without a desktop. Full TCL core is
+  available (set / if / expr / foreach / proc / ...). Notes for scripting:
+    * coordinates are in DIPs; the default headless viewport is 1100x720
+    * expr is integer-only here — use literal numbers for coordinates
+    * use forward slashes in paths (TCL treats backslash as an escape)
+    * an assert* failure exits non-zero, so scripts double as UI tests
+
+  input     type \"text\"            type characters into the editor
+            key NAME               one key: Enter Backspace Delete Tab Escape
+                                   Left Right Up Down Home End PageUp PageDown
+                                   or a letter; prefix Ctrl+ / Shift+ (Ctrl+S)
+            caret ROW COL          place the caret (0-based row/col)
+  pointer   move X Y               move the mouse (hover; lights a splitter)
+            click X Y              press + release at a point
+            drag X1 Y1 X2 Y2       press, move, release (resize a splitter, ...)
+  panes     splitter col FRAC      set the editor|assistant split (0.0..1.0)
+            splitter row PX        set the output-pane height (DIPs)
+            collapse PANE          hide a pane (PANE = assistant | output)
+            expand PANE            reveal it at its default size
+  files     open FILE              load a .was file into the editor
+            new                    start an empty buffer
+            size W H               set the viewport size (pixels)
+  capture   screenshot PATH.png    render the current frame to a PNG file
+  read-back text                   the whole editor buffer
+            line N                 the text of line N
+            linecount              number of lines
+            caret-row / caret-col  the caret position
+            split-frac             the editor|assistant split fraction
+            output-h               the output-pane height (DIPs)
+            assistant-open         1/0 — is the assistant pane shown
+            output-open            1/0 — is the output pane shown
+            hover-split            col | row | none — splitter under the mouse
+            notice                 the status-line text
+  assert    assert COND ?msg?      fail (exit 1) unless COND is true / non-zero
+            assert-eq GOT WANT ?msg?   fail unless GOT equals WANT
+
+  Example script: crates/studio/scripts/ui_demo.tcl
+";
+
     pub fn run() -> anyhow::Result<()> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // for WIC (snapshots)
@@ -2367,6 +2421,10 @@ main:
         // Headless `--shot [dir]`: render one offscreen frame to a timestamped
         // PNG and exit — no window, so it works without a visible desktop.
         let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            print!("{HELP}");
+            return Ok(());
+        }
         if let Some(i) = args.iter().position(|a| a == "--shot") {
             let dir = args
                 .get(i + 1)
