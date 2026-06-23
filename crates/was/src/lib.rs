@@ -504,7 +504,33 @@ pub fn check(src: &str, kb: &Kb) -> Vec<Diag> {
     labels.extend(macro_names(src)); // a macro invocation is not an unknown name
     let com_objs = collect_com_objs(src);
     labels.extend(com_objs.keys().cloned());
+    // Equates are their own namespace and win over winkb constants (eval_expr checks
+    // them first), so register the names: a defined equate is a known identifier, not
+    // an unknown constant. Where a name also matches a Windows constant, note the
+    // (intentional) shadow once at its definition rather than erroring on every use.
+    let eqdefs = collect_equate_defs(src);
+    for (name, _) in &eqdefs {
+        labels.insert(name.clone());
+    }
     let mut diags = Vec::new();
+    for (name, line) in &eqdefs {
+        let shadowed = match kb.resolve(name) {
+            Ok(v) if !v.is_empty() => Some(name.clone()),
+            _ => kb
+                .suggest(name, 1)
+                .ok()
+                .and_then(|s| s.into_iter().find(|c| c.eq_ignore_ascii_case(name))),
+        };
+        if let Some(c) = shadowed {
+            diags.push(Diag {
+                line: *line,
+                col: 1,
+                message: format!(
+                    "equate '{name}' shadows the Windows constant '{c}' — the equate value is used"
+                ),
+            });
+        }
+    }
     let mut in_macro = false;
     let mut string_block_end: Option<&str> = None;
     for (i, raw) in src.lines().enumerate() {
@@ -1573,6 +1599,45 @@ fn parse_equate<'a>(t: &'a str, in_struct: bool) -> Option<(&'a str, &'a str)> {
         }
     }
     None
+}
+
+/// The equates a source defines, as `(name, 1-based line)`. `check()` registers
+/// these as known names so a defined equate isn't flagged as an unknown constant,
+/// and notes any whose name coincides with a Windows constant (a shadow). Mirrors
+/// `preprocess_equates`'s recognition via `parse_equate` + struct/raw-block tracking.
+fn collect_equate_defs(src: &str) -> Vec<(String, usize)> {
+    let mut defs = Vec::new();
+    let mut in_struct = false;
+    let mut raw_end: Option<&str> = None;
+    for (i, raw) in src.lines().enumerate() {
+        let t = strip_comment(raw).trim();
+        if let Some(end) = raw_end {
+            if raw.trim().eq_ignore_ascii_case(end) {
+                raw_end = None;
+            }
+            continue;
+        }
+        if t.eq_ignore_ascii_case(".asciistring") {
+            raw_end = Some(".endasciistring");
+            continue;
+        }
+        if t.eq_ignore_ascii_case(".widestring") {
+            raw_end = Some(".endwidestring");
+            continue;
+        }
+        if parse_struct_open(t).is_some() {
+            in_struct = true;
+            continue;
+        }
+        if t == "ends" || t == "endstruct" {
+            in_struct = false;
+            continue;
+        }
+        if let Some((name, _)) = parse_equate(t, in_struct) {
+            defs.push((name.to_string(), i + 1));
+        }
+    }
+    defs
 }
 
 /// Replace whole-word equate names with their integer value, skipping the insides
@@ -3265,6 +3330,19 @@ mod tests {
         let low = lower(src, &kb).expect("equate + multibyte string must lower");
         assert!(low.contains(".word 8212"), "em-dash stays one UTF-16 unit: {low}");
         assert!(!low.contains("226"), "not split into its UTF-8 bytes: {low}");
+    }
+
+    #[test]
+    fn check_treats_equates_as_known_with_a_shadow_note() {
+        let Some(kb) = kb() else { return };
+        // A clean equate is a known name — no 'unknown constant' diagnostic.
+        let d = check(".code\n.globl main\nMYVAL equ 5\nmain:\n  mov eax, MYVAL\n  ret\n", &kb);
+        assert!(d.is_empty(), "a clean equate produces no diagnostics: {d:?}");
+        // An equate whose name matches a Windows constant is a SHADOW note (not an
+        // 'unknown constant' error), reported once at the definition.
+        let d = check(".code\n.globl main\nOFF equ 0\nmain:\n  mov eax, OFF\n  ret\n", &kb);
+        assert!(!d.iter().any(|x| x.message.contains("unknown constant")), "no error: {d:?}");
+        assert!(d.iter().any(|x| x.message.contains("shadows")), "a shadow note: {d:?}");
     }
 
     #[test]
