@@ -1,0 +1,46 @@
+; equ_demo.was — MASM-style equates + compile-time conditional assembly.
+;
+;   was examples/equ_demo.was --emit-asm     ; see the equate folded + IF resolved
+;   was examples/equ_demo.was -o /tmp/equ_demo.exe
+;
+; The whole point: nothing is hidden. `equ` folds to a literal you can SEE in the
+; lowered text, and the undotted compile-time IF/ELSE picks which body survives —
+; the dropped branch leaves no trace.
+
+; ── compile-time constants (fold before anything is lowered) ──────────────────
+DEBUG    equ 1               ; flip to 0 to swap the IF branch below
+WIDTH    equ 80
+HEIGHT   equ 25
+CELLS    equ WIDTH * HEIGHT  ; define-before-use: references earlier equates
+STRIDE   equ 1 << 4          ; 16  (shift)
+EXIT_OK  equ 0
+
+.globl main
+
+.CODE
+main:
+    ; WIDTH * HEIGHT folds to a single literal operand — no arithmetic survives.
+    mov eax, CELLS
+
+    ; STRIDE used as a dup-style stride and a bitmask — both fold.
+    mov ecx, STRIDE
+    and eax, STRIDE - 1
+
+IF DEBUG
+    ; This body is INCLUDED because DEBUG != 0; the ELSE body is dropped entirely.
+    mov edx, 0xDEAD
+ELSE
+    mov edx, 0xBEEF
+ENDIF
+
+    ; A winkb constant folded through `equ` (the value the OS expects).
+    mov r8d, MB_OK
+
+    invoke ExitProcess, EXIT_OK
+    ret
+
+.DATA
+    .balign 16
+; A dup count that folds (trap #5 retired): STRIDE is a literal by the time the
+; data line is read, so `BYTE STRIDE dup(0)` lays out 16 zero bytes.
+buf  BYTE STRIDE dup(0)

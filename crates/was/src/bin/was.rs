@@ -33,6 +33,16 @@ THE WRASM DIALECT — Intel/MASM-compatible, with exceptions
   (`x real8 440.0` -> IEEE bits), with `N dup(v)`. Everything lowers to *visible*
   instructions -- nothing is hidden (see `--emit-asm`).
 
+EQUATES + COMPILE-TIME CONDITIONALS (MASM-style, fold before lowering)
+  `NAME equ <expr>` / `NAME = <expr>` define an integer constant (define-before-use);
+  every later whole-word use of NAME folds to its value (never inside a \"string\" or a
+  comment). `<expr>` is a full integer expression: decimal/0x-hex literals, equates,
+  and winkb constants, with - ~  * / %  + -  << >>  &  ^  |  and parentheses.
+  Inside a `struct`/`ends` data block, `field = value` stays a struct field, NOT an
+  equate. Undotted COMPILE-TIME conditionals select source text before assembly:
+    IF <expr> / IFDEF NAME / IFNDEF NAME / ELSEIF <expr> / ELSE / ENDIF  (nestable)
+  These are DISTINCT from the runtime `.if` (which lowers to a compare + branch).
+
   Exceptions that bite (the full reference is help.md):
     * `invoke` uses rax/eax as scratch to stage stack args -- never pass an `invoke`
       argument that lives in rax/eax; route it through memory or another register.
@@ -40,7 +50,8 @@ THE WRASM DIALECT — Intel/MASM-compatible, with exceptions
       registers ONLY, not xmm -- save xmm6+ yourself if a proc touches them.
     * a `proc` that contains `invoke`/`call` must declare `frame` (aligned shadow space).
     * float args to `invoke` need a real4/real8 annotation: `invoke f, real8 [rip+x]`.
-    * `dup` count must be a literal: `BYTE 64 dup(0)`, not `BYTE 8*8 dup(0)`.
+    * `dup` count folds via equates/constants: `STRIDE equ 8*8` then `BYTE STRIDE dup(0)`
+      (a bare `8*8` still won't parse -- name it with an equate first).
     * no manual `sub rsp` inside a `frame` proc -- use a memory slot or xmm0-5.
     * a `','` char literal trips the lexer -- use the ASCII number (44) instead.
 ";
@@ -121,14 +132,17 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let lowered = was::lower(&src, &kb)?;
+    // Keep the source→lowered map so a downstream encode error is reported at the
+    // real source line, not the post-preprocessing/lowering line (the equate/IF
+    // pass removes lines, so the two diverge).
+    let (lowered, map) = was::lower_mapped(&src, &kb)?;
 
     if emit_asm {
         print!("{lowered}");
         return Ok(());
     }
 
-    let module = assemble(&lowered)?;
+    let module = assemble(&lowered).map_err(|e| was::remap_assemble_error(e, &map))?;
     let output = output
         .unwrap_or_else(|| Path::new(&input).with_extension("obj").to_string_lossy().into_owned());
 

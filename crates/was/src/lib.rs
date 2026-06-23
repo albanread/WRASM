@@ -1202,6 +1202,19 @@ pub fn lower(src: &str, kb: &Kb) -> Result<String> {
     Ok(lower_mapped(src, kb)?.0)
 }
 
+/// Rewrite a leading ``line N: `` tag on an error so `N` (a *lowered* line number,
+/// as produced by `rasm::assemble`) is mapped back through `map` to its real
+/// source line. Used by the compile path so a downstream encode error points at
+/// the source line, not the post-preprocessing/lowering line. Mirrors the
+/// remapping `check` does on its diagnostics.
+pub fn remap_assemble_error(e: anyhow::Error, map: &[usize]) -> anyhow::Error {
+    let (lowered, msg) = split_line_tag(&format!("{e:#}"));
+    match lowered.and_then(|n| map.get(n.saturating_sub(1)).copied()) {
+        Some(src_line) => anyhow::anyhow!("line {src_line}: {msg}"),
+        None => e,
+    }
+}
+
 /// Lower `src`, also returning a map from each *lowered* line (0-based) back to
 /// the 1-based source line it came from. One source line can expand to many
 /// lowered lines (an `invoke`, a `.while`, or a user macro), so this is what lets
@@ -1212,12 +1225,561 @@ pub fn lower(src: &str, kb: &Kb) -> Result<String> {
 /// compose, so a macro's body still maps back to the invocation line.
 pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     let (expanded, emap) = expand_macros(src)?;
-    let (lowered, lmap) = lower_expanded(&expanded, kb)?;
+    // Compile-time layer: fold MASM equates (`NAME equ …` / `NAME = …`) and
+    // resolve undotted conditional assembly (`IF`/`IFDEF`/`ELSE`/`ENDIF`) before
+    // anything structural is lowered. Returns its own 1-based map (expanded line
+    // per emitted line) so a downstream error still points at the real source.
+    let (preprocessed, pmap) = preprocess_equates(&expanded, kb)?;
+    let (lowered, lmap) = lower_expanded(&preprocessed, kb)?;
+    // Compose all three maps: lowered → preprocessed → expanded → source.
     let map = lmap
         .into_iter()
-        .map(|el| emap.get(el.wrapping_sub(1)).copied().unwrap_or(0))
+        .map(|ll| {
+            let pl = pmap.get(ll.wrapping_sub(1)).copied().unwrap_or(0);
+            emap.get(pl.wrapping_sub(1)).copied().unwrap_or(0)
+        })
         .collect();
     Ok((lowered, map))
+}
+
+// ── compile-time equates + conditional assembly (MASM-style) ──────────────────
+//
+// A textual pass that runs after macro expansion and before structural lowering.
+// It does two interleaved things, top-to-bottom in one walk so each can see the
+// other:
+//
+//   * EQUATES — `NAME equ <expr>` and `NAME = <expr>` define an integer constant
+//     (define-before-use). The definition line emits nothing; every later use of
+//     `NAME` as a whole word (outside strings and comments) is replaced by its
+//     value. This is what lets a `dup` count fold to a literal before `lower_data`
+//     ever sees it.
+//
+//   * CONDITIONAL ASSEMBLY — undotted `IF`/`IFDEF`/`IFNDEF`/`ELSEIF`/`ELSE`/
+//     `ENDIF`. These are COMPILE-TIME and entirely distinct from the runtime
+//     `.if` (which lowers to a compare + branch). Excluded lines emit nothing; an
+//     equate inside a skipped branch is never recorded.
+//
+// `=` is overloaded: it is also a struct field assignment inside a
+// `LABEL struct TYPE … field = value … ends` block. We track that block depth and
+// treat a bare `=` as an equate ONLY outside such a block. `equ` is always an
+// equate.
+
+/// One frame of the conditional-assembly stack.
+struct CondFrame {
+    /// Are lines in the *current* clause emitted?
+    active: bool,
+    /// Has any clause in this IF chain been taken yet? (gates ELSEIF/ELSE.)
+    taken: bool,
+    /// Have we already seen the `ELSE`? (a second `ELSE`/`ELSEIF` is an error.)
+    else_seen: bool,
+    /// Was the enclosing context emitting when this IF opened? A nested IF inside
+    /// a skipped branch stays skipped regardless of its own condition.
+    parent_active: bool,
+    /// 1-based source line of the opening `IF`/`IFDEF`/`IFNDEF`, so an unclosed
+    /// frame can point its diagnostic at the dangling opener.
+    open_line: usize,
+}
+
+/// Recursive-descent integer evaluator over equates + winkb constants.
+///
+/// Grammar (lowest precedence first), matching C / MASM expression rules:
+///   or    := xor   ('|' xor)*
+///   xor   := and   ('^' and)*
+///   and   := shift ('&' shift)*
+///   shift := add   (('<<'|'>>') add)*
+///   add   := mul   (('+'|'-') mul)*
+///   mul   := unary (('*'|'/'|'%') unary)*
+///   unary := ('-'|'~')* primary
+///   primary := NUMBER | IDENT | '(' or ')'
+///
+/// A NUMBER is decimal or `0x`-hex (underscores allowed). An IDENT resolves as
+/// (a) an equate from `eqs`, else (b) a winkb constant via `kb.resolve`, else a
+/// hard error — a compile-time expression must be fully known.
+fn eval_expr(expr: &str, eqs: &HashMap<String, i64>, kb: &Kb) -> Result<i64> {
+    let toks = tokenize_expr(expr)?;
+    let mut p = ExprParser { toks: &toks, pos: 0, eqs, kb };
+    let v = p.parse_or()?;
+    if p.pos != p.toks.len() {
+        bail!("trailing tokens in expression `{}`", expr.trim());
+    }
+    Ok(v)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Num(i64),
+    Ident(String),
+    Op(&'static str),
+    LParen,
+    RParen,
+}
+
+/// Lex an expression into tokens. Multi-char operators `<<` and `>>` are matched
+/// before their single-char prefixes.
+fn tokenize_expr(s: &str) -> Result<Vec<Tok>> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '<' && i + 1 < b.len() && b[i + 1] == b'<' {
+            out.push(Tok::Op("<<"));
+            i += 2;
+            continue;
+        }
+        if c == '>' && i + 1 < b.len() && b[i + 1] == b'>' {
+            out.push(Tok::Op(">>"));
+            i += 2;
+            continue;
+        }
+        match c {
+            '(' => {
+                out.push(Tok::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(Tok::RParen);
+                i += 1;
+            }
+            '+' | '-' | '*' | '/' | '%' | '&' | '^' | '|' | '~' => {
+                let op: &'static str = match c {
+                    '+' => "+",
+                    '-' => "-",
+                    '*' => "*",
+                    '/' => "/",
+                    '%' => "%",
+                    '&' => "&",
+                    '^' => "^",
+                    '|' => "|",
+                    '~' => "~",
+                    _ => unreachable!(),
+                };
+                out.push(Tok::Op(op));
+                i += 1;
+            }
+            _ if c.is_ascii_digit() => {
+                let start = i;
+                while i < b.len()
+                    && (is_ident_char(b[i] as char) || b[i] as char == '_')
+                {
+                    i += 1;
+                }
+                let raw = &s[start..i];
+                let body = raw.replace('_', "");
+                let n = if let Some(h) =
+                    body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
+                {
+                    i64::from_str_radix(h, 16)
+                        .with_context(|| format!("bad hex literal `{raw}`"))?
+                } else {
+                    body.parse::<i64>()
+                        .with_context(|| format!("bad integer literal `{raw}`"))?
+                };
+                out.push(Tok::Num(n));
+            }
+            _ if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < b.len() && is_ident_char(b[i] as char) {
+                    i += 1;
+                }
+                out.push(Tok::Ident(s[start..i].to_string()));
+            }
+            _ => bail!("unexpected character `{c}` in expression"),
+        }
+    }
+    Ok(out)
+}
+
+struct ExprParser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+    eqs: &'a HashMap<String, i64>,
+    kb: &'a Kb,
+}
+
+impl ExprParser<'_> {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+    fn eat_op(&mut self, op: &str) -> bool {
+        if matches!(self.peek(), Some(Tok::Op(o)) if *o == op) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn parse_or(&mut self) -> Result<i64> {
+        let mut v = self.parse_xor()?;
+        while self.eat_op("|") {
+            v |= self.parse_xor()?;
+        }
+        Ok(v)
+    }
+    fn parse_xor(&mut self) -> Result<i64> {
+        let mut v = self.parse_and()?;
+        while self.eat_op("^") {
+            v ^= self.parse_and()?;
+        }
+        Ok(v)
+    }
+    fn parse_and(&mut self) -> Result<i64> {
+        let mut v = self.parse_shift()?;
+        while self.eat_op("&") {
+            v &= self.parse_shift()?;
+        }
+        Ok(v)
+    }
+    fn parse_shift(&mut self) -> Result<i64> {
+        let mut v = self.parse_add()?;
+        loop {
+            if self.eat_op("<<") {
+                let s = self.parse_add()?;
+                if !(0..64).contains(&s) {
+                    bail!("shift count {s} out of range 0..=63");
+                }
+                v = v.wrapping_shl(s as u32);
+            } else if self.eat_op(">>") {
+                let s = self.parse_add()?;
+                if !(0..64).contains(&s) {
+                    bail!("shift count {s} out of range 0..=63");
+                }
+                // Logical (MASM `SHR`) shift: a negative left operand does not
+                // sign-extend, so masking flags built from `~0`/negatives folds the
+                // way an asm writer reaching for SHR expects.
+                v = ((v as u64) >> (s as u32)) as i64;
+            } else {
+                break;
+            }
+        }
+        Ok(v)
+    }
+    fn parse_add(&mut self) -> Result<i64> {
+        let mut v = self.parse_mul()?;
+        loop {
+            if self.eat_op("+") {
+                v = v.wrapping_add(self.parse_mul()?);
+            } else if self.eat_op("-") {
+                v = v.wrapping_sub(self.parse_mul()?);
+            } else {
+                break;
+            }
+        }
+        Ok(v)
+    }
+    fn parse_mul(&mut self) -> Result<i64> {
+        let mut v = self.parse_unary()?;
+        loop {
+            if self.eat_op("*") {
+                v = v.wrapping_mul(self.parse_unary()?);
+            } else if self.eat_op("/") {
+                let d = self.parse_unary()?;
+                if d == 0 {
+                    bail!("division by zero in expression");
+                }
+                v = v
+                    .checked_div(d)
+                    .ok_or_else(|| anyhow::anyhow!("division overflow (i64::MIN / -1)"))?;
+            } else if self.eat_op("%") {
+                let d = self.parse_unary()?;
+                if d == 0 {
+                    bail!("modulo by zero in expression");
+                }
+                v = v
+                    .checked_rem(d)
+                    .ok_or_else(|| anyhow::anyhow!("modulo overflow (i64::MIN % -1)"))?;
+            } else {
+                break;
+            }
+        }
+        Ok(v)
+    }
+    fn parse_unary(&mut self) -> Result<i64> {
+        if self.eat_op("-") {
+            return Ok(self.parse_unary()?.wrapping_neg());
+        }
+        if self.eat_op("~") {
+            return Ok(!self.parse_unary()?);
+        }
+        self.parse_primary()
+    }
+    fn parse_primary(&mut self) -> Result<i64> {
+        match self.peek() {
+            Some(Tok::Num(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok(n)
+            }
+            Some(Tok::Ident(name)) => {
+                let name = name.clone();
+                self.pos += 1;
+                if let Some(v) = self.eqs.get(&name) {
+                    return Ok(*v);
+                }
+                if let Some(v) = self.kb.resolve(&name)?.first() {
+                    return Ok(v.i64v);
+                }
+                bail!("unknown name `{name}` in expression")
+            }
+            Some(Tok::LParen) => {
+                self.pos += 1;
+                let v = self.parse_or()?;
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    bail!("missing `)` in expression");
+                }
+                self.pos += 1;
+                Ok(v)
+            }
+            other => bail!("unexpected token {other:?} in expression"),
+        }
+    }
+}
+
+/// `NAME equ <expr>` or `NAME = <expr>` → `(NAME, expr)`, if `t` is a definition.
+/// `in_struct` suppresses the bare-`=` form (it's a struct field there). `equ` is
+/// recognised everywhere. The `=`/`equ` keyword must be whole-word, and NAME a
+/// valid asm identifier.
+fn parse_equate<'a>(t: &'a str, in_struct: bool) -> Option<(&'a str, &'a str)> {
+    // `NAME equ rest`
+    let (name, rest) = split_first(t);
+    if !name.is_empty() && name.chars().all(is_ident_char) && !name.chars().next().unwrap().is_ascii_digit() {
+        if let Some(expr) = strip_keyword(rest, "equ") {
+            if !expr.is_empty() {
+                return Some((name, expr));
+            }
+        }
+    }
+    // `NAME = rest` — only outside a struct block.
+    if !in_struct {
+        if let Some((lhs, rhs)) = t.split_once('=') {
+            let lhs = lhs.trim();
+            let rhs = rhs.trim();
+            // Reject comparison / compound operators that merely contain `=`
+            // (`==`, `<=`, `>=`, `!=`); a bare equate's lhs is a single ident.
+            let after = &t[t.find('=').unwrap() + 1..];
+            if !lhs.is_empty()
+                && lhs.chars().all(is_ident_char)
+                && !lhs.chars().next().unwrap().is_ascii_digit()
+                && !after.starts_with('=')
+                && !lhs.ends_with(['<', '>', '!', '='])
+                && !rhs.is_empty()
+            {
+                return Some((lhs, rhs));
+            }
+        }
+    }
+    None
+}
+
+/// Replace whole-word equate names with their integer value, skipping the insides
+/// of double-quoted strings and (already stripped) comments. Single-char `'…'`
+/// literals are copied verbatim too.
+fn substitute_equates(line: &str, eqs: &HashMap<String, i64>) -> String {
+    if eqs.is_empty() {
+        return line.to_string();
+    }
+    let b = line.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '"' || c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i] as char);
+                let done = b[i] as char == c;
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < b.len() && is_ident_char(b[i] as char) {
+                i += 1;
+            }
+            let tok = &line[start..i];
+            match eqs.get(tok) {
+                Some(v) => out.push_str(&v.to_string()),
+                None => out.push_str(tok),
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The compile-time preprocessing pass. Returns the rewritten text and a 1-based
+/// map from each *output* line to the *input* (expanded) line it came from, so a
+/// downstream error still points at the real source.
+fn preprocess_equates(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
+    let mut eqs: HashMap<String, i64> = HashMap::new();
+    let mut out = String::new();
+    let mut map: Vec<usize> = Vec::new();
+    let mut conds: Vec<CondFrame> = Vec::new();
+    // Depth of the data `LABEL struct TYPE … ends` block, where `=` is a field
+    // assignment rather than an equate. (`struct` data blocks do not nest, but a
+    // counter keeps the bookkeeping simple and robust.)
+    let mut struct_depth = 0usize;
+
+    let emitting = |conds: &[CondFrame]| conds.iter().all(|f| f.active);
+
+    for (i, raw) in src.lines().enumerate() {
+        let in_line = i + 1;
+        let t = strip_comment(raw).trim();
+        let active = emitting(&conds);
+
+        // ── conditional-assembly directives (handled even while skipping, so the
+        //    nesting stays balanced) ──────────────────────────────────────────
+        if let Some(expr) = strip_keyword_ci(t, "if") {
+            let parent = active;
+            let val = if parent { eval_expr(expr, &eqs, kb).map_err(|e| line_err(in_line, e))? } else { 0 };
+            conds.push(CondFrame {
+                active: parent && val != 0,
+                taken: parent && val != 0,
+                else_seen: false,
+                parent_active: parent,
+                open_line: in_line,
+            });
+            continue;
+        }
+        if let Some(name) = strip_keyword_ci(t, "ifdef") {
+            let parent = active;
+            // MASM IFDEF takes exactly one symbol — resolve the first token, so a
+            // stray trailing token can't make a defined name look undefined.
+            let def = eqs.contains_key(split_first(name.trim()).0);
+            conds.push(CondFrame {
+                active: parent && def,
+                taken: parent && def,
+                else_seen: false,
+                parent_active: parent,
+                open_line: in_line,
+            });
+            continue;
+        }
+        if let Some(name) = strip_keyword_ci(t, "ifndef") {
+            let parent = active;
+            let undef = !eqs.contains_key(split_first(name.trim()).0);
+            conds.push(CondFrame {
+                active: parent && undef,
+                taken: parent && undef,
+                else_seen: false,
+                parent_active: parent,
+                open_line: in_line,
+            });
+            continue;
+        }
+        if let Some(expr) = strip_keyword_ci(t, "elseif") {
+            let f = conds
+                .last_mut()
+                .ok_or_else(|| line_err(in_line, anyhow::anyhow!("`ELSEIF` without an open `IF`")))?;
+            if f.else_seen {
+                return Err(line_err(in_line, anyhow::anyhow!("`ELSEIF` after `ELSE`")));
+            }
+            let parent = f.parent_active;
+            if f.taken || !parent {
+                f.active = false;
+            } else {
+                let val = eval_expr(expr, &eqs, kb).map_err(|e| line_err(in_line, e))?;
+                f.active = val != 0;
+                f.taken = val != 0;
+            }
+            continue;
+        }
+        if t.eq_ignore_ascii_case("else") {
+            let f = conds
+                .last_mut()
+                .ok_or_else(|| line_err(in_line, anyhow::anyhow!("`ELSE` without an open `IF`")))?;
+            if f.else_seen {
+                return Err(line_err(in_line, anyhow::anyhow!("duplicate `ELSE`")));
+            }
+            f.else_seen = true;
+            f.active = f.parent_active && !f.taken;
+            f.taken = true;
+            continue;
+        }
+        if t.eq_ignore_ascii_case("endif") {
+            if conds.pop().is_none() {
+                return Err(line_err(in_line, anyhow::anyhow!("`ENDIF` without an open `IF`")));
+            }
+            continue;
+        }
+
+        // Excluded by a false branch: emit nothing, define nothing.
+        if !active {
+            continue;
+        }
+
+        // ── struct-block depth tracking (so `=` means the right thing) ────────
+        if parse_struct_open(t).is_some() {
+            struct_depth += 1;
+        }
+        let in_struct = struct_depth > 0;
+        if in_struct && (t == "ends" || t == "endstruct") {
+            struct_depth = struct_depth.saturating_sub(1);
+        }
+
+        // ── equate definition: record, emit nothing ─────────────────────────
+        if let Some((name, expr)) = parse_equate(t, in_struct) {
+            // A register-named equate would silently rewrite `mov eax, 1` into
+            // `mov 99, 1` — exactly the kind of hidden corruption the dialect
+            // refuses to do. Reject it with a clear, line-tagged error instead.
+            if is_register(name) {
+                return Err(line_err(
+                    in_line,
+                    anyhow::anyhow!("equate `{name}` shadows a register name"),
+                ));
+            }
+            // The rhs may itself reference earlier equates by name; substitute
+            // first so `B equ A + 1` works, then evaluate.
+            let sub = substitute_equates(expr, &eqs);
+            let v = eval_expr(&sub, &eqs, kb).map_err(|e| line_err(in_line, e))?;
+            eqs.insert(name.to_string(), v);
+            continue;
+        }
+
+        // ── ordinary line: substitute equate uses, keep verbatim otherwise ──
+        // Substitute only over the code portion; re-append the original comment
+        // verbatim so equate names inside a comment are never rewritten (and a
+        // stray apostrophe in comment text can't flip quote-tracking).
+        let code = strip_comment(raw);
+        out.push_str(&substitute_equates(code, &eqs));
+        out.push_str(&raw[code.len()..]);
+        out.push('\n');
+        map.push(in_line);
+    }
+    if let Some(f) = conds.first() {
+        return Err(line_err(
+            f.open_line,
+            anyhow::anyhow!("`IF` without a matching `ENDIF`"),
+        ));
+    }
+    Ok((out, map))
+}
+
+/// Prefix an error with `line N:` (matching the convention `split_line_tag` peels
+/// back), so a preprocessing failure points at its source line.
+fn line_err(line: usize, e: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("line {line}: {e:#}")
+}
+
+/// Like [`strip_keyword`] but case-insensitive (MASM `IF`/`if`/`Ifdef` all work).
+fn strip_keyword_ci<'a>(t: &'a str, kw: &str) -> Option<&'a str> {
+    let (head, rest) = split_first(t);
+    if head.eq_ignore_ascii_case(kw) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
 }
 
 /// Lower already-macro-expanded `src`. The returned map is the 1-based *expanded*
@@ -2887,5 +3449,209 @@ mod tests {
         assert!(lower("main:\n  .endfor\n", &kb).is_err(), ".endfor without .for/.forever");
         assert!(lower("main:\n  .break\n", &kb).is_err(), ".break outside a loop");
         assert!(lower("main:\n  .until al == 1\n", &kb).is_err(), ".until without .repeat");
+    }
+
+    // ── compile-time equates + conditional assembly ──────────────────────────
+
+    #[test]
+    fn equate_arithmetic_folds_into_operand() {
+        let Some(kb) = kb() else { return };
+        let low = lower("main:\n  N equ 8*4\n  mov eax, N\n", &kb).unwrap();
+        assert!(low.contains("mov eax, 32"), "N equ 8*4 should fold to 32:\n{low}");
+        // the definition line emits nothing
+        assert!(!low.contains("equ"), "the equate definition must not survive:\n{low}");
+    }
+
+    #[test]
+    fn equate_hex_and_bitwise_or() {
+        let Some(kb) = kb() else { return };
+        let low = lower("main:\n  F equ 0x10 | 1\n  mov eax, F\n", &kb).unwrap();
+        assert!(low.contains("mov eax, 17"), "0x10 | 1 == 17:\n{low}");
+    }
+
+    #[test]
+    fn eval_expr_precedence_and_operators() {
+        let Some(kb) = kb() else { return };
+        let e = HashMap::new();
+        assert_eq!(eval_expr("2 + 3 * 4", &e, &kb).unwrap(), 14);
+        assert_eq!(eval_expr("(2 + 3) * 4", &e, &kb).unwrap(), 20);
+        assert_eq!(eval_expr("1 << 4", &e, &kb).unwrap(), 16);
+        assert_eq!(eval_expr("0xFF & 0x0F", &e, &kb).unwrap(), 0x0F);
+        assert_eq!(eval_expr("~0 & 0xFF", &e, &kb).unwrap(), 0xFF);
+        assert_eq!(eval_expr("-5 + 8", &e, &kb).unwrap(), 3);
+        assert_eq!(eval_expr("10 % 3", &e, &kb).unwrap(), 1);
+        assert_eq!(eval_expr("1 | 2 ^ 2", &e, &kb).unwrap(), 1); // ^ binds tighter than |
+        assert!(eval_expr("3 +", &e, &kb).is_err());
+        assert!(eval_expr("totally_unknown_name", &e, &kb).is_err());
+    }
+
+    #[test]
+    fn equate_resolves_winkb_constants() {
+        let Some(kb) = kb() else { return };
+        // Pick a pair that exists and fold them with `|`; cross-check kb.resolve.
+        let ok = kb.resolve("MB_OK").unwrap();
+        let err = kb.resolve("MB_ICONERROR").unwrap();
+        let (Some(a), Some(b)) = (ok.first(), err.first()) else { return };
+        let want = a.i64v | b.i64v;
+        let src = format!("main:\n  S equ MB_OK | MB_ICONERROR\n  mov eax, S\n");
+        let low = lower(&src, &kb).unwrap();
+        assert!(low.contains(&format!("mov eax, {want}")), "want folded {want}:\n{low}");
+    }
+
+    #[test]
+    fn dup_count_folds_via_equate_trap5_retired() {
+        let Some(kb) = kb() else { return };
+        // STRIDE used as a `dup` count: must fold to a literal before lower_data
+        // (this is exactly what retires trap #5 — a dup count no longer has to be
+        // a bare literal in the source).
+        let low = lower(".data\nSTRIDE equ 32\nbuf BYTE STRIDE dup(0)\n", &kb).unwrap();
+        assert!(low.contains(".zero 32"), "BYTE STRIDE dup(0) must fold to .zero 32:\n{low}");
+    }
+
+    #[test]
+    fn equate_is_not_substituted_inside_a_string() {
+        let Some(kb) = kb() else { return };
+        // `N` is an equate, but the WCHAR string literally contains the word N.
+        let low = lower("N equ 5\nmsg WCHAR \"N items\", 0\n", &kb).unwrap();
+        // The 'N' (0x4E) and 'i','t'... encode as their UTF-16 units; the equate's
+        // value 5 must NOT appear where the string's 'N' is.
+        assert!(low.contains("78"), "the literal 'N' (78) must survive in the string:\n{low}");
+        assert!(!low.contains(".word 5,") && !low.contains(", 5,"), "no equate sub in string:\n{low}");
+    }
+
+    #[test]
+    fn conditional_if_includes_and_excludes() {
+        let Some(kb) = kb() else { return };
+        let on = lower("main:\n  DBG equ 1\n  IF DBG\n  mov eax, 111\n  ELSE\n  mov eax, 222\n  ENDIF\n", &kb).unwrap();
+        assert!(on.contains("mov eax, 111") && !on.contains("mov eax, 222"), "DBG=1 keeps A:\n{on}");
+        let off = lower("main:\n  DBG equ 0\n  IF DBG\n  mov eax, 111\n  ELSE\n  mov eax, 222\n  ENDIF\n", &kb).unwrap();
+        assert!(off.contains("mov eax, 222") && !off.contains("mov eax, 111"), "DBG=0 keeps B:\n{off}");
+    }
+
+    #[test]
+    fn conditional_ifdef_ifndef_and_nesting() {
+        let Some(kb) = kb() else { return };
+        // FEATURE defined -> outer taken; nested IF on its value selects inner A.
+        let src = "FEATURE equ 1\nmain:\n  IFDEF FEATURE\n    IF FEATURE\n    mov eax, 1\n    ELSE\n    mov eax, 2\n    ENDIF\n  ELSE\n  mov eax, 3\n  ENDIF\n";
+        let low = lower(src, &kb).unwrap();
+        assert!(low.contains("mov eax, 1"), "nested taken branch:\n{low}");
+        assert!(!low.contains("mov eax, 2") && !low.contains("mov eax, 3"), "others dropped:\n{low}");
+        // IFNDEF of an undefined name is taken.
+        let low2 = lower("main:\n  IFNDEF NOPE\n  mov eax, 9\n  ENDIF\n", &kb).unwrap();
+        assert!(low2.contains("mov eax, 9"), "IFNDEF undefined is taken:\n{low2}");
+    }
+
+    #[test]
+    fn runtime_dot_if_still_lowers_after_equates() {
+        let Some(kb) = kb() else { return };
+        // The compile-time IF and the runtime `.if` coexist; `.if` must still
+        // lower to a compare + branch.
+        let src = "LIMIT equ 5\nmain:\n  mov eax, 0\n  .if eax < LIMIT\n    inc eax\n  .endif\n  ret\n";
+        let low = lower(src, &kb).unwrap();
+        assert!(low.contains("cmp eax, 5"), "LIMIT folds into the runtime cmp:\n{low}");
+        assert!(low.contains("__if0_"), "runtime .if still emits its branch labels:\n{low}");
+    }
+
+    #[test]
+    fn equate_in_skipped_branch_is_not_recorded() {
+        let Some(kb) = kb() else { return };
+        // X is defined only inside a dropped branch, so it must NOT fold: the use
+        // survives verbatim as a bare symbol (left for rasm to treat as a label).
+        let src = "main:\n  IF 0\n  X equ 7\n  ENDIF\n  mov eax, X\n";
+        let low = lower(src, &kb).unwrap();
+        assert!(low.contains("mov eax, X"), "X from a skipped branch must not fold:\n{low}");
+        assert!(!low.contains("mov eax, 7"), "the dropped equate must not leak:\n{low}");
+    }
+
+    #[test]
+    fn struct_field_equals_is_not_an_equate() {
+        let Some(kb) = kb() else { return };
+        // Inside a `… struct … ends` block, `Format = 87` is a field, not an
+        // equate; the preprocessor must NOT swallow it as a definition.
+        let src = "scd struct DXGI_SWAP_CHAIN_DESC\n  BufferDesc.Format = 87\n  BufferCount = 2\nends\n";
+        let low = lower(src, &kb).unwrap();
+        assert!(low.contains("scd:"), "the struct instance must be laid out:\n{low}");
+        // 87 lands as data, not vanished into an equate table.
+        assert!(low.contains("87"), "the field value must reach the layout:\n{low}");
+    }
+
+    #[test]
+    fn equate_line_map_points_at_real_source_line() {
+        let Some(kb) = kb() else { return };
+        // Equates + a conditional precede a bogus mnemonic on line 7; the diag
+        // must report line 7, mirroring check_locates_encode_error_at_its_source_line.
+        let src = ".globl main\nN equ 8\nmain:\n  IF N\n  mov eax, N\n  ENDIF\n  xyzzy rax, rbx\n  ret\n";
+        let diags = check(src, &kb);
+        assert!(diags.iter().any(|d| d.line == 7), "want a diag on source line 7: {diags:?}");
+        assert!(!diags.iter().any(|d| d.line == 0), "no whole-file fallback: {diags:?}");
+    }
+
+    #[test]
+    fn shift_out_of_range_is_a_clean_error_not_a_panic() {
+        let Some(kb) = kb() else { return };
+        let e = HashMap::new();
+        for expr in ["1 << 64", "1 << 100", "1 << -1", "1 >> 64", "1 >> -1"] {
+            let r = eval_expr(expr, &e, &kb);
+            assert!(r.is_err(), "`{expr}` must be a clean error, got {r:?}");
+            assert!(
+                format!("{:#}", r.unwrap_err()).contains("shift count"),
+                "`{expr}` should mention the shift count"
+            );
+        }
+        // In-range shifts still work.
+        assert_eq!(eval_expr("1 << 63", &e, &kb).unwrap(), i64::MIN);
+        // Logical right shift: a negative left operand does NOT sign-extend.
+        assert_eq!(eval_expr("(0 - 8) >> 1", &e, &kb).unwrap(), (((-8i64) as u64) >> 1) as i64);
+        // Reachable through the public lower() entrypoint without panicking.
+        assert!(lower("FLAGS equ 1 << 64\nmain:\n  mov eax, FLAGS\n", &kb).is_err());
+    }
+
+    #[test]
+    fn division_overflow_is_a_clean_error_not_a_panic() {
+        let Some(kb) = kb() else { return };
+        let e = HashMap::new();
+        let div = eval_expr("(0 - 9223372036854775807 - 1) / (0 - 1)", &e, &kb);
+        assert!(div.is_err(), "i64::MIN / -1 must error, got {div:?}");
+        assert!(format!("{:#}", div.unwrap_err()).contains("overflow"));
+        let rem = eval_expr("(0 - 9223372036854775807 - 1) % (0 - 1)", &e, &kb);
+        assert!(rem.is_err(), "i64::MIN % -1 must error, got {rem:?}");
+        // Plain division still works.
+        assert_eq!(eval_expr("100 / 7", &e, &kb).unwrap(), 14);
+    }
+
+    #[test]
+    fn ifdef_resolves_only_the_first_token() {
+        let Some(kb) = kb() else { return };
+        // IFDEF with a trailing junk token on a DEFINED symbol must still take it.
+        let on = lower("X equ 1\nmain:\n  IFDEF X extra junk\n  mov eax, 1\n  ENDIF\n", &kb).unwrap();
+        assert!(on.contains("mov eax, 1"), "IFDEF X (defined) must include, trailing junk ignored:\n{on}");
+        // IFNDEF with a trailing token on a DEFINED symbol must NOT take it.
+        let off = lower("X equ 1\nmain:\n  IFNDEF X trailing\n  mov eax, 777\n  ENDIF\n", &kb).unwrap();
+        assert!(!off.contains("mov eax, 777"), "IFNDEF of a defined X must drop the branch:\n{off}");
+    }
+
+    #[test]
+    fn register_named_equate_is_rejected() {
+        let Some(kb) = kb() else { return };
+        let r = lower("eax equ 99\nmain:\n  mov eax, 1\n", &kb);
+        assert!(r.is_err(), "a register-named equate must be rejected, not silently fold");
+        assert!(format!("{:#}", r.unwrap_err()).contains("shadows a register"));
+    }
+
+    #[test]
+    fn equate_name_inside_a_comment_is_not_rewritten() {
+        let Some(kb) = kb() else { return };
+        // The comment text mentions the equate name and contains a lone apostrophe;
+        // neither the name nor the apostrophe-driven quote scan must touch the code.
+        let low = lower("N equ 5\nmain:\n  mov eax, N  ; that's N items\n", &kb).unwrap();
+        assert!(low.contains("mov eax, 5"), "the code N folds:\n{low}");
+    }
+
+    #[test]
+    fn unclosed_if_points_at_the_opening_line() {
+        let Some(kb) = kb() else { return };
+        let src = "main:\n  mov eax, 1\n  IF 1\n  mov eax, 2\n";
+        let diags = check(src, &kb);
+        assert!(diags.iter().any(|d| d.line == 3), "unclosed IF should point at line 3: {diags:?}");
     }
 }

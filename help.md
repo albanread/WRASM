@@ -56,6 +56,72 @@ endproc
   not listed in `uses`, reading an `in` register after it's been overwritten, and frame
   imbalance. It is **GP-register only** — see trap #2.
 
+## Equates & compile-time conditionals (MASM-style)
+
+A textual preprocessing layer runs **after macro expansion and before any structural
+lowering**, so equates fold and dead conditional branches vanish before `invoke`,
+`struct`, data, or the runtime `.if` are ever interpreted.
+
+### Equates — integer constants that fold
+
+```
+N      equ 8 * 4          ; `equ`, anywhere
+STRIDE = 1 << 5           ; `=` form (outside a struct block) — same thing
+WIDTH  equ STRIDE + N     ; define-before-use: may reference earlier equates
+MASK   equ MB_OK | MB_ICONERROR   ; winkb constants resolve too
+```
+
+- The definition line **emits nothing**. Every later **whole-word** use of the name is
+  replaced by its integer value — in operands, data values, `dup` counts, struct field
+  values. Substitution **never** touches the inside of a `"…"` string or a comment, and
+  never rewrites a substring of a longer identifier/label.
+- `<expr>` is a recursive-descent integer expression. **Literals**: decimal and `0x`-hex
+  (underscores allowed). **Identifiers** resolve as (a) an equate, else (b) a winkb
+  constant (`MB_OK`, `WS_VISIBLE`, …), else a hard error — a compile-time expression must
+  be fully known. **Operators** (high → low precedence):
+
+  | precedence | operators |
+  |---|---|
+  | unary  | `-` `~` |
+  | mul    | `*` `/` `%` |
+  | add    | `+` `-` |
+  | shift  | `<<` `>>` |
+  | and    | `&` |
+  | xor    | `^` |
+  | or     | `\|` |
+
+  with parentheses to override. (Same shape as C: `1 \| 2 ^ 2` is `1`, `2 + 3 * 4` is `14`.)
+
+- **`=` vs the struct field.** Inside a `LABEL struct TYPE … ends` data block, `field =
+  value` is a struct field assignment, *not* an equate — the preprocessor tracks struct
+  depth and only treats a bare `=` as an equate **outside** such a block. `equ` is always
+  an equate.
+
+### Conditional assembly — `IF` is compile-time, `.if` is runtime
+
+Undotted, MASM-style, and **selected at assembly time** (excluded lines produce no output
+and define no equates):
+
+```
+DBG equ 1
+IF DBG                 ; include when the expression is nonzero
+    invoke OutputDebugStringA, msg
+ELSEIF OTHER
+    …
+ELSE
+    …
+ENDIF
+
+IFDEF  FEATURE         ; taken when FEATURE is in the equate table
+IFNDEF FEATURE         ; …or when it is not
+```
+
+`IF` / `IFDEF` / `IFNDEF` / `ELSEIF` / `ELSE` / `ENDIF` nest. **This is entirely distinct
+from the runtime dotted `.if`**, which is control flow — it lowers to a `cmp` + branch and
+runs every time the code does. Rule of thumb: **undotted `IF` chooses *whether code
+exists*; dotted `.if` chooses *what code does at run time*.** An equate folds happily into
+a runtime `.if` condition (`.if eax < LIMIT`).
+
 ## Exceptions & traps — where WRASM bites
 
 These are the dialect's sharp edges. Most were found the hard way; learn them once.
@@ -78,8 +144,11 @@ These are the dialect's sharp edges. Most were found the hard way; learn them on
 4. **Float args to `invoke` need an annotation.** Tag them `real4`/`real8` so they
    marshal to an xmm register: `invoke f, real8 [rip + x]`.
 
-5. **`dup` count must be a literal.** `BYTE 64 dup(0)` works; `BYTE 8*8 dup(0)` does not
-   (no arithmetic folding in the count).
+5. **`dup` count folds through equates/constants** (was: "must be a literal"). A bare
+   expression still won't parse — `BYTE 8*8 dup(0)` is rejected — but the preprocessing
+   layer folds equates and winkb constants *before* the data line is read, so name the
+   count first: `STRIDE equ 8*8` then `BYTE STRIDE dup(0)` lays out 64 bytes. See
+   **Equates & compile-time conditionals** below.
 
 6. **No manual `sub rsp` inside a `frame` proc** ("rsp off the frame level"). To keep a
    value across a `call`, use `xmm0`–`xmm5` (if the callee honors xmm6+) or a `.DATA`
