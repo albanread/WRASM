@@ -2019,11 +2019,16 @@ fn expand_comcall(rest: &str, kb: &Kb, labels: &HashSet<String>, framed: bool) -
         o.push_str(&load_arg("rax", v, kb, labels)?);
         o.push_str(&format!("  mov [rsp + {off}], rax\n"));
     }
-    for (i, arg) in all.iter().enumerate().take(4) {
-        // all[0] is `this` (an integer pointer); all[i>=1] is method param i-1.
-        let pty = i.checked_sub(1).and_then(|pi| m.params.get(pi)).map(|s| s.as_str());
+    // Marshal the method's register args (rdx/r8/r9) BEFORE loading `this` into rcx,
+    // so an argument that lives in rcx/ecx (a count or index computed there) survives
+    // instead of being clobbered by the `this` load. (help.md trap #9 — handled by the
+    // macro now, not just a documented footgun.)
+    for (i, arg) in all.iter().enumerate().take(4).skip(1) {
+        let pty = m.params.get(i - 1).map(|s| s.as_str());
         o.push_str(&marshal_reg_arg(i, arg, pty, kb, labels)?);
     }
+    // `this` (arg 0) → rcx, LAST — after every method arg is already in place.
+    o.push_str(&marshal_reg_arg(0, &all[0], None, kb, labels)?);
     o.push_str("  mov rax, [rcx]\n"); // vtable, from the `this` pointer in rcx
     o.push_str(&format!("  call qword ptr [rax + {disp}]\n"));
     if !framed {
@@ -2622,6 +2627,24 @@ mod tests {
         // a bad method on a typed pointer is an editor diagnostic
         let diags = check("comobj p : IDXGISwapChain\np.Nope()\n", &kb);
         assert!(diags.iter().any(|d| d.message.contains("no method 'Nope'")), "{diags:?}");
+    }
+
+    #[test]
+    fn comcall_marshals_this_into_rcx_last() {
+        let Some(kb) = kb() else { return };
+        // Present(SyncInterval, Flags): the args go to rdx/r8, `this` to rcx. The `this`
+        // load must come AFTER the arg loads, so an argument living in rcx/ecx (a count
+        // computed there) isn't clobbered — `pObj.Method(4, ecx, 0, 0)` keeps ecx.
+        // (help.md trap #9.)
+        let low =
+            lower("comobj pSwap : IDXGISwapChain\nmain:\n  pSwap.Present(1, 0)\n", &kb).unwrap();
+        let this_at = low.find("mov rcx, [rip + pSwap]").expect("this -> rcx");
+        let rdx_at = low.find("mov rdx,").expect("arg1 -> rdx");
+        let r8_at = low.find("mov r8,").expect("arg2 -> r8");
+        assert!(
+            this_at > rdx_at && this_at > r8_at,
+            "`this` must marshal into rcx AFTER the method's register args:\n{low}"
+        );
     }
 
     #[test]
