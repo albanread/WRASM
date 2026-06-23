@@ -166,6 +166,7 @@ mod gui {
     const VK_SLASH: VIRTUAL_KEY = VIRTUAL_KEY(0xBF); // VK_OEM_2 '/' (Ctrl+/ = comment)
     const CUR_LINE: u32 = 0x1B_1B_24; // current-line highlight (subtle)
     const BRACKET_HL: u32 = 0x3A_5A_3A; // matching-bracket box
+    const OCCUR: u32 = 0x2E_34_42; // other occurrences of the word at the caret
 
     // The go-to-label palette.
     const FIND_ITEM_H: f32 = 22.0;
@@ -1311,6 +1312,16 @@ main:
             render::fill_rect(t, 0.0, 0.0, SRC_X - 4.0, editor_h, 0x18_18_18); // margin bg
             render::fill_rect(t, SRC_X - 4.0, 0.0, 1.0, editor_h, theme::BORDER); // rule
 
+            // Other occurrences of the word at the caret (boxed faintly). Only when
+            // there are at least two, so a unique symbol isn't decorated.
+            let occ: Vec<(usize, usize, usize)> = match self.doc.occurrence_needle() {
+                Some(n) => {
+                    let m = self.doc.find_all(&n, true);
+                    if m.len() >= 2 { m } else { Vec::new() }
+                }
+                None => Vec::new(),
+            };
+
             let rows = self.row_layout();
             for (row, &(top, h)) in rows.iter().enumerate() {
                 let sy = top - self.editor_scroll;
@@ -1356,6 +1367,17 @@ main:
                             let bw = measure(&line[bc..bc + 1]).max(4.0);
                             render::fill_rect(t, bx, sy, bw, LINE_H, BRACKET_HL);
                         }
+                    }
+                }
+
+                // Other-occurrence boxes (under the selection + text).
+                for &(_, ms, me) in occ.iter().filter(|m| m.0 == row) {
+                    let a = ms.min(line.len());
+                    let b = me.min(line.len());
+                    let ox = SRC_X + measure(&line[..a]);
+                    if ox <= text_right {
+                        let ow = (measure(&line[..b]) - measure(&line[..a])).max(2.0);
+                        render::fill_rect(t, ox, sy, ow, LINE_H, OCCUR);
                     }
                 }
 

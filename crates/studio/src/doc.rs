@@ -509,7 +509,9 @@ impl Doc {
         self.delete_selection();
         let line = &self.lines[self.caret.row];
         let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
-        self.insert_raw(&format!("\n{indent}"));
+        // One extra level after a block opener (proc/.if/.while/…), asm-style.
+        let extra = if opens_block(&line[..self.caret.col]) { INDENT } else { "" };
+        self.insert_raw(&format!("\n{indent}{extra}"));
     }
 
     /// Indent the selected lines (or the caret line) by one level. One undo step.
@@ -739,6 +741,23 @@ impl Doc {
         }
         None
     }
+
+    /// The token whose other occurrences should be highlighted: a single-line,
+    /// word-like selection, else the word under the caret. `None` when it isn't
+    /// worth highlighting (too short, spans lines, or not a word).
+    pub fn occurrence_needle(&self) -> Option<String> {
+        if let Some((s, e)) = self.selection() {
+            if s.row != e.row {
+                return None;
+            }
+            let t = &self.lines[s.row][s.col..e.col];
+            return (t.len() >= 2 && t.chars().all(is_word)).then(|| t.to_string());
+        }
+        let line = &self.lines[self.caret.row];
+        let (s, e) = (word_start(line, self.caret.col), word_end(line, self.caret.col));
+        let t = &line[s..e];
+        (t.len() >= 2 && t.chars().all(is_word)).then(|| t.to_string())
+    }
 }
 
 const INDENT: &str = "  ";
@@ -769,6 +788,16 @@ fn word_end(line: &str, col: usize) -> usize {
         }
     }
     c
+}
+
+/// Whether `line`'s first token opens an indented block in the WRASM dialect, so
+/// Enter after it bumps the indent one level.
+fn opens_block(line: &str) -> bool {
+    let first = line.trim_start().split(char::is_whitespace).next().unwrap_or("");
+    matches!(
+        first.to_ascii_lowercase().as_str(),
+        "proc" | ".if" | ".while" | ".repeat" | ".for" | "struct" | "macro"
+    )
 }
 
 /// Whether `c` is part of a "word" for word-wise movement.
@@ -1121,6 +1150,24 @@ mod tests {
         d.insert_newline();
         assert_eq!(d.text(), "    mov rax, 1\n    ");
         assert_eq!(d.caret, Caret { row: 1, col: 4 });
+    }
+
+    #[test]
+    fn enter_after_a_block_opener_adds_a_level() {
+        let mut d = Doc::from_str("proc foo");
+        d.set_caret(0, 8);
+        d.insert_newline();
+        assert_eq!(d.text(), "proc foo\n  ");
+
+        let mut d = Doc::from_str("  .if rax == 0");
+        d.set_caret(0, 14);
+        d.insert_newline();
+        assert_eq!(d.text(), "  .if rax == 0\n    "); // nested: 2 + 2
+
+        let mut d = Doc::from_str("  mov rax, 1"); // a plain line just copies indent
+        d.set_caret(0, 12);
+        d.insert_newline();
+        assert_eq!(d.text(), "  mov rax, 1\n  ");
     }
 
     #[test]
