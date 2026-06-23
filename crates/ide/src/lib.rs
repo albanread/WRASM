@@ -768,9 +768,14 @@ mod tests {
             assert!(was_card(k).is_some(), "{k} should resolve");
         }
         assert!(was_card("mov").is_none());
-        // routes through answer() too — the search-box path
+        // answer() now serves the richer db `directives` card for proc; check it
+        // carries the key contract info (db version supersedes the was_card one).
         let Some(kb) = kb() else { return };
-        assert_eq!(answer(&kb, "proc").unwrap(), md);
+        let a = answer(&kb, "proc").unwrap();
+        assert!(
+            a.contains("uses") && a.contains("frame") && a.to_lowercase().contains("subroutine"),
+            "answer proc card:\n{a}"
+        );
     }
 
     #[test]
