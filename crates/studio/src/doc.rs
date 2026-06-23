@@ -36,6 +36,9 @@ pub struct Doc {
     redo: Vec<Snapshot>,
     /// True while a run of typed characters may merge into one undo step.
     coalescing: bool,
+    /// The column vertical movement tries to keep, so the caret doesn't drift
+    /// left when it passes through short lines. `None` after any horizontal move.
+    goal_col: Option<usize>,
 }
 
 impl Default for Doc {
@@ -47,6 +50,7 @@ impl Default for Doc {
             undo: Vec::new(),
             redo: Vec::new(),
             coalescing: false,
+            goal_col: None,
         }
     }
 }
@@ -88,6 +92,7 @@ impl Doc {
         let row = row.min(self.lines.len().saturating_sub(1));
         self.caret = Caret { row, col: self.snap(row, col) };
         self.coalescing = false;
+        self.goal_col = None;
     }
 
     /// Insert text at the caret (replacing any selection) as one undo step.
@@ -95,6 +100,7 @@ impl Doc {
     pub fn insert(&mut self, s: &str) {
         self.push_undo();
         self.coalescing = false;
+        self.goal_col = None;
         self.delete_selection();
         self.insert_raw(s);
     }
@@ -102,6 +108,7 @@ impl Doc {
     /// Type a single character — coalescing into the current undo step and
     /// replacing any selection. Use this for keystrokes so undo groups a run.
     pub fn type_char(&mut self, c: char) {
+        self.goal_col = None;
         if !self.coalescing {
             self.push_undo();
             self.coalescing = true;
@@ -141,6 +148,7 @@ impl Doc {
     pub fn backspace(&mut self) {
         self.push_undo();
         self.coalescing = false;
+        self.goal_col = None;
         if self.delete_selection() {
             return;
         }
@@ -163,6 +171,7 @@ impl Doc {
     pub fn delete_forward(&mut self) {
         self.push_undo();
         self.coalescing = false;
+        self.goal_col = None;
         if self.delete_selection() {
             return;
         }
@@ -181,6 +190,7 @@ impl Doc {
     pub fn apply_completion(&mut self, replace_start: usize, replacement: &str) {
         self.push_undo();
         self.coalescing = false;
+        self.goal_col = None;
         let row = self.caret.row;
         let end = self.caret.col;
         let start = replace_start.min(end);
@@ -337,6 +347,7 @@ impl Doc {
     /// Move one character left, wrapping to the end of the previous line.
     pub fn move_left(&mut self) {
         self.coalescing = false;
+        self.goal_col = None;
         let Caret { row, col } = self.caret;
         if col > 0 {
             let prev = self.lines[row][..col].chars().next_back().unwrap();
@@ -349,6 +360,7 @@ impl Doc {
     /// Move one character right, wrapping to the start of the next line.
     pub fn move_right(&mut self) {
         self.coalescing = false;
+        self.goal_col = None;
         let Caret { row, col } = self.caret;
         let line = &self.lines[row];
         if col < line.len() {
@@ -359,35 +371,312 @@ impl Doc {
         }
     }
 
-    /// Move to the previous line, keeping the column (clamped to that line).
+    /// Move to the previous line, keeping the goal column (so the caret doesn't
+    /// drift left through short lines).
     pub fn move_up(&mut self) {
         self.coalescing = false;
         if self.caret.row > 0 {
+            let goal = *self.goal_col.get_or_insert(self.caret.col);
             let row = self.caret.row - 1;
-            self.caret = Caret { row, col: self.snap(row, self.caret.col) };
+            self.caret = Caret { row, col: self.snap(row, goal) };
         }
     }
 
-    /// Move to the next line, keeping the column (clamped to that line).
+    /// Move to the next line, keeping the goal column.
     pub fn move_down(&mut self) {
         self.coalescing = false;
         if self.caret.row + 1 < self.lines.len() {
+            let goal = *self.goal_col.get_or_insert(self.caret.col);
             let row = self.caret.row + 1;
-            self.caret = Caret { row, col: self.snap(row, self.caret.col) };
+            self.caret = Caret { row, col: self.snap(row, goal) };
         }
     }
 
     /// Caret to the start of the line.
     pub fn home(&mut self) {
         self.coalescing = false;
+        self.goal_col = None;
         self.caret.col = 0;
+    }
+
+    /// **Smart Home**: to the first non-blank character, or to column 0 if
+    /// already there — the toggle most editors give `Home`.
+    pub fn smart_home(&mut self) {
+        self.coalescing = false;
+        self.goal_col = None;
+        let line = &self.lines[self.caret.row];
+        let first = line.len() - line.trim_start().len();
+        self.caret.col = if self.caret.col == first { 0 } else { first };
     }
 
     /// Caret to the end of the line.
     pub fn end(&mut self) {
         self.coalescing = false;
+        self.goal_col = None;
         self.caret.col = self.lines[self.caret.row].len();
     }
+
+    // ── word-wise movement & deletion ────────────────────────────────────────
+
+    /// Move left to the previous word boundary (`Ctrl+Left`).
+    pub fn move_word_left(&mut self) {
+        self.coalescing = false;
+        self.goal_col = None;
+        let Caret { row, col } = self.caret;
+        if col == 0 {
+            if row > 0 {
+                self.caret = Caret { row: row - 1, col: self.lines[row - 1].len() };
+            }
+        } else {
+            self.caret.col = word_left(&self.lines[row], col);
+        }
+    }
+
+    /// Move right to the next word boundary (`Ctrl+Right`).
+    pub fn move_word_right(&mut self) {
+        self.coalescing = false;
+        self.goal_col = None;
+        let Caret { row, col } = self.caret;
+        let len = self.lines[row].len();
+        if col >= len {
+            if row + 1 < self.lines.len() {
+                self.caret = Caret { row: row + 1, col: 0 };
+            }
+        } else {
+            self.caret.col = word_right(&self.lines[row], col);
+        }
+    }
+
+    /// Delete to the previous word boundary (`Ctrl+Backspace`); a selection is
+    /// deleted instead. One undo step.
+    pub fn delete_word_left(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        self.goal_col = None;
+        if self.delete_selection() {
+            return;
+        }
+        let Caret { row, col } = self.caret;
+        if col > 0 {
+            let start = word_left(&self.lines[row], col);
+            self.lines[row].replace_range(start..col, "");
+            self.caret.col = start;
+        } else if row > 0 {
+            let cur = self.lines.remove(row);
+            let plen = self.lines[row - 1].len();
+            self.lines[row - 1].push_str(&cur);
+            self.caret = Caret { row: row - 1, col: plen };
+        }
+    }
+
+    /// Delete to the next word boundary (`Ctrl+Delete`); a selection is deleted
+    /// instead. One undo step.
+    pub fn delete_word_right(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        self.goal_col = None;
+        if self.delete_selection() {
+            return;
+        }
+        let Caret { row, col } = self.caret;
+        let len = self.lines[row].len();
+        if col < len {
+            let end = word_right(&self.lines[row], col);
+            self.lines[row].replace_range(col..end, "");
+        } else if row + 1 < self.lines.len() {
+            let next = self.lines.remove(row + 1);
+            self.lines[row].push_str(&next);
+        }
+    }
+
+    // ── line operations & indentation ────────────────────────────────────────
+
+    /// The inclusive row range the selection (or the caret) spans.
+    fn selected_rows(&self) -> (usize, usize) {
+        match self.selection() {
+            // A selection ending at column 0 of a row doesn't include that row.
+            Some((s, e)) => (s.row, if e.col == 0 && e.row > s.row { e.row - 1 } else { e.row }),
+            None => (self.caret.row, self.caret.row),
+        }
+    }
+
+    /// Insert a newline that copies the current line's leading indentation
+    /// (`Enter`). A selection is replaced first. One undo step.
+    pub fn insert_newline(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        self.goal_col = None;
+        self.delete_selection();
+        let line = &self.lines[self.caret.row];
+        let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        self.insert_raw(&format!("\n{indent}"));
+    }
+
+    /// Indent the selected lines (or the caret line) by one level. One undo step.
+    pub fn indent(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        let (r0, r1) = self.selected_rows();
+        for r in r0..=r1 {
+            self.lines[r].insert_str(0, INDENT);
+        }
+        self.shift_cols(r0, r1, INDENT.len() as isize);
+    }
+
+    /// Outdent the selected lines (or the caret line) by up to one level. One
+    /// undo step.
+    pub fn outdent(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        let (r0, r1) = self.selected_rows();
+        for r in r0..=r1 {
+            let line = &self.lines[r];
+            let n = line.len() - line.trim_start_matches(' ').len();
+            let remove = n.min(INDENT.len());
+            self.lines[r].replace_range(0..remove, "");
+            self.adjust_col(r, -(remove as isize));
+        }
+    }
+
+    /// Shift caret/anchor columns on rows in `r0..=r1` by `delta` (for a uniform
+    /// indent).
+    fn shift_cols(&mut self, r0: usize, r1: usize, delta: isize) {
+        for c in [Some(&mut self.caret), self.anchor.as_mut()].into_iter().flatten() {
+            if c.row >= r0 && c.row <= r1 {
+                c.col = (c.col as isize + delta).max(0) as usize;
+            }
+        }
+    }
+
+    /// Shift caret/anchor columns on a single row by `delta`, clamped to ≥0.
+    fn adjust_col(&mut self, row: usize, delta: isize) {
+        for c in [Some(&mut self.caret), self.anchor.as_mut()].into_iter().flatten() {
+            if c.row == row {
+                c.col = (c.col as isize + delta).max(0) as usize;
+            }
+        }
+    }
+
+    /// Duplicate the caret line below it (`Ctrl+D`). One undo step.
+    pub fn duplicate_line(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        self.anchor = None;
+        let row = self.caret.row;
+        let dup = self.lines[row].clone();
+        self.lines.insert(row + 1, dup);
+        self.caret.row = row + 1;
+    }
+
+    /// Delete the caret line (`Ctrl+Shift+K`). One undo step.
+    pub fn delete_line(&mut self) {
+        self.push_undo();
+        self.coalescing = false;
+        self.anchor = None;
+        let row = self.caret.row;
+        if self.lines.len() == 1 {
+            self.lines[0].clear();
+            self.caret.col = 0;
+            return;
+        }
+        self.lines.remove(row);
+        let row = row.min(self.lines.len() - 1);
+        self.caret = Caret { row, col: self.snap(row, self.caret.col) };
+    }
+
+    /// Swap the caret line with the one above (`Alt+Up`). One undo step.
+    pub fn move_line_up(&mut self) {
+        if self.caret.row == 0 {
+            return;
+        }
+        self.push_undo();
+        self.coalescing = false;
+        self.anchor = None;
+        let row = self.caret.row;
+        self.lines.swap(row, row - 1);
+        self.caret.row = row - 1;
+    }
+
+    /// Swap the caret line with the one below (`Alt+Down`). One undo step.
+    pub fn move_line_down(&mut self) {
+        if self.caret.row + 1 >= self.lines.len() {
+            return;
+        }
+        self.push_undo();
+        self.coalescing = false;
+        self.anchor = None;
+        let row = self.caret.row;
+        self.lines.swap(row, row + 1);
+        self.caret.row = row + 1;
+    }
+
+    /// All matches of `needle` as `(row, start, end)` byte ranges. Case-folding
+    /// is ASCII (asm is ASCII), so byte offsets stay aligned. Empty if no needle.
+    pub fn find_all(&self, needle: &str, case_sensitive: bool) -> Vec<(usize, usize, usize)> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let nl = if case_sensitive { needle.to_string() } else { needle.to_ascii_lowercase() };
+        let mut hits = Vec::new();
+        for (r, line) in self.lines.iter().enumerate() {
+            let hay = if case_sensitive { line.clone() } else { line.to_ascii_lowercase() };
+            let mut from = 0;
+            while let Some(i) = hay[from..].find(&nl) {
+                let s = from + i;
+                hits.push((r, s, s + needle.len()));
+                from = s + needle.len().max(1);
+            }
+        }
+        hits
+    }
+}
+
+const INDENT: &str = "  ";
+
+/// Whether `c` is part of a "word" for word-wise movement.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Byte column of the previous word boundary before `col` on `line`.
+fn word_left(line: &str, col: usize) -> usize {
+    let mut c = col;
+    let back = |c: usize| line[..c].chars().next_back().unwrap();
+    while c > 0 && back(c).is_whitespace() {
+        c -= back(c).len_utf8();
+    }
+    if c > 0 {
+        let word = is_word(back(c));
+        while c > 0 {
+            let ch = back(c);
+            if ch.is_whitespace() || is_word(ch) != word {
+                break;
+            }
+            c -= ch.len_utf8();
+        }
+    }
+    c
+}
+
+/// Byte column of the next word boundary after `col` on `line`.
+fn word_right(line: &str, col: usize) -> usize {
+    let len = line.len();
+    let mut c = col;
+    let fwd = |c: usize| line[c..].chars().next().unwrap();
+    if c < len && !fwd(c).is_whitespace() {
+        let word = is_word(fwd(c));
+        while c < len {
+            let ch = fwd(c);
+            if ch.is_whitespace() || is_word(ch) != word {
+                break;
+            }
+            c += ch.len_utf8();
+        }
+    }
+    while c < len && fwd(c).is_whitespace() {
+        c += fwd(c).len_utf8();
+    }
+    c
 }
 
 #[cfg(test)]
@@ -498,15 +787,15 @@ mod tests {
     }
 
     #[test]
-    fn move_up_down_clamps_the_column() {
+    fn move_up_down_tracks_the_goal_column() {
         let mut d = Doc::from_str("longline\nhi\nanother");
-        d.set_caret(0, 8); // end of "longline"
-        d.move_down(); // "hi" is shorter → clamp to col 2
+        d.set_caret(0, 8); // end of "longline" — goal column 8
+        d.move_down(); // "hi" (len 2) clamps to col 2
         assert_eq!(d.caret, Caret { row: 1, col: 2 });
-        d.move_down(); // "another" is long enough → keep col 2
-        assert_eq!(d.caret, Caret { row: 2, col: 2 });
+        d.move_down(); // "another" (len 7) restores toward the goal → col 7
+        assert_eq!(d.caret, Caret { row: 2, col: 7 });
         d.move_up();
-        assert_eq!(d.caret, Caret { row: 1, col: 2 });
+        assert_eq!(d.caret, Caret { row: 1, col: 2 }); // "hi" clamps again
     }
 
     #[test]
@@ -620,5 +909,108 @@ mod tests {
         d.set_caret(0, 1);
         d.delete_forward(); // join the next line
         assert_eq!(d.text(), "acd");
+    }
+
+    // ── Core text-editing extensions ─────────────────────────────────────────
+
+    #[test]
+    fn word_movement_skips_words_and_whitespace() {
+        // cols: 0-1 spaces, 2-8 foo_bar, 9-10 spaces, 11-13 baz, len 14
+        let mut d = Doc::from_str("  foo_bar  baz");
+        d.set_caret(0, 14);
+        d.move_word_left();
+        assert_eq!(d.caret.col, 11);
+        d.move_word_left();
+        assert_eq!(d.caret.col, 2);
+        d.move_word_left();
+        assert_eq!(d.caret.col, 0);
+        d.move_word_right();
+        assert_eq!(d.caret.col, 2);
+        d.move_word_right();
+        assert_eq!(d.caret.col, 11);
+    }
+
+    #[test]
+    fn delete_word_left_and_right() {
+        let mut d = Doc::from_str("hello world");
+        d.set_caret(0, 11);
+        d.delete_word_left();
+        assert_eq!(d.text(), "hello ");
+        let mut d = Doc::from_str("hello world");
+        d.set_caret(0, 0);
+        d.delete_word_right(); // word + the following whitespace
+        assert_eq!(d.text(), "world");
+    }
+
+    #[test]
+    fn smart_home_toggles() {
+        let mut d = Doc::from_str("    mov rax, 1");
+        d.set_caret(0, 10);
+        d.smart_home();
+        assert_eq!(d.caret.col, 4); // first non-blank
+        d.smart_home();
+        assert_eq!(d.caret.col, 0); // toggle to start
+        d.smart_home();
+        assert_eq!(d.caret.col, 4);
+    }
+
+    #[test]
+    fn vertical_movement_keeps_the_goal_column() {
+        let mut d = Doc::from_str("longer line\nx\nanother line");
+        d.set_caret(0, 9);
+        d.move_down(); // clamps to the short "x" line
+        assert_eq!(d.caret.col, 1);
+        d.move_down(); // goal column 9 is restored on the long line
+        assert_eq!(d.caret.col, 9);
+    }
+
+    #[test]
+    fn indent_and_outdent_a_selection() {
+        let mut d = Doc::from_str("a\nb\nc");
+        d.set_caret(0, 0);
+        d.start_selection();
+        d.set_caret(2, 1);
+        d.indent();
+        assert_eq!(d.text(), "  a\n  b\n  c");
+        d.outdent();
+        assert_eq!(d.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn enter_auto_indents_to_the_previous_line() {
+        let mut d = Doc::from_str("    mov rax, 1");
+        d.set_caret(0, 14);
+        d.insert_newline();
+        assert_eq!(d.text(), "    mov rax, 1\n    ");
+        assert_eq!(d.caret, Caret { row: 1, col: 4 });
+    }
+
+    #[test]
+    fn line_ops_duplicate_delete_move() {
+        let mut d = Doc::from_str("a\nb\nc");
+        d.set_caret(1, 0);
+        d.duplicate_line();
+        assert_eq!(d.text(), "a\nb\nb\nc");
+        assert_eq!(d.caret.row, 2);
+
+        let mut d = Doc::from_str("a\nb\nc");
+        d.set_caret(1, 0);
+        d.delete_line();
+        assert_eq!(d.text(), "a\nc");
+
+        let mut d = Doc::from_str("a\nb\nc");
+        d.set_caret(2, 0);
+        d.move_line_up();
+        assert_eq!(d.text(), "a\nc\nb");
+        d.move_line_down();
+        assert_eq!(d.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn find_all_case_sensitive_and_insensitive() {
+        let d = Doc::from_str("foo bar\nFOO foo");
+        assert_eq!(d.find_all("foo", true), vec![(0, 0, 3), (1, 4, 7)]);
+        assert_eq!(d.find_all("foo", false), vec![(0, 0, 3), (1, 0, 3), (1, 4, 7)]);
+        assert!(d.find_all("", false).is_empty());
     }
 }

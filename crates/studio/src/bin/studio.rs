@@ -159,6 +159,10 @@ mod gui {
     const VK_O: VIRTUAL_KEY = VIRTUAL_KEY(0x4F);
     const VK_S: VIRTUAL_KEY = VIRTUAL_KEY(0x53);
     const VK_G: VIRTUAL_KEY = VIRTUAL_KEY(0x47); // 'G' (Ctrl+G = go to label)
+    const VK_D: VIRTUAL_KEY = VIRTUAL_KEY(0x44); // 'D' (Ctrl+D = duplicate line)
+    const VK_K: VIRTUAL_KEY = VIRTUAL_KEY(0x4B); // 'K' (Ctrl+Shift+K = delete line)
+    const VK_BACK: VIRTUAL_KEY = VIRTUAL_KEY(0x08);
+    const VK_TAB: VIRTUAL_KEY = VIRTUAL_KEY(0x09);
 
     // The go-to-label palette.
     const FIND_ITEM_H: f32 = 22.0;
@@ -1638,8 +1642,7 @@ main:
             // in WM_KEYDOWN, so they aren't applied twice).
             match ch {
                 0x08 => self.doc.backspace(),
-                0x0D => self.doc.insert("\n"),
-                0x09 => self.doc.insert("  "),
+                0x0D => self.doc.insert_newline(), // auto-indent to the previous line
                 c if c >= 0x20 && c != 0x7f => {
                     if let Some(c) = char::from_u32(c) {
                         self.doc.type_char(c); // coalesced typing → one undo step
@@ -1658,7 +1661,7 @@ main:
         }
 
         /// A navigation / command key from WM_KEYDOWN. Returns true if handled.
-        fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) -> bool {
+        fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> bool {
             // Go-to-label palette: arrows move the selection, Esc closes; all
             // keys are swallowed (text + Enter arrive via WM_CHAR / on_char).
             if self.find_active {
@@ -1711,8 +1714,36 @@ main:
                     _ => {}
                 }
             }
+            // Alt+Up/Down move the current line.
+            if alt {
+                match vk {
+                    VK_UP => return self.edit(|d| d.move_line_up()),
+                    VK_DOWN => return self.edit(|d| d.move_line_down()),
+                    _ => {}
+                }
+            }
             if ctrl {
                 match vk {
+                    // Word-wise caret moves (Shift extends the selection).
+                    VK_LEFT | VK_RIGHT => {
+                        if shift {
+                            self.doc.start_selection();
+                        } else {
+                            self.doc.clear_selection();
+                        }
+                        if vk == VK_LEFT {
+                            self.doc.move_word_left();
+                        } else {
+                            self.doc.move_word_right();
+                        }
+                        self.after_caret();
+                        self.invalidate();
+                        return true;
+                    }
+                    VK_BACK => return self.edit(|d| d.delete_word_left()),
+                    VK_DELETE => return self.edit(|d| d.delete_word_right()),
+                    VK_D => return self.edit(|d| d.duplicate_line()),
+                    VK_K if shift => return self.edit(|d| d.delete_line()),
                     VK_F => self.search_active = true,
                     VK_G => self.find_open(),
                     VK_A => self.doc.select_all(),
@@ -1744,8 +1775,11 @@ main:
                 VK_RIGHT => self.doc.move_right(),
                 VK_UP => self.doc.move_up(),
                 VK_DOWN => self.doc.move_down(),
-                VK_HOME => self.doc.home(),
+                VK_HOME => self.doc.smart_home(),
                 VK_END => self.doc.end(),
+                VK_TAB if shift => return self.edit(|d| d.outdent()),
+                VK_TAB if self.doc.has_selection() => return self.edit(|d| d.indent()),
+                VK_TAB => return self.edit(|d| d.insert("  ")),
                 VK_PRIOR => {
                     self.page_move(false);
                     return true;
@@ -2361,12 +2395,13 @@ main:
 
     /// Map a key name (optionally `Ctrl+`/`Shift+` prefixed) to a virtual key +
     /// modifiers, for the `key` verb.
-    fn map_key(spec: &str) -> Option<(VIRTUAL_KEY, bool, bool)> {
-        let (mut ctrl, mut shift, mut name) = (false, false, spec);
+    fn map_key(spec: &str) -> Option<(VIRTUAL_KEY, bool, bool, bool)> {
+        let (mut ctrl, mut shift, mut alt, mut name) = (false, false, false, spec);
         for part in spec.split('+') {
             match part.to_ascii_lowercase().as_str() {
                 "ctrl" | "control" => ctrl = true,
                 "shift" => shift = true,
+                "alt" | "meta" => alt = true,
                 _ => name = part,
             }
         }
@@ -2387,7 +2422,7 @@ main:
             s if s.len() == 1 => s.chars().next().unwrap().to_ascii_uppercase() as u16,
             _ => return None,
         };
-        Some((VIRTUAL_KEY(code), ctrl, shift))
+        Some((VIRTUAL_KEY(code), ctrl, shift, alt))
     }
 
     /// The WM_CHAR a key produces, so the `key` verb mirrors Windows (a
@@ -2438,10 +2473,10 @@ main:
             Ok(Value::new(""))
         });
         r.register("key", Arity::exact(1), |_, a| {
-            let (vk, ctrl, shift) = map_key(a[0].as_str())
+            let (vk, ctrl, shift, alt) = map_key(a[0].as_str())
                 .ok_or_else(|| TclError::runtime(format!("unknown key: {}", a[0].as_str())))?;
             with_app(|app| {
-                app.on_key(vk, ctrl, shift);
+                app.on_key(vk, ctrl, shift, alt);
                 // Mirror Windows: a char-producing key also yields WM_CHAR (so
                 // Enter/typing reach on_char). Ctrl combos produce no usable char.
                 if !ctrl {
@@ -2867,7 +2902,8 @@ TCL UI SCRIPTING (--script / --exec)
             WM_KEYDOWN => {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                if app.on_key(VIRTUAL_KEY(wparam.0 as u16), ctrl, shift) {
+                let alt = unsafe { GetKeyState(0x12) } < 0; // VK_MENU
+                if app.on_key(VIRTUAL_KEY(wparam.0 as u16), ctrl, shift, alt) {
                     LRESULT(0)
                 } else {
                     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
