@@ -172,13 +172,6 @@ sprFrameTab   BYTE 4096 dup(0)           ; 256 * 16
 .globl sprInstCount
 sprInstCount  DWORD 0
 
-; DrawInstanced's InstanceCount, marshalled through memory (NOT a live register):
-; the comcall macro loads `this` into rcx FIRST, which would clobber any GP-reg
-; arg that aliases rcx/ecx — so we snapshot sprInstCount here (zero-extended to a
-; full QWORD) and pass [rip + sprDrawCount]. The 64-bit load is then self-contained
-; (upper dword is part of this same field), and InstanceCount (r8d) reads true.
-sprDrawCount  QWORD 0
-
 ; per-instance stride (8 floats = 32 bytes) + the IASetVertexBuffers stride/offset
 ; single-element arrays (the API wants pointers to u32).
 sprStride   DWORD 32
@@ -766,15 +759,10 @@ DrawSprites:
     ; TRIANGLESTRIP (4 verts -> a quad).
     pContext.IASetPrimitiveTopology(5)    ; D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
     ; DrawInstanced(VertexCountPerInstance=4, InstanceCount=sprInstCount, 0, 0).
-    ; Marshal the count through memory — NEVER a live GP register: the comcall macro
-    ; materializes `this` into rcx BEFORE consuming the arg, so a register that
-    ; aliases rcx (e.g. ecx) is clobbered. Snapshot to sprDrawCount (zero-extended
-    ; via the qword store) then pass [rip + sprDrawCount]; the macro emits an
-    ; independent `mov r8, [rip + sprDrawCount]` and InstanceCount (r8d) is correct.
-    mov     eax, [rip + sprInstCount]
-    mov     qword ptr [rip + sprDrawCount], 0
-    mov     [rip + sprDrawCount], eax
-    pContext.DrawInstanced(4, [rip + sprDrawCount], 0, 0)
+    ; The count rides in ecx — the comcall macro now marshals the method args BEFORE
+    ; loading `this` into rcx (help.md trap #9, fixed in was), so ecx survives.
+    mov     ecx, [rip + sprInstCount]
+    pContext.DrawInstanced(4, ecx, 0, 0)
 
     add     rsp, 32
     pop     rdi
