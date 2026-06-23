@@ -1,0 +1,390 @@
+; gpu/wallfx.was — GPU Canvas "brick-wall fx BACKGROUND" + index-0-transparent LUT.
+;
+; The deluxe brickout (examples/brickout_fx.was) renders a PROCEDURAL brick-wall
+; pixel shader as the BACK of the stack, then composites the game's indexed layer
+; (idxBuf) ON TOP with index 0 = TRANSPARENT — so the wall shows through the play
+; area. This module is the GPU machinery for that:
+;
+;   * a brick-wall FX pass — a fullscreen-triangle VS (SV_VertexID, uv in [0,1],
+;     identical structure to gpu/fx.was) + the brief's exact running-bond brick HLSL,
+;     fed by a Params cbuffer { float time; float aspect; uint pad0; uint pad1; }
+;     (16 bytes, b0). WallFxRender(rcx=dstRTV) draws it full-screen, opaque, FIRST.
+;
+;   * a TRANSPARENT-index-0 LUT resolve — the SAME indexed→palette resolve as
+;     gpu/canvas.was's LUT shader, but the PS DISCARDS index 0 (so the wall behind
+;     shows through) and the draw uses alpha-over blend. WallComposite uploads idxBuf,
+;     binds the three palette SRVs (t0/t1/t2, reusing canvas.was's pSRVidx/global/line)
+;     and draws the fullscreen triangle into the back buffer WITHOUT clearing — the
+;     wall fx already painted it.
+;
+; THIS MODULE IS INCLUDED ONLY BY examples/brickout_fx.was. gpu/canvas.was,
+; gpu/fx.was, gpu/harness.was are UNTOUCHED, so gpu_brickout.was (and every
+; gpu_g2/g3/g4/g6 demo) builds + renders byte-identically.
+;
+; Built ON TOP of gpu/canvas.was (G0: pDevice/pContext/pRTV, idxBuf, pTexIdx +
+; the three palette SRVs, vsTarget/psTarget/pErrBlob, pRast, srvArray, vp) and
+; gpu/blit.was (G1: pBlendAlpha, blendFactor). Include AFTER both.
+;
+; winkb supplied every D3D11 detail (all reused from G0/G1/G4):
+;   D3D11_BUFFER_DESC{ByteWidth@0,Usage@4,BindFlags@8,...} (24 bytes, winkb skel).
+;   D3D11_BIND_CONSTANT_BUFFER=4, D3D11_USAGE_DEFAULT=0,
+;   D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST=4 (winkb resolve).
+;
+; Every .DATA block opens with .balign 16 (trap #8). COM register-args are staged in
+; memory (trap #9): srvArray (reused from canvas.was), wfxCBArr.
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The BRICK-WALL fx shader (the brief's exact HLSL).
+;   VS — fullscreen triangle from SV_VertexID, forwards a 0..1 uv (mirror of G4's).
+;   PS — the procedural running-bond brick wall: a half-offset brick grid, mortar
+;        lines via smoothstep on the cell edge distance, per-brick hash tint, a
+;        soft diagonal face shade, a slow time sheen drift, and a radial vignette.
+; CB (b0): Params { float time; float aspect; uint pad0; uint pad1; } — 16 bytes.
+; ---------------------------------------------------------------------------
+wfxSrc:
+.ASCIISTRING
+cbuffer Params : register(b0) { float time; float aspect; uint pad0; uint pad1; };
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut WVS(uint i : SV_VertexID){ VSOut o; float2 u=float2((i<<1)&2,i&2); o.pos=float4(u.x*2-1,1-u.y*2,0,1); o.uv=u; return o; }
+float hash21(float2 p){ p = frac(p*float2(123.34,345.45)); p += dot(p,p+34.345); return frac(p.x*p.y); }
+float4 main(VSOut i) : SV_Target {
+    float2 p = float2(i.uv.x * aspect, i.uv.y);
+    const float ROWS = 9.0;
+    float2 grid = float2(ROWS*0.5, ROWS);
+    float2 cell = p * grid;
+    float row = floor(cell.y);
+    cell.x += 0.5 * fmod(row, 2.0);
+    float2 id = floor(cell);
+    float2 f  = frac(cell);
+    float2 d  = min(f, 1.0 - f) / grid;
+    float edge = min(d.x, d.y);
+    float mortarW = 0.006;
+    float face = smoothstep(mortarW, mortarW + 0.004, edge);
+    float  h     = hash21(id);
+    float3 brick = lerp(float3(0.07,0.08,0.14), float3(0.12,0.13,0.22), h);
+    float3 mortar= float3(0.02,0.02,0.04);
+    float2 c     = f - 0.5;
+    brick += 0.05 * (-c.x - c.y);
+    float3 col = lerp(mortar, brick, face);
+    col += 0.015 * (0.5 + 0.5*sin((p.x + p.y)*2.5 - time*0.6));
+    float2 q = i.uv - 0.5; q.x *= aspect;
+    col *= lerp(0.7, 1.0, smoothstep(1.1, 0.2, length(q)));
+    return float4(col, 1.0);
+}
+.ENDASCIISTRING
+wfxEnd:
+    BYTE 0
+
+wvsEntry  BYTE "WVS", 0
+wfxPsEntry BYTE "main", 0
+wfxName   BYTE "gpuwallfx", 0
+
+.balign 16
+; ---------------------------------------------------------------------------
+; The TRANSPARENT-index-0 LUT resolve shader. Identical resolve to gpu/canvas.was's
+; LUT (low 16 -> per-line palette, 16..255 -> global), but DISCARDS index 0 so the
+; wall fx behind shows through the cleared play area. Same SRV slots t0/t1/t2.
+; ---------------------------------------------------------------------------
+wlutSrc:
+.ASCIISTRING
+Texture2D<uint> idx:register(t0);
+Texture2D<float4> palGlobal:register(t1);
+Texture2D<float4> palLine:register(t2);
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO WLVS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float wlhash(float2 p){p=frac(p*float2(127.1,311.7));p+=dot(p,p+45.32);return frac(p.x*p.y);}
+float4 WLPS(VO v):SV_Target{
+float scale=1.8;float barX=(640.0-320.0*scale)*0.5;
+int px=(int)(160.0+(v.uv.x*640.0-barX)/scale);
+int py=(int)(80.0+(v.uv.y*360.0)/scale);
+px=clamp(px,0,639);py=clamp(py,0,359);
+uint c=idx.Load(int3(px,py,0));
+if(c==0u){discard;}
+// ---- TEXTURED STRENGTH BRICKS: indices 100..117 encode colourId*6+damage ----
+//   colourId 0=red 1=yellow 2=green ; damage 0=pristine .. up = battered.
+//   The brick grid is fixed: physical cell x0=168+col*38, y0=104+row*12, 36x10.
+if(c>=100u){
+  uint e=c-100u; uint colId=e/6u; uint dmg=e%6u;
+  // base per-row tint (R,G,B), bright/solid at full health.
+  float3 base;
+  if(colId==0u){base=float3(0.86,0.20,0.18);}        // red
+  else if(colId==1u){base=float3(0.92,0.78,0.20);}   // yellow
+  else{base=float3(0.30,0.74,0.32);}                  // green
+  // cell-local coordinates (0..35 x, 0..9 y) inside the 36x10 brick face.
+  // recover col/row from px,py to find the cell origin, then local offset.
+  int col=(px-168)/38; int row=(py-104)/12;
+  float lx=float(px-(168+col*38)); float ly=float(py-(104+row*12));
+  float fx=lx/36.0; float fy=ly/10.0;            // 0..1 across the face
+  // --- mortar edge: 1px dark border so each brick reads as a discrete object.
+  float mort=1.0;
+  if(lx<1.0||lx>34.0||ly<1.0||ly>8.5){mort=0.40;}
+  // --- bevel: top-left highlight, bottom-right shadow (a raised face).
+  float bevel=1.0;
+  bevel+=0.42*(1.0-fx)+0.42*(1.0-fy);            // light from top-left
+  bevel-=0.42*fx+0.42*fy;                          // shadow to bottom-right
+  // strong rim highlight on the very top + left, dark rim bottom + right.
+  if(ly<1.6||lx<1.6){bevel+=0.30;}
+  if(ly>7.8||lx>33.5){bevel-=0.28;}
+  // --- grain: fine per-texel material noise so the face isn't a flat fill.
+  float g=wlhash(float2(float(px)*0.7,float(py)*1.3));
+  float grain=0.90+0.18*g;
+  // --- damage darkening: each hit taken pulls the face darker + flatter.
+  float dark=1.0-0.20*float(dmg);
+  // --- cracks: more (and brighter/deeper) cracks as damage rises. A couple of
+  //     hashed diagonal fissures across the face; their count scales with dmg.
+  float crack=1.0;
+  if(dmg>0u){
+    float cseed=wlhash(float2(float(col)*3.1+float(row)*7.7, float(colId)));
+    // primary fissure: a near-diagonal line; widens with damage.
+    float d1=abs((fx-0.5)+(fy-0.5)*(0.6+cseed))-0.02-0.015*float(dmg);
+    if(d1<0.0){crack=0.45;}
+    // secondary fissure for heavier damage.
+    if(dmg>=2u){
+      float d2=abs((fx-0.30)-(fy-0.5)*(0.8-cseed*0.5))-0.015-0.01*float(dmg);
+      if(d2<0.0){crack=0.40;}
+    }
+    // last-hit-before-break: speckled chips near the centre.
+    if(dmg>=3u){
+      float ch=wlhash(float2(float(px)*2.3,float(py)*1.7));
+      if(ch>0.86){crack=0.35;}
+    }
+  }
+  float3 col3=base*bevel*grain*dark*crack*mort;
+  col3=saturate(col3);
+  return float4(col3,1.0);
+}
+float4 col;
+if(c<16u){col=palLine.Load(int3((int)c,py,0));}else{col=palGlobal.Load(int3((int)c,0,0));}
+return float4(col.rgb,1.0);}
+.ENDASCIISTRING
+wlutEnd:
+    BYTE 0
+
+wlutVsEntry BYTE "WLVS", 0
+wlutPsEntry BYTE "WLPS", 0
+wlutName    BYTE "gpuwalllut", 0
+
+.balign 16
+; ---- fx shader COM objects + scalar state ----
+comobj pVSBlobW  : ID3DBlob
+comobj pPSBlobW  : ID3DBlob
+comobj pVSBlobWL : ID3DBlob
+comobj pPSBlobWL : ID3DBlob
+
+pWallVS    QWORD ?
+pWallPS    QWORD ?
+pWallLutVS QWORD ?
+pWallLutPS QWORD ?
+pWallCB    QWORD ?                       ; the Params constant buffer (b0)
+wfxSrcLen  QWORD ?
+wlutSrcLen QWORD ?
+tmpPtrW    QWORD ?
+tmpSizeW   QWORD ?
+
+.balign 16
+; the Params CB mirror: { float time; float aspect; uint pad0; uint pad1; } = 16 bytes.
+;   [0] time  [4] aspect  [8] pad0  [12] pad1
+wallCB    DWORD 0, 0, 0, 0
+; the running animation time (float seconds), advanced each frame by wallStep.
+wallTime  DWORD 0                        ; reinterpreted as a float (starts 0.0)
+wallStep  DWORD 0x3C888889              ; ~1/60 s per frame (0.016666f)
+; aspect = CanvasW/CanvasH physical = 640/360 = 1.77778f.
+wallAspect DWORD 0x3FE38E39             ; 1.7777778f
+.balign 16
+wfxCBArr  QWORD 0                        ; single-element CB array for PSSetConstantBuffers
+wallRTVTmp QWORD ?                       ; single-element RTV array for OMSetRenderTargets
+
+; the Params constant buffer descriptor (16 bytes, BIND_CONSTANT_BUFFER).
+wcbDesc struct D3D11_BUFFER_DESC
+    ByteWidth = 16
+    Usage     = 0                        ; D3D11_USAGE_DEFAULT
+    BindFlags = 4                        ; D3D11_BIND_CONSTANT_BUFFER
+ends
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; WallFxInit — compile the brick-wall VS/PS + the discard-index-0 LUT VS/PS, create
+; the 16-byte Params constant buffer, and seed aspect into the CB mirror. Returns 0
+; in eax; on D3D failure exits with a small distinct code (like G0/G4). Call AFTER
+; GpuInit + BlitInit (needs pDevice live).
+; ===========================================================================
+.globl WallFxInit
+WallFxInit:
+    push    rbx
+    sub     rsp, 40
+
+    ; ---- compile the brick-wall VS/PS ----
+    lea     rax, [rip + wfxEnd]
+    lea     rcx, [rip + wfxSrc]
+    sub     rax, rcx
+    mov     [rip + wfxSrcLen], rax
+    invoke  D3DCompile, wfxSrc, [rip + wfxSrcLen], wfxName, 0, 0, wvsEntry, vsTarget, 0, 0, pVSBlobW, pErrBlob
+    test    eax, eax
+    js      wfi_fail_compile
+    invoke  D3DCompile, wfxSrc, [rip + wfxSrcLen], wfxName, 0, 0, wfxPsEntry, psTarget, 0, 0, pPSBlobW, pErrBlob
+    test    eax, eax
+    js      wfi_fail_compile
+
+    pVSBlobW.GetBufferPointer()
+    mov     [rip + tmpPtrW], rax
+    pVSBlobW.GetBufferSize()
+    mov     [rip + tmpSizeW], rax
+    pDevice.CreateVertexShader([rip + tmpPtrW], [rip + tmpSizeW], 0, pWallVS)
+    test    eax, eax
+    js      wfi_fail_d3d
+    pPSBlobW.GetBufferPointer()
+    mov     [rip + tmpPtrW], rax
+    pPSBlobW.GetBufferSize()
+    mov     [rip + tmpSizeW], rax
+    pDevice.CreatePixelShader([rip + tmpPtrW], [rip + tmpSizeW], 0, pWallPS)
+    test    eax, eax
+    js      wfi_fail_d3d
+
+    ; ---- compile the discard-index-0 LUT VS/PS ----
+    lea     rax, [rip + wlutEnd]
+    lea     rcx, [rip + wlutSrc]
+    sub     rax, rcx
+    mov     [rip + wlutSrcLen], rax
+    invoke  D3DCompile, wlutSrc, [rip + wlutSrcLen], wlutName, 0, 0, wlutVsEntry, vsTarget, 0, 0, pVSBlobWL, pErrBlob
+    test    eax, eax
+    js      wfi_fail_compile
+    invoke  D3DCompile, wlutSrc, [rip + wlutSrcLen], wlutName, 0, 0, wlutPsEntry, psTarget, 0, 0, pPSBlobWL, pErrBlob
+    test    eax, eax
+    js      wfi_fail_compile
+
+    pVSBlobWL.GetBufferPointer()
+    mov     [rip + tmpPtrW], rax
+    pVSBlobWL.GetBufferSize()
+    mov     [rip + tmpSizeW], rax
+    pDevice.CreateVertexShader([rip + tmpPtrW], [rip + tmpSizeW], 0, pWallLutVS)
+    test    eax, eax
+    js      wfi_fail_d3d
+    pPSBlobWL.GetBufferPointer()
+    mov     [rip + tmpPtrW], rax
+    pPSBlobWL.GetBufferSize()
+    mov     [rip + tmpSizeW], rax
+    pDevice.CreatePixelShader([rip + tmpPtrW], [rip + tmpSizeW], 0, pWallLutPS)
+    test    eax, eax
+    js      wfi_fail_d3d
+
+    ; ---- the Params constant buffer (16 bytes, no init data) ----
+    pDevice.CreateBuffer(wcbDesc, 0, pWallCB)
+    test    eax, eax
+    js      wfi_fail_d3d
+
+    ; seed the CB mirror: aspect = 640/360; time = 0.
+    mov     eax, [rip + wallAspect]
+    mov     [rip + wallCB + 4], eax
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     rbx
+    ret
+wfi_fail_compile:
+    invoke  ExitProcess, 55
+wfi_fail_d3d:
+    invoke  ExitProcess, 53
+
+; ===========================================================================
+; WallFxSetTime — advance the brick-wall animation time by wallStep (float add). The
+; CB mirror's time (offset 0) is set to the new value; WallFxRender uploads it. Call
+; once per frame. (aspect at +4 stays whatever WallFxInit seeded.)
+; ===========================================================================
+.globl WallFxSetTime
+WallFxSetTime:
+    movss   xmm0, [rip + wallTime]
+    addss   xmm0, [rip + wallStep]
+    movss   [rip + wallTime], xmm0
+    movss   [rip + wallCB + 0], xmm0      ; Params.time = time
+    ret
+
+; ===========================================================================
+; WallFxRender(rcx=dstRTV) — draw the brick wall full-screen into dstRTV (the back
+; buffer). The wall is the BACK of the stack, so the caller calls WallFxRender FIRST
+; (it fully covers the RT, opaque). Binds the wall VS/PS, the opaque blend state,
+; uploads + binds the Params CB at b0, Draw(3,0). Caller owns the viewport.
+; ===========================================================================
+.globl WallFxRender
+WallFxRender:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     rdi, rcx                      ; dstRTV
+
+    ; bind the dst RT (unbinds any prior RT).
+    mov     [rip + wallRTVTmp], rdi
+    pContext.OMSetRenderTargets(1, wallRTVTmp, 0)
+
+    ; upload the Params CB + bind it at b0.
+    pContext.UpdateSubresource([rip + pWallCB], 0, 0, wallCB, 0, 0)
+    mov     rax, [rip + pWallCB]
+    mov     [rip + wfxCBArr], rax
+    pContext.PSSetConstantBuffers(0, 1, wfxCBArr)
+
+    ; shaders + raster + opaque blend (fully covers the RT, no blend needed).
+    pContext.VSSetShader([rip + pWallVS], 0, 0)
+    pContext.PSSetShader([rip + pWallPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+    pContext.OMSetBlendState([rip + pBlendOpaque], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(4)    ; TRIANGLELIST
+    pContext.Draw(3, 0)
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; WallComposite — upload idxBuf, then run the TRANSPARENT-index-0 LUT resolve into
+; the back buffer ON TOP of the already-rendered wall. NO ClearRenderTargetView (the
+; wall fx already painted the RT). Index 0 is discarded by the PS so the wall shows
+; through; alpha-over blend keeps the opaque resolved pixels over the wall. Mirrors
+; gpu/canvas.was GpuComposite, minus the clear, with the discard PS + alpha blend.
+; ===========================================================================
+.globl WallComposite
+WallComposite:
+    push    rbx
+    sub     rsp, 32
+
+    ; refresh the index texture from idxBuf (full subresource, srcRowPitch=640).
+    pContext.UpdateSubresource([rip + pTexIdx], 0, 0, idxBuf, 640, 0)
+
+    ; bind the back buffer RT — NO clear (the wall fx already covered it).
+    pContext.OMSetRenderTargets(1, pRTV, 0)
+    pContext.RSSetViewports(1, vp)
+    pContext.RSSetState([rip + pRast])
+    pContext.VSSetShader([rip + pWallLutVS], 0, 0)
+    pContext.PSSetShader([rip + pWallLutPS], 0, 0)
+
+    ; bind the three palette SRVs at t0,t1,t2 (reuse canvas.was's contiguous srvArray).
+    mov     rax, [rip + pSRVidx]
+    mov     [rip + srvArray + 0], rax
+    mov     rax, [rip + pSRVglobal]
+    mov     [rip + srvArray + 8], rax
+    mov     rax, [rip + pSRVline]
+    mov     [rip + srvArray + 16], rax
+    pContext.PSSetShaderResources(0, 3, srvArray)
+
+    ; alpha-over: the resolved opaque pixels (A=1) land over the wall; discarded
+    ; index-0 pixels never write, so the wall shows through the play area.
+    pContext.OMSetBlendState([rip + pBlendAlpha], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(4)    ; TRIANGLELIST
+    pContext.Draw(3, 0)
+
+    add     rsp, 32
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+wallfxPad QWORD 0                         ; tail padding (keeps the .DATA 16-aligned)

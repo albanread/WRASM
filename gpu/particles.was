@@ -1,0 +1,1412 @@
+; gpu/particles.was — a REUSABLE GPU PARTICLE SYSTEM (debris / sparks / explosions).
+;
+; -------------------------------------------------------------------- TEXTURED MODE
+; This module has TWO independent particle pools that PtDraw composites in one frame:
+;   1. the PROCEDURAL pool (the original) — soft-glow dots, additive blend, a flat
+;      colour per particle (PtBurst). Unchanged, byte-for-byte.
+;   2. a TEXTURED pool — each particle carries an ATLAS sub-rect {atlasX,atlasY,w,h}
+;      + a PALETTE SLOT instead of a flat colour, and is drawn by a SECOND shader that
+;      samples gpu/sprite.was's idxAtlas (t0) over that sub-rect, DISCARDS index 0,
+;      resolves the index through spritePal (t1) at the slot — EXACTLY like sprite.was's
+;      PS — and fades the output ALPHA by `life` (alpha-over blend, so the textured
+;      fragments are solid pixels, not glow). PtBurstSprite shatters a whole sprite
+;      frame into a gridX*gridY fan of these textured fragments (each fragment = one
+;      cell of the frame, flying outward from the centre under the same gravity/fade).
+;
+; The textured mode therefore DEPENDS on gpu/sprite.was: it reuses sprite.was's atlas
+; + palette SRVs and reads sprFrameTab. A game that uses PtBurstSprite MUST include
+; gpu/sprite.was BEFORE gpu/particles.was, call SprInit before PtInit, and after SprInit
+; call PtSetAtlas(pSprSRVatlas, pSprSRVpal) to hand the textured pass those two SRVs.
+;
+; IMPORTANT (link-level pay-as-you-go): this module does NOT reference any gpu/sprite.was
+; SYMBOL except sprFrameTab/sprFrameCount inside PtBurstSprite. The SRVs come in through
+; PtSetAtlas into LOCAL cells, so a PROCEDURAL-ONLY game that includes particles.was but
+; NOT sprite.was (e.g. brickout_fx.was) still links with no unresolved symbol and builds
+; byte-identically — it never calls PtBurstSprite/PtSetAtlas, so ptTexCount stays 0 and
+; PtDraw skips the whole textured pass.
+;
+; A self-contained module any GPU-Canvas game can include for procedural particle
+; bursts on the G3 instanced-sprite path. It MIRRORS gpu/sprite.was's instancing —
+; a DYNAMIC per-instance vertex buffer (Map WRITE_DISCARD / memcpy / Unmap each
+; frame), an INPUT LAYOUT (D3D11_INPUT_PER_INSTANCE_DATA, step rate 1), and ONE
+; DrawInstanced over a 4-vertex TRIANGLESTRIP quad — but instead of an atlas+palette
+; sprite it draws a procedural soft glowing DOT with ADDITIVE blend (SRC_ALPHA/ONE)
+; for a fire/spark glow.
+;
+; Built ON TOP of gpu/canvas.was (G0: pDevice/pContext/pRTV, the comobj/.Method COM
+; idioms, vsTarget/psTarget/pErrBlob, pRast, the .ASCIISTRING + D3DCompile path,
+; the struct..ends descriptors) and gpu/blit.was (G1: blendFactor). Include AFTER
+; both — and after gpu/wallfx.was when used by the deluxe brickout (it just needs
+; pDevice live by PtInit time). It creates its OWN additive blend state, so it does
+; NOT disturb gpu/blit.was's pBlendOpaque / pBlendAlpha.
+;
+; This module is INCLUDED ONLY by a game that wants it (here examples/brickout_fx.was);
+; gpu/canvas.was, gpu/sprite.was, gpu/fx.was, gpu/harness.was, gpu/wallfx.was are
+; UNTOUCHED, so gpu_brickout.was / gpu_g6.was (and every parity demo) build + render
+; byte-identically.
+;
+; --------------------------------------------------------------------------- POOL
+;   PT_MAX (8192) particles, a CPU mirror PT_STRIDE (32) bytes each:
+;     { x, y (screen px), vx, vy (px/frame), life (1->0), r, g, b }  — 8 floats.
+;   ptCount = the number of LIVE particles (a tight live prefix; COMPACT in PtUpdate
+;   drops the dead ones by swapping the last live particle down).
+;
+; --------------------------------------------------------------------------- SHADER
+;   The per-instance VB is a SEPARATE 7-float record laid out for the GPU:
+;     { x, y (screen px), size (px), r, g, b, alpha }  = PT_INST (28 bytes).
+;   VS — a base quad from SV_VertexID (4 verts, TRIANGLESTRIP): corner=(vid&1,vid>>1).
+;        pos = inst.xy + (corner-0.5)*size  (CENTRED quad, screen px), then NDC:
+;        clip = (pos.x/320-1, 1-pos.y/180) — the same 640x360 mapping the other passes
+;        use. Forwards corner-0.5 as a local coord for the radial falloff + the colour.
+;   PS — radial falloff: g = saturate(1 - 1.6*length(local)) ; g = g*g (soft round dot,
+;        bright centre -> 0 near the rim; the 1.6 coeff makes a fat soft disc). Then a
+;        white-hot core is added to the colour: c = inst.rgb + g*g*0.6 (so the spark
+;        reads bright over the dark wall as life fades). Output float4(c * a, a) with
+;        a = g*inst.alpha (premultiplied); ADDITIVE blend (SRC_ALPHA/ONE) sums the glow.
+;
+; --------------------------------------------------------------------------- API
+;   PtInit                         — compile the shader, create the instance VB + the
+;                                    input layout + the ADDITIVE blend state.
+;   PtBurst(x,y,count,speed,r,g,b) — spawn `count` particles at (x,y) with random
+;                                    OUTWARD velocities (~speed) + colour + full life.
+;                                    ABI: xmm0=x xmm1=y (screen px floats), ecx=count,
+;                                    xmm3=speed, xmm4=r xmm5=g xmm6=b (0..1 floats).
+;   PtBurstSprite(x,y,frameId,gridX,gridY,speed) — read sprFrameTab[frameId] ->
+;                                    {atlasX,atlasY,w,h}, SUBDIVIDE the frame into a
+;                                    gridX*gridY grid of sub-rects, and spawn ONE
+;                                    TEXTURED particle per cell carrying that sub-rect
+;                                    + the cell's screen position, with an OUTWARD
+;                                    velocity (~speed) from the frame centre + full
+;                                    life. The sprite bursts into its OWN pixels.
+;                                    ABI: xmm0=x xmm1=y (screen px floats, the frame's
+;                                    top-left so the cells tile its w x h footprint),
+;                                    ecx=frameId, edx=gridX, r8d=gridY, xmm3=speed.
+;                                    PALETTE SLOT defaults to ptBurstSlot (a .globl, 0).
+;   PtUpdate                       — advance + fade + COMPACT BOTH pools (drop dead,
+;                                    keep each live prefix tight).
+;   PtDraw(rcx=dstRTV)             — draw the procedural dots (additive) AND the
+;                                    textured fragments (alpha-over, sprite atlas/palette
+;                                    SRVs) onto dstRTV, each in one DrawInstanced.
+;
+; SCREEN ALIGNMENT: particles are SCREEN-space and ride the x1.8-scaled board. A game
+; that knows a thing's idxBuf position converts at SPAWN: screenX = idxX*1.8 - 256,
+; screenY = idxY*1.8 - 144 (the exact WLPS / HUD-text transform). PtBurst takes screen
+; px, so the caller does that one multiply-add before calling. (See brickout_fx.was's
+; brick-break hook.)
+;
+; winkb supplied every D3D11 detail (reused from gpu/sprite.was + gpu/blit.was — no
+; hand-counted structs):
+;   D3D11_INPUT_ELEMENT_DESC{name@0(PSTR),index@8,format@12,slot@16,offset@20,
+;     class@24,step@28} = 32 bytes ; D3D11_BUFFER_DESC{ByteWidth@0,Usage@4,
+;     BindFlags@8,CPUAccessFlags@12,...} = 24 ; D3D11_MAPPED_SUBRESOURCE{pData@0,..}.
+;   D3D11_BLEND_DESC{AlphaToCoverageEnable@0,IndependentBlendEnable@4,
+;     RenderTarget[0]@8 = {BlendEnable@0,SrcBlend@4,DestBlend@8,BlendOp@12,
+;     SrcBlendAlpha@16,DestBlendAlpha@20,BlendOpAlpha@24,WriteMask@28(u8)}} (winkb).
+;   Enums: D3D11_USAGE_DYNAMIC=2, D3D11_CPU_ACCESS_WRITE=0x10000,
+;     D3D11_BIND_VERTEX_BUFFER=1, D3D11_INPUT_PER_INSTANCE_DATA=1,
+;     D3D11_MAP_WRITE_DISCARD=4, DXGI_FORMAT_R32G32_FLOAT=16, DXGI_FORMAT_R32_FLOAT=41,
+;     R32G32B32_FLOAT=6, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP=5,
+;     D3D11_BLEND_SRC_ALPHA=5, D3D11_BLEND_ONE=2, D3D11_BLEND_OP_ADD=1,
+;     D3D11_COLOR_WRITE_ENABLE_ALL=15.
+;   ID3D11DeviceContext vtbl: Map[14] Unmap[15] IASetInputLayout[17]
+;     IASetVertexBuffers[18] DrawInstanced[21] IASetPrimitiveTopology[24];
+;     ID3D11Device CreateInputLayout[11] (all via the comobj/.Method macro).
+;
+; trap #8: every .DATA block opens with .balign 16.
+; trap #9: COM register-args are staged in memory (ptVBArr, ptRTVTmp, ptSrvArr-free);
+;   DrawInstanced's instance count rides in ecx (the comcall macro marshals args
+;   BEFORE loading `this`, so ecx survives — same as gpu/sprite.was DrawSprites).
+
+; ---------------------------------------------------------------------------
+; Named constants (equates — fold to literals, visible in --emit-asm).
+PT_MAX        equ 8192               ; pool capacity (mirrors SPR_MAX_INST headroom)
+PT_STRIDE     equ 32                 ; CPU-mirror bytes per particle (8 floats)
+PT_INST       equ 28                 ; per-instance GPU bytes (7 floats: x,y,size,r,g,b,a)
+PT_POOL_BYTES equ PT_MAX * PT_STRIDE ; 262144 — the CPU particle pool
+PT_INST_BYTES equ PT_MAX * PT_INST   ; 229376 — the dynamic instance VB + build mirror
+
+; --- TEXTURED pool geometry (the second, sprite-shatter pool). The CPU mirror needs
+; the sub-rect + the palette slot per particle, so it is wider than the procedural one:
+;   { x@0, y@4, vx@8, vy@12, life@16, atlasX@20, atlasY@24, w@28, h@32, palSlot@36 }
+; = 10 floats = 40 bytes. The GPU instance is the 8-float (32-byte) sprite-style record
+;   { x, y, atlasX, atlasY, w, h, palSlot, alpha }.
+PTX_STRIDE     equ 40                  ; CPU-mirror bytes per textured particle (10 floats)
+PTX_INST       equ 32                  ; per-instance GPU bytes (8 floats, sprite-style)
+PTX_POOL_BYTES equ PT_MAX * PTX_STRIDE ; 327680 — the textured CPU pool
+PTX_INST_BYTES equ PT_MAX * PTX_INST   ; 262144 — the textured dynamic instance VB + mirror
+
+.DATA
+.balign 16
+; ---------------------------------------------------------------------------
+; The PARTICLE shader — a procedural soft glowing DOT.
+;
+; Per-instance vertex inputs (one InputSlot 0, PER_INSTANCE_DATA, step 1), matching
+; the 28-byte instance record { x@0, y@4, size@8, r@12, g@16, b@20, alpha@24 }:
+;   PTPOS  (R32G32_FLOAT)    : x, y      (centre, screen px)
+;   PTSIZE (R32_FLOAT)       : size       (quad side, px)
+;   PTCOL  (R32G32B32_FLOAT) : r, g, b    (0..1)
+;   PTA    (R32_FLOAT)       : alpha       (0..1, scaled by life at build time)
+; ---------------------------------------------------------------------------
+ptSrc:
+.ASCIISTRING
+struct VO{float4 p:SV_Position; float2 lc:TEXCOORD0; nointerpolation float3 col:TEXCOORD1; nointerpolation float a:TEXCOORD2;};
+VO PVS(uint vid:SV_VertexID, float2 pos:PTPOS, float size:PTSIZE, float3 col:PTCOL, float a:PTA){
+  VO o;
+  float2 corner=float2((float)(vid&1u),(float)((vid>>1)&1u));   // {0,1}^2
+  float2 lc=corner-0.5;                                          // centred [-0.5,0.5]
+  float2 sp=pos+lc*size;                                          // screen px
+  o.p=float4(sp.x/320.0-1.0, 1.0-sp.y/180.0, 0.0, 1.0);
+  o.lc=lc;
+  o.col=col;
+  o.a=a;
+  return o;
+}
+float4 PPS(VO v):SV_Target{
+  float d=length(v.lc);              // 0 at centre, ~0.707 at the corner
+  float g=saturate(1.0-1.6*d);       // 1 centre -> 0 near the corner (fat soft disc)
+  g=g*g;                              // soften (bright core, smooth falloff)
+  float a=g*v.a;
+  // additive glow: a white-hot core plus the coloured halo, so the spark reads
+  // brightly over the dark wall even as `life` (v.a) fades the particle out.
+  float3 c=v.col + g*g*0.6;
+  return float4(c*a, a);              // premultiplied; ADDITIVE blend sums it
+}
+.ENDASCIISTRING
+ptEnd:
+    BYTE 0
+
+pvsEntry  BYTE "PVS", 0
+ppsEntry  BYTE "PPS", 0
+ptName    BYTE "gpuparticle", 0
+
+; per-instance attribute SEMANTIC names (PSTRs the input layout points at).
+semPtPos  BYTE "PTPOS", 0
+semPtSize BYTE "PTSIZE", 0
+semPtCol  BYTE "PTCOL", 0
+semPtA    BYTE "PTA", 0
+
+.balign 16
+; ---------------------------------------------------------------------------
+; The TEXTURED particle shader — a sprite-fragment quad sampled from the shared
+; sprite atlas + palette (gpu/sprite.was's idxAtlas t0 / spritePal t1). This is
+; sprite.was's SVS/SPS, adapted: the VS positions a quad PER INSTANCE from the per-
+; instance data {screenX, screenY, atlasX, atlasY, w, h, paletteSlot, alpha}; the PS
+; .Load's the atlas at the instance's atlas region, DISCARDS index 0, resolves the
+; index through the per-sprite palette row, and outputs float4(rgb, instanceAlpha) —
+; alpha-over via the G1 alpha blend state. The instance alpha is `life`, so the
+; fragment FADES as the particle dies. Identical fetch-clamp logic to sprite.was so a
+; sub-rect of a packed frame samples only THAT cell (no bleed into the neighbour).
+;
+; idxAtlas : Texture2D<uint>   at t0 (R8_UINT, 512x512 sprite atlas)  — sprite.was's
+; spritePal: Texture2D<float4> at t1 (B8G8R8A8_UNORM, 16 x slots)     — sprite.was's
+;
+; Per-instance vertex inputs (one InputSlot, PER_INSTANCE_DATA, step 1), 32-byte rec:
+;   PTXSCR (R32G32_FLOAT) : screenX, screenY  (top-left, screen px)
+;   PTXATL (R32G32_FLOAT) : atlasX,  atlasY   (top-left texel of THIS fragment's cell)
+;   PTXWH  (R32G32_FLOAT) : w, h               (the cell size, px)
+;   PTXPAL (R32_FLOAT)    : paletteSlot         (row in spritePal; floored in PS)
+;   PTXA   (R32_FLOAT)    : alpha                (= life, the output alpha)
+; ---------------------------------------------------------------------------
+ptxSrc:
+.ASCIISTRING
+Texture2D<uint> idxAtlas:register(t0);
+Texture2D<float4> spritePal:register(t1);
+struct TVO{float4 p:SV_Position;float2 atl:TEXCOORD0;float pal:TEXCOORD1;float a:TEXCOORD2;
+          nointerpolation float2 org:TEXCOORD3; nointerpolation float2 wh:TEXCOORD4;};
+TVO TVS(uint vid:SV_VertexID,
+        float2 scr:PTXSCR, float2 atl:PTXATL, float2 wh:PTXWH,
+        float pal:PTXPAL, float a:PTXA){
+  TVO o;
+  float2 corner=float2((float)(vid&1u),(float)((vid>>1)&1u));
+  float2 pos=scr+corner*wh;
+  o.p=float4(pos.x/320.0-1.0, 1.0-pos.y/180.0, 0.0, 1.0);
+  o.atl=atl+corner*wh;
+  o.pal=pal;
+  o.a=a;
+  o.org=atl;
+  o.wh=wh;
+  return o;
+}
+float4 TPS(TVO v):SV_Target{
+  int ax=(int)v.atl.x; int ay=(int)v.atl.y;
+  int x0=(int)v.org.x; int y0=(int)v.org.y;
+  ax=clamp(ax, x0, x0+(int)v.wh.x-1);
+  ay=clamp(ay, y0, y0+(int)v.wh.y-1);
+  ax=clamp(ax,0,511); ay=clamp(ay,0,511);
+  uint c=idxAtlas.Load(int3(ax,ay,0));
+  if(c==0u) discard;
+  int slot=(int)(v.pal+0.5);
+  float4 col=spritePal.Load(int3((int)c,slot,0));
+  return float4(col.rgb, saturate(v.a));
+}
+.ENDASCIISTRING
+ptxEnd:
+    BYTE 0
+
+tvsEntry  BYTE "TVS", 0
+tpsEntry  BYTE "TPS", 0
+ptxName   BYTE "gpuptex", 0
+
+; textured per-instance attribute SEMANTIC names.
+semPtxScr BYTE "PTXSCR", 0
+semPtxAtl BYTE "PTXATL", 0
+semPtxWh  BYTE "PTXWH", 0
+semPtxPal BYTE "PTXPAL", 0
+semPtxA   BYTE "PTXA", 0
+
+.balign 16
+; ---- public pool geometry ----
+.globl PtMaxParticles
+PtMaxParticles DWORD PT_MAX
+.globl ptCount
+ptCount   DWORD 0                    ; live particle count (the tight prefix)
+.globl ptTexCount
+ptTexCount DWORD 0                   ; live TEXTURED particle count (the tight prefix)
+; DrawInstanced's InstanceCount is staged through memory so the COM method call's
+; `this` marshaling cannot alias the rcx/ecx argument register.
+ptDrawCount QWORD 0
+ptTexDrawCount QWORD 0
+; the palette slot every PtBurstSprite fragment carries (the resolve row in spritePal).
+; A game sets this to the slot it gave its frame's colours via SprSetPalette. Default 0.
+.globl ptBurstSlot
+ptBurstSlot DWORD 0
+
+.balign 16
+; ---- particle COM objects + scalar state ----
+comobj pVSBlobPt : ID3DBlob
+comobj pPSBlobPt : ID3DBlob
+comobj pPtInstVB : ID3D11Buffer      ; dynamic per-instance vertex buffer
+
+pPtVS      QWORD ?
+pPtPS      QWORD ?
+pPtLayout  QWORD ?                   ; ID3D11InputLayout*
+pPtBlendAdd QWORD ?                  ; ADDITIVE (SRC_ALPHA/ONE) blend state
+ptSrcLen   QWORD ?
+tmpPtrPt   QWORD ?
+tmpSizePt  QWORD ?
+
+; ---- TEXTURED particle COM objects + scalar state ----
+comobj pVSBlobPtx : ID3DBlob
+comobj pPSBlobPtx : ID3DBlob
+comobj pPtxInstVB : ID3D11Buffer     ; dynamic per-instance VB for the textured pool
+
+pPtxVS     QWORD ?
+pPtxPS     QWORD ?
+pPtxLayout QWORD ?                   ; ID3D11InputLayout*
+ptxSrcLen  QWORD ?
+
+; per-instance stride (7 floats = 28 bytes) + the IASetVertexBuffers stride/offset
+; single-element arrays (the API wants pointers to u32).
+ptStride   DWORD PT_INST
+ptOffset   DWORD 0
+ptxStride  DWORD PTX_INST             ; textured per-instance stride (32 bytes)
+ptxOffset  DWORD 0
+.balign 16
+ptVBArr    QWORD 0                    ; single-element ppVertexBuffers array
+ptxVBArr   QWORD 0                    ; textured single-element ppVertexBuffers array
+ptRTVTmp   QWORD ?                    ; single-element RTV array for OMSetRenderTargets
+ptMapped   BYTE 16 dup(0)             ; D3D11_MAPPED_SUBRESOURCE out
+ptxMapped  BYTE 16 dup(0)             ; textured D3D11_MAPPED_SUBRESOURCE out
+.balign 16
+ptxSrvArr  QWORD 0, 0                  ; t0=sprite atlas, t1=sprite palette (from sprite.was)
+; the atlas + palette SRV pointers the textured pass binds. A sprite-using game passes
+; gpu/sprite.was's pSprSRVatlas / pSprSRVpal here via PtSetAtlas after SprInit. Holding
+; them in LOCAL cells (rather than referencing the sprite.was symbols directly) keeps
+; this module self-contained at LINK time — a procedural-only game (e.g. brickout_fx,
+; which includes particles.was but NOT sprite.was) links with NO unresolved symbol, and
+; since it never calls PtBurstSprite/PtSetAtlas, ptTexCount stays 0 and these stay null.
+ptAtlasSRV QWORD 0
+ptPalSRV   QWORD 0
+; the sprite FRAME TABLE base + the live-frame-count pointer (gpu/sprite.was's
+; sprFrameTab / &sprFrameCount). PtBurstSprite reads the frame rect through these, so
+; it does NOT reference the sprite.was symbols directly — same link-clean reasoning as
+; the SRVs above. PtSetAtlas wires all four; a procedural-only game leaves them null.
+ptFrameTab QWORD 0
+ptFrameCnt QWORD 0                    ; -> the u32 sprFrameCount
+
+; tuning (floats): the dot size, the per-frame gravity pull, the life fade rate.
+.globl ptSize
+ptSize     DWORD 0x41800000           ; 16.0f — the quad side in px (a fat glow)
+.globl ptGravity
+ptGravity  DWORD 0x3E4CCCCD           ; 0.20f — vy += gravity each frame (px/frame^2)
+.globl ptFade
+ptFade     DWORD 0x3D4CCCCD           ; 0.05f — life -= fade each frame (~20 frames)
+ptHalf     DWORD 0x3F000000           ; 0.5f
+
+.balign 16
+; ---- the CPU particle pool: PT_MAX * 32 bytes (8 floats per particle), packed as
+;      { x@0, y@4, vx@8, vy@12, life@16, r@20, g@24, b@28 }. ----
+.globl ptPool
+ptPool     BYTE PT_POOL_BYTES dup(0)  ; 8192 * 32
+
+.balign 16
+; ---- the instance build mirror: PT_MAX * 28 bytes (7 floats per instance). PtDraw
+;      fills the first ptCount records from the live pool, then Maps the VB + copies. ----
+ptInstData BYTE PT_INST_BYTES dup(0)  ; 8192 * 28
+
+.balign 16
+; ---- the dynamic instance vertex buffer descriptor: PT_MAX*28 bytes, DYNAMIC +
+;      CPU_ACCESS_WRITE + BIND_VERTEX_BUFFER (so Map WRITE_DISCARD works each frame). ----
+ptVbDesc struct D3D11_BUFFER_DESC
+    ByteWidth      = PT_INST_BYTES    ; PT_MAX * 28
+    Usage          = 2                ; D3D11_USAGE_DYNAMIC
+    BindFlags      = 1                ; D3D11_BIND_VERTEX_BUFFER
+    CPUAccessFlags = 0x10000          ; D3D11_CPU_ACCESS_WRITE
+ends
+
+.balign 16
+; ---- the input layout: 4 per-instance attributes, one InputSlot (0),
+;      InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA (1), step rate 1.
+;      Each D3D11_INPUT_ELEMENT_DESC is 32 bytes; SemanticName PSTR (@0) patched at
+;      init. Offsets walk the 28-byte instance record:
+;        PTPOS @0 (R32G32_FLOAT=16), PTSIZE @8 (R32_FLOAT=41),
+;        PTCOL @12 (R32G32B32_FLOAT=6), PTA @24 (R32_FLOAT=41).
+ptElems:
+elPtPos struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16          ; DXGI_FORMAT_R32G32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 0
+    InputSlotClass       = 1           ; D3D11_INPUT_PER_INSTANCE_DATA
+    InstanceDataStepRate = 1
+ends
+elPtSize struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 41          ; DXGI_FORMAT_R32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 8
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elPtCol struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 6           ; DXGI_FORMAT_R32G32B32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 12
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elPtA struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 41          ; DXGI_FORMAT_R32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 24
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+
+.balign 16
+; ---- the TEXTURED CPU pool: PT_MAX * 40 bytes (10 floats per particle), packed as
+;      { x@0, y@4, vx@8, vy@12, life@16, atlasX@20, atlasY@24, w@28, h@32, palSlot@36 }. ----
+.globl ptTexPool
+ptTexPool  BYTE PTX_POOL_BYTES dup(0)  ; 8192 * 40
+
+.balign 16
+; ---- the textured instance build mirror: PT_MAX * 32 bytes (8 floats per instance,
+;      sprite-style { x, y, atlasX, atlasY, w, h, palSlot, alpha }). ----
+ptxInstData BYTE PTX_INST_BYTES dup(0) ; 8192 * 32
+
+.balign 16
+; ---- the textured dynamic instance VB descriptor: PT_MAX*32 bytes, DYNAMIC. ----
+ptxVbDesc struct D3D11_BUFFER_DESC
+    ByteWidth      = PTX_INST_BYTES    ; PT_MAX * 32
+    Usage          = 2                 ; D3D11_USAGE_DYNAMIC
+    BindFlags      = 1                 ; D3D11_BIND_VERTEX_BUFFER
+    CPUAccessFlags = 0x10000           ; D3D11_CPU_ACCESS_WRITE
+ends
+
+.balign 16
+; ---- the TEXTURED input layout: 5 per-instance attributes, InputSlot 0,
+;      PER_INSTANCE_DATA, step 1. Offsets walk the 32-byte sprite-style record:
+;        PTXSCR @0 (R32G32_FLOAT=16), PTXATL @8, PTXWH @16,
+;        PTXPAL @24 (R32_FLOAT=41),   PTXA   @28.
+ptxElems:
+elPtxScr struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16          ; DXGI_FORMAT_R32G32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 0
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elPtxAtl struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16
+    InputSlot            = 0
+    AlignedByteOffset    = 8
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elPtxWh struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 16
+    InputSlot            = 0
+    AlignedByteOffset    = 16
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elPtxPal struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 41          ; DXGI_FORMAT_R32_FLOAT
+    InputSlot            = 0
+    AlignedByteOffset    = 24
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+elPtxA struct D3D11_INPUT_ELEMENT_DESC
+    SemanticIndex        = 0
+    Format               = 41
+    InputSlot            = 0
+    AlignedByteOffset    = 28
+    InputSlotClass       = 1
+    InstanceDataStepRate = 1
+ends
+
+.balign 16
+; ---- ADDITIVE blend state (SRC_ALPHA / ONE, ADD). Laid out by hand like gpu/blit.was's
+;      bdAlpha (the struct macro can't address RenderTarget[0] at +8). Colour: src*srcA
+;      added to the dest; alpha: src*1 + dest*1 (glow accumulates). 264 bytes total. ----
+bdPtAdd:
+    DWORD 0                            ; AlphaToCoverageEnable
+    DWORD 0                            ; IndependentBlendEnable
+    DWORD 1                            ; [0] BlendEnable = TRUE
+    DWORD 5                            ; SrcBlend       = D3D11_BLEND_SRC_ALPHA
+    DWORD 2                            ; DestBlend      = D3D11_BLEND_ONE  (additive)
+    DWORD 1                            ; BlendOp        = D3D11_BLEND_OP_ADD
+    DWORD 2                            ; SrcBlendAlpha  = D3D11_BLEND_ONE
+    DWORD 2                            ; DestBlendAlpha = D3D11_BLEND_ONE
+    DWORD 1                            ; BlendOpAlpha   = D3D11_BLEND_OP_ADD
+    BYTE  15, 0, 0, 0                  ; RenderTargetWriteMask = ALL (+28) + pad
+    BYTE  224 dup(0)                   ; RenderTarget[1..7]
+
+.balign 16
+; ---- a small rotating DIRECTION table: 16 unit vectors around the circle (cos,sin),
+;      pairs of floats. PtBurst varies the launch direction BY PARTICLE INDEX through
+;      this table (Math.random is unavailable), plus a per-burst rotating seed so
+;      successive bursts don't all fire the identical fan. (cos/sin of k*22.5deg.) ----
+ptDirTab:
+    DWORD 0x3F800000, 0x00000000       ;   0deg : ( 1.000,  0.000)
+    DWORD 0x3F6C835E, 0x3EC3EF15       ;  22.5  : ( 0.924,  0.383)
+    DWORD 0x3F3504F3, 0x3F3504F3       ;  45    : ( 0.707,  0.707)
+    DWORD 0x3EC3EF15, 0x3F6C835E       ;  67.5  : ( 0.383,  0.924)
+    DWORD 0x00000000, 0x3F800000       ;  90    : ( 0.000,  1.000)
+    DWORD 0xBEC3EF15, 0x3F6C835E       ; 112.5  : (-0.383,  0.924)
+    DWORD 0xBF3504F3, 0x3F3504F3       ; 135    : (-0.707,  0.707)
+    DWORD 0xBF6C835E, 0x3EC3EF15       ; 157.5  : (-0.924,  0.383)
+    DWORD 0xBF800000, 0x00000000       ; 180    : (-1.000,  0.000)
+    DWORD 0xBF6C835E, 0xBEC3EF15       ; 202.5  : (-0.924, -0.383)
+    DWORD 0xBF3504F3, 0xBF3504F3       ; 225    : (-0.707, -0.707)
+    DWORD 0xBEC3EF15, 0xBF6C835E       ; 247.5  : (-0.383, -0.924)
+    DWORD 0x00000000, 0xBF800000       ; 270    : ( 0.000, -1.000)
+    DWORD 0x3EC3EF15, 0xBF6C835E       ; 292.5  : ( 0.383, -0.924)
+    DWORD 0x3F3504F3, 0xBF3504F3       ; 315    : ( 0.707, -0.707)
+    DWORD 0x3F6C835E, 0xBEC3EF15       ; 337.5  : ( 0.924, -0.383)
+
+; a per-burst rotating seed: each PtBurst advances it so bursts don't all fan alike.
+ptBurstSeed DWORD 0
+; a small speed-jitter table (multipliers 0.55..1.00) so shards don't all fly at the
+; same magnitude — index it alongside the direction table for a livelier spray. Index 0
+; is 1.00 (full speed, no jitter) BY DESIGN, so the leading shard of each fan reaches
+; full reach; the rest (0.55..0.90) trail it.
+ptSpdTab:
+    DWORD 0x3F800000                   ; 1.00
+    DWORD 0x3F2E147B                   ; 0.68
+    DWORD 0x3F4CCCCD                   ; 0.80
+    DWORD 0x3F19999A                   ; 0.60
+    DWORD 0x3F666666                   ; 0.90
+    DWORD 0x3F0CCCCD                   ; 0.55
+    DWORD 0x3F59999A                   ; 0.85
+    DWORD 0x3F3851EC                   ; 0.72
+
+.balign 16
+.CODE
+
+; ===========================================================================
+; PtInit — compile the particle VS/PS, patch + create the input layout (against the
+; VS blob's input signature), create the dynamic instance VB + the additive blend
+; state. Returns 0 in eax; on D3D failure exits with a small distinct code. Call
+; AFTER GpuInit (+ BlitInit, for blendFactor). Mirrors SprInit's setup.
+; ===========================================================================
+.globl PtInit
+PtInit:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 40
+
+    ; patch each input element's SemanticName PSTR (@0) — a label, not a constant.
+    lea     rax, [rip + semPtPos]
+    mov     [rip + elPtPos + 0], rax
+    lea     rax, [rip + semPtSize]
+    mov     [rip + elPtSize + 0], rax
+    lea     rax, [rip + semPtCol]
+    mov     [rip + elPtCol + 0], rax
+    lea     rax, [rip + semPtA]
+    mov     [rip + elPtA + 0], rax
+
+    ; ---- compile the particle VS/PS ----
+    lea     rax, [rip + ptEnd]
+    lea     rcx, [rip + ptSrc]
+    sub     rax, rcx
+    mov     [rip + ptSrcLen], rax
+    invoke  D3DCompile, ptSrc, [rip + ptSrcLen], ptName, 0, 0, pvsEntry, vsTarget, 0, 0, pVSBlobPt, pErrBlob
+    test    eax, eax
+    js      pti_fail_compile
+    invoke  D3DCompile, ptSrc, [rip + ptSrcLen], ptName, 0, 0, ppsEntry, psTarget, 0, 0, pPSBlobPt, pErrBlob
+    test    eax, eax
+    js      pti_fail_compile
+
+    pVSBlobPt.GetBufferPointer()
+    mov     [rip + tmpPtrPt], rax
+    pVSBlobPt.GetBufferSize()
+    mov     [rip + tmpSizePt], rax
+    pDevice.CreateVertexShader([rip + tmpPtrPt], [rip + tmpSizePt], 0, pPtVS)
+    test    eax, eax
+    js      pti_fail_d3d
+    pPSBlobPt.GetBufferPointer()
+    mov     [rip + tmpPtrPt], rax
+    pPSBlobPt.GetBufferSize()
+    mov     [rip + tmpSizePt], rax
+    pDevice.CreatePixelShader([rip + tmpPtrPt], [rip + tmpSizePt], 0, pPtPS)
+    test    eax, eax
+    js      pti_fail_d3d
+
+    ; ---- input layout (against the VS blob's input signature, 4 elements) ----
+    pVSBlobPt.GetBufferPointer()
+    mov     [rip + tmpPtrPt], rax
+    pVSBlobPt.GetBufferSize()
+    mov     [rip + tmpSizePt], rax
+    pDevice.CreateInputLayout(ptElems, 4, [rip + tmpPtrPt], [rip + tmpSizePt], pPtLayout)
+    test    eax, eax
+    js      pti_fail_d3d
+
+    ; ---- the ADDITIVE blend state ----
+    pDevice.CreateBlendState(bdPtAdd, pPtBlendAdd)
+    test    eax, eax
+    js      pti_fail_d3d
+
+    ; ---- the dynamic instance vertex buffer (no init data) ----
+    pDevice.CreateBuffer(ptVbDesc, 0, pPtInstVB)
+    test    eax, eax
+    js      pti_fail_d3d
+
+    ; ======================= TEXTURED particle pass setup =======================
+    ; patch each textured input element's SemanticName PSTR (@0).
+    lea     rax, [rip + semPtxScr]
+    mov     [rip + elPtxScr + 0], rax
+    lea     rax, [rip + semPtxAtl]
+    mov     [rip + elPtxAtl + 0], rax
+    lea     rax, [rip + semPtxWh]
+    mov     [rip + elPtxWh + 0], rax
+    lea     rax, [rip + semPtxPal]
+    mov     [rip + elPtxPal + 0], rax
+    lea     rax, [rip + semPtxA]
+    mov     [rip + elPtxA + 0], rax
+
+    ; ---- compile the textured VS/PS ----
+    lea     rax, [rip + ptxEnd]
+    lea     rcx, [rip + ptxSrc]
+    sub     rax, rcx
+    mov     [rip + ptxSrcLen], rax
+    invoke  D3DCompile, ptxSrc, [rip + ptxSrcLen], ptxName, 0, 0, tvsEntry, vsTarget, 0, 0, pVSBlobPtx, pErrBlob
+    test    eax, eax
+    js      pti_fail_compile
+    invoke  D3DCompile, ptxSrc, [rip + ptxSrcLen], ptxName, 0, 0, tpsEntry, psTarget, 0, 0, pPSBlobPtx, pErrBlob
+    test    eax, eax
+    js      pti_fail_compile
+
+    pVSBlobPtx.GetBufferPointer()
+    mov     [rip + tmpPtrPt], rax
+    pVSBlobPtx.GetBufferSize()
+    mov     [rip + tmpSizePt], rax
+    pDevice.CreateVertexShader([rip + tmpPtrPt], [rip + tmpSizePt], 0, pPtxVS)
+    test    eax, eax
+    js      pti_fail_d3d
+    pPSBlobPtx.GetBufferPointer()
+    mov     [rip + tmpPtrPt], rax
+    pPSBlobPtx.GetBufferSize()
+    mov     [rip + tmpSizePt], rax
+    pDevice.CreatePixelShader([rip + tmpPtrPt], [rip + tmpSizePt], 0, pPtxPS)
+    test    eax, eax
+    js      pti_fail_d3d
+
+    ; ---- textured input layout (5 elements, against the textured VS blob) ----
+    pVSBlobPtx.GetBufferPointer()
+    mov     [rip + tmpPtrPt], rax
+    pVSBlobPtx.GetBufferSize()
+    mov     [rip + tmpSizePt], rax
+    pDevice.CreateInputLayout(ptxElems, 5, [rip + tmpPtrPt], [rip + tmpSizePt], pPtxLayout)
+    test    eax, eax
+    js      pti_fail_d3d
+
+    ; ---- the textured dynamic instance vertex buffer (no init data) ----
+    pDevice.CreateBuffer(ptxVbDesc, 0, pPtxInstVB)
+    test    eax, eax
+    js      pti_fail_d3d
+
+    xor     eax, eax
+    add     rsp, 40
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+pti_fail_compile:
+    invoke  ExitProcess, 75
+pti_fail_d3d:
+    invoke  ExitProcess, 73
+
+; ===========================================================================
+; PtSetAtlas(rcx=atlasSRV, rdx=palSRV, r8=frameTabPtr, r9=frameCountPtr) — wire the
+; TEXTURED pass to gpu/sprite.was's resources: the atlas (t0) + per-sprite palette (t1)
+; SRVs it samples, plus the FRAME TABLE base (sprFrameTab) and the &sprFrameCount that
+; PtBurstSprite reads the frame rect from. A sprite-using game calls this ONCE after
+; SprInit, e.g.  PtSetAtlas(pSprSRVatlas, pSprSRVpal, sprFrameTab, &sprFrameCount).
+; Routing these through LOCAL cells (instead of referencing the sprite.was symbols in
+; particles.was code) is what keeps a procedural-only build link-clean: it never calls
+; PtSetAtlas/PtBurstSprite, the cells stay null, and the textured pass is skipped.
+; ===========================================================================
+.globl PtSetAtlas
+PtSetAtlas:
+    mov     [rip + ptAtlasSRV], rcx
+    mov     [rip + ptPalSRV], rdx
+    mov     [rip + ptFrameTab], r8
+    mov     [rip + ptFrameCnt], r9
+    ret
+
+; ===========================================================================
+; PtBurst(xmm0=x, xmm1=y, ecx=count, xmm3=speed, xmm4=r, xmm5=g, xmm6=b) — spawn
+; `count` particles at the SCREEN-px point (x,y) with random OUTWARD velocities of
+; ~`speed` magnitude, the given colour, and full life (1.0). The 'explode'.
+;
+; Direction is varied by particle index through ptDirTab (+ a rotating per-burst
+; seed so successive bursts fan differently) since Math.random is unavailable; the
+; magnitude is jittered through ptSpdTab. Each new particle is appended at ptCount;
+; if the pool is FULL (ptCount >= PT_MAX) the burst stops appending (the remaining
+; shards of that burst are dropped — the safe direction; never overflows). With
+; PT_MAX=8192 vs ~18 live shards/break this is unreachable in brickout_fx. The pool
+; record is { x, y, vx, vy, life, r, g, b }.
+; ===========================================================================
+.globl PtBurst
+PtBurst:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    sub     rsp, 8
+
+    mov     r12d, ecx                    ; count requested
+    test    r12d, r12d
+    jle     pb_done
+
+    ; spill the spawn point + colour to xmm-safe slots (comcalls? none here, but the
+    ; loop reuses xmm0/xmm1 for math). Keep them in callee memory cells.
+    movss   [rip + pbX], xmm0
+    movss   [rip + pbY], xmm1
+    movss   [rip + pbSpeed], xmm3
+    movss   [rip + pbR], xmm4
+    movss   [rip + pbG], xmm5
+    movss   [rip + pbB], xmm6
+
+    ; r13 = the rotating direction index = ptBurstSeed (advanced each particle).
+    mov     r13d, [rip + ptBurstSeed]
+    xor     r14d, r14d                   ; r14 = particles spawned this burst
+pb_loop:
+    cmp     r14d, r12d
+    jge     pb_seedupd
+    ; pool-full guard.
+    mov     eax, [rip + ptCount]
+    cmp     eax, PT_MAX
+    jae     pb_seedupd
+
+    ; dst pool record = ptPool + ptCount*32.
+    lea     rdi, [rip + ptPool]
+    mov     edx, eax
+    shl     edx, 5                       ; *32
+    add     rdi, rdx                     ; rdi -> the 32-byte record
+
+    ; direction = ptDirTab[(r13 & 15)] : two floats (cos,sin).
+    mov     ebx, r13d
+    and     ebx, 15
+    lea     rsi, [rip + ptDirTab]
+    shl     ebx, 3                       ; *8 bytes (two floats)
+    add     rsi, rbx                     ; rsi -> {cos, sin}
+    ; magnitude = speed * ptSpdTab[(r13 & 7)].
+    mov     ebx, r13d
+    and     ebx, 7
+    lea     rax, [rip + ptSpdTab]
+    movss   xmm2, [rax + rbx*4]          ; jitter multiplier
+    mulss   xmm2, [rip + pbSpeed]        ; xmm2 = magnitude
+
+    ; vx = cos * magnitude ; vy = sin * magnitude.
+    movss   xmm0, [rsi + 0]              ; cos
+    mulss   xmm0, xmm2                   ; vx
+    movss   xmm1, [rsi + 4]              ; sin
+    mulss   xmm1, xmm2                   ; vy
+
+    ; write the record: x,y (spawn) ; vx,vy ; life=1 ; r,g,b. Use only VOLATILE xmm
+    ; (xmm0..xmm5) — xmm6..xmm15 are callee-saved on the Windows x64 ABI, so this proc
+    ; must not clobber them. vx/vy are already stored, so xmm0/xmm2 are free scratch.
+    movss   xmm2, [rip + pbX]
+    movss   [rdi + 0], xmm2             ; x
+    movss   xmm2, [rip + pbY]
+    movss   [rdi + 4], xmm2             ; y
+    movss   [rdi + 8], xmm0             ; vx
+    movss   [rdi + 12], xmm1            ; vy
+    mov     dword ptr [rdi + 16], 0x3F800000  ; life = 1.0f
+    movss   xmm2, [rip + pbR]
+    movss   [rdi + 20], xmm2            ; r
+    movss   xmm2, [rip + pbG]
+    movss   [rdi + 24], xmm2            ; g
+    movss   xmm2, [rip + pbB]
+    movss   [rdi + 28], xmm2            ; b
+
+    ; ptCount++ ; advance the direction index by a stride coprime-ish to 16 (5) so
+    ; the fan spreads instead of clumping; bump r14.
+    mov     eax, [rip + ptCount]
+    inc     eax
+    mov     [rip + ptCount], eax
+    add     r13d, 5
+    inc     r14d
+    jmp     pb_loop
+
+pb_seedupd:
+    ; rotate the per-burst seed by 3 so the next burst starts at a different angle.
+    mov     eax, [rip + ptBurstSeed]
+    add     eax, 3
+    mov     [rip + ptBurstSeed], eax
+pb_done:
+    add     rsp, 8
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtBurstSprite(xmm0=x, xmm1=y, ecx=frameId, edx=gridX, r8d=gridY, xmm3=speed) —
+; shatter a sprite FRAME into a gridX*gridY fan of TEXTURED fragments. (x,y) is the
+; frame's TOP-LEFT in screen px (so the cells tile its w x h footprint over the screen).
+;
+; Reads sprFrameTab[frameId] -> { atlasX@0, atlasY@4, w@8, h@12 } (gpu/sprite.was).
+; Subdivides the frame into a gridX x gridY grid: cell (cx,cy) covers atlas sub-rect
+;   atlasX + cx*(w/gridX), atlasY + cy*(h/gridY), size (w/gridX) x (h/gridY)
+; and spawns one textured particle for it at screen position
+;   x + cx*cellWpx, y + cy*cellHpx                      (cellWpx = w/gridX in px too)
+; with an OUTWARD velocity from the frame CENTRE: the cell-centre offset from the frame
+; centre, normalised-ish and scaled by `speed`, so the sprite bursts apart into its own
+; pixels. life = 1.0; the palette slot is ptBurstSlot. Appends at ptTexCount; pool-full
+; (>= PT_MAX) stops appending safely. NOTE: this is the ONLY proc that reads sprFrameTab,
+; so it is also the only thing that makes this module depend on gpu/sprite.was.
+;
+; record written: { x, y, vx, vy, life, atlasX, atlasY, cellW, cellH, palSlot } (40 B).
+; ===========================================================================
+.globl PtBurstSprite
+PtBurstSprite:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+    sub     rsp, 8
+
+    ; spill the spawn anchor + speed.
+    movss   [rip + pbsX], xmm0
+    movss   [rip + pbsY], xmm1
+    movss   [rip + pbsSpeed], xmm3
+
+    ; not wired to a sprite atlas? (procedural-only build never calls PtSetAtlas.)
+    mov     rax, [rip + ptFrameTab]
+    test    rax, rax
+    jz      pbs_done
+    ; frame-id range guard (read *ptFrameCnt, the sprite.was sprFrameCount).
+    mov     r9, [rip + ptFrameCnt]
+    mov     eax, [r9]
+    cmp     ecx, eax
+    jae     pbs_done
+    ; grid guards (>=1).
+    test    edx, edx
+    jle     pbs_done
+    test    r8d, r8d
+    jle     pbs_done
+
+    mov     r12d, edx                    ; gridX
+    mov     r13d, r8d                    ; gridY
+
+    ; frame record base = ptFrameTab + frameId*16 (ptFrameTab = sprite.was sprFrameTab).
+    mov     rsi, [rip + ptFrameTab]
+    mov     eax, ecx
+    shl     eax, 4
+    add     rsi, rax                     ; rsi -> { atlasX, atlasY, w, h }
+    mov     r14d, [rsi + 0]              ; frame atlasX
+    mov     r15d, [rsi + 4]              ; frame atlasY
+    mov     ebp, [rsi + 8]               ; frame w
+    mov     ebx, [rsi + 12]             ; frame h
+
+    ; cell size in atlas texels = w/gridX, h/gridY (integer; >=1). Same number of px
+    ; on screen (the frame draws at 1:1 here). Store as ints in cell* cells.
+    mov     eax, ebp
+    cdq
+    idiv    r12d                         ; eax = w/gridX
+    test    eax, eax
+    jnz     pbs_cwok
+    mov     eax, 1
+pbs_cwok:
+    mov     [rip + pbsCellW], eax        ; cellW (atlas + px)
+    mov     eax, ebx
+    cdq
+    idiv    r13d                         ; eax = h/gridY
+    test    eax, eax
+    jnz     pbs_chok
+    mov     eax, 1
+pbs_chok:
+    mov     [rip + pbsCellH], eax        ; cellH
+
+    ; frame centre in cells: cx0 = (gridX-1)/2.0, cy0 = (gridY-1)/2.0 (used to push each
+    ; cell outward). Precompute the half extents as floats once.
+    mov     eax, r12d
+    dec     eax
+    cvtsi2ss xmm0, eax
+    mulss   xmm0, [rip + ptHalf]
+    movss   [rip + pbsCx0], xmm0         ; (gridX-1)/2
+    mov     eax, r13d
+    dec     eax
+    cvtsi2ss xmm0, eax
+    mulss   xmm0, [rip + ptHalf]
+    movss   [rip + pbsCy0], xmm0         ; (gridY-1)/2
+
+    ; loop over cells (cy outer, cx inner).
+    xor     r8d, r8d                     ; cy
+pbs_cy:
+    cmp     r8d, r13d
+    jge     pbs_done
+    xor     r9d, r9d                     ; cx
+pbs_cx:
+    cmp     r9d, r12d
+    jge     pbs_cy_next
+
+    ; pool-full guard.
+    mov     eax, [rip + ptTexCount]
+    cmp     eax, PT_MAX
+    jae     pbs_done
+
+    ; dst record = ptTexPool + ptTexCount*40.
+    lea     rdi, [rip + ptTexPool]
+    mov     edx, eax
+    imul    edx, edx, PTX_STRIDE         ; *40
+    add     rdi, rdx                     ; rdi -> the 40-byte record
+
+    ; --- screen pos: x + cx*cellW, y + cy*cellH (px) ---
+    mov     eax, [rip + pbsCellW]
+    imul    eax, r9d                     ; cx*cellW
+    cvtsi2ss xmm0, eax
+    addss   xmm0, [rip + pbsX]           ; screenX
+    movss   [rdi + 0], xmm0
+    mov     eax, [rip + pbsCellH]
+    imul    eax, r8d                     ; cy*cellH
+    cvtsi2ss xmm0, eax
+    addss   xmm0, [rip + pbsY]           ; screenY
+    movss   [rdi + 4], xmm0
+
+    ; --- outward velocity: dir = (cx - cx0, cy - cy0) * speed ; a touch of upward
+    ;     bias so gravity arcs them like the brick shatter (matches PtBurst feel). ---
+    cvtsi2ss xmm0, r9d                   ; cx
+    subss   xmm0, [rip + pbsCx0]         ; dx (cells from centre)
+    mulss   xmm0, [rip + pbsSpeed]       ; vx
+    movss   [rdi + 8], xmm0
+    cvtsi2ss xmm1, r8d                   ; cy
+    subss   xmm1, [rip + pbsCy0]         ; dy
+    mulss   xmm1, [rip + pbsSpeed]       ; vy
+    subss   xmm1, [rip + pbsSpeed]       ; - speed : initial upward kick (arc up then fall)
+    movss   [rdi + 12], xmm1
+
+    ; --- life = 1.0 ---
+    mov     dword ptr [rdi + 16], 0x3F800000
+
+    ; --- atlas sub-rect: atlasX + cx*cellW, atlasY + cy*cellH, cellW, cellH (floats) ---
+    mov     eax, [rip + pbsCellW]
+    imul    eax, r9d
+    add     eax, r14d                    ; atlasX + cx*cellW
+    cvtsi2ss xmm0, eax
+    movss   [rdi + 20], xmm0
+    mov     eax, [rip + pbsCellH]
+    imul    eax, r8d
+    add     eax, r15d                    ; atlasY + cy*cellH
+    cvtsi2ss xmm0, eax
+    movss   [rdi + 24], xmm0
+    cvtsi2ss xmm0, dword ptr [rip + pbsCellW]
+    movss   [rdi + 28], xmm0             ; cellW
+    cvtsi2ss xmm0, dword ptr [rip + pbsCellH]
+    movss   [rdi + 32], xmm0             ; cellH
+
+    ; --- palette slot (float) ---
+    cvtsi2ss xmm0, dword ptr [rip + ptBurstSlot]
+    movss   [rdi + 36], xmm0
+
+    ; ptTexCount++.
+    mov     eax, [rip + ptTexCount]
+    inc     eax
+    mov     [rip + ptTexCount], eax
+
+    inc     r9d
+    jmp     pbs_cx
+pbs_cy_next:
+    inc     r8d
+    jmp     pbs_cy
+pbs_done:
+    add     rsp, 8
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtUpdate — advance every live particle one frame:
+;   x += vx ; y += vy ; vy += ptGravity ; life -= ptFade ;
+; then COMPACT: if life <= 0 drop the particle by copying the LAST live particle
+; into its slot and shrinking ptCount (the live prefix stays tight, order is not
+; preserved — fine for debris). Call once per frame before PtDraw.
+; ===========================================================================
+.globl PtUpdate
+PtUpdate:
+    push    rbx
+    push    rsi
+    push    rdi
+    ; gravity/fade are reloaded from memory each iteration into VOLATILE xmm (xmm5) —
+    ; xmm6..xmm15 are callee-saved on the Windows x64 ABI; this proc must preserve them.
+    xor     ebx, ebx                     ; i = 0
+pud_loop:
+    cmp     ebx, [rip + ptCount]
+    jge     pud_done
+
+    lea     rdi, [rip + ptPool]
+    mov     eax, ebx
+    shl     eax, 5                       ; i*32
+    add     rdi, rax                     ; rdi -> particle i
+
+    ; x += vx ; y += vy.
+    movss   xmm0, [rdi + 0]
+    addss   xmm0, [rdi + 8]
+    movss   [rdi + 0], xmm0
+    movss   xmm1, [rdi + 4]
+    addss   xmm1, [rdi + 12]
+    movss   [rdi + 4], xmm1
+    ; vy += gravity.
+    movss   xmm2, [rdi + 12]
+    addss   xmm2, [rip + ptGravity]
+    movss   [rdi + 12], xmm2
+    ; life -= fade.
+    movss   xmm3, [rdi + 16]
+    subss   xmm3, [rip + ptFade]
+    movss   [rdi + 16], xmm3
+
+    ; dead? life <= 0 -> compact (copy the last live particle into slot i, shrink).
+    xorps   xmm4, xmm4
+    comiss  xmm3, xmm4                   ; life > 0 ?
+    ja      pud_next                      ; alive -> keep, advance i
+
+    ; copy ptPool[(ptCount-1)] into slot i (32 bytes), then ptCount--.
+    mov     eax, [rip + ptCount]
+    dec     eax
+    mov     [rip + ptCount], eax         ; new live count
+    cmp     ebx, eax
+    jge     pud_loop                      ; i was the last live one -> nothing to move
+    lea     rsi, [rip + ptPool]
+    mov     ecx, eax
+    shl     ecx, 5                       ; (ptCount-1)*32
+    add     rsi, rcx                     ; rsi -> the last live particle
+    ; 32-byte copy (4 qwords) src(rsi) -> dst(rdi); do NOT advance i (re-test slot i).
+    mov     rax, [rsi + 0]
+    mov     [rdi + 0], rax
+    mov     rax, [rsi + 8]
+    mov     [rdi + 8], rax
+    mov     rax, [rsi + 16]
+    mov     [rdi + 16], rax
+    mov     rax, [rsi + 24]
+    mov     [rdi + 24], rax
+    jmp     pud_loop                      ; re-process slot i (now holds the moved one)
+pud_next:
+    inc     ebx
+    jmp     pud_loop
+pud_done:
+    ; ---- advance + compact the TEXTURED pool (40-byte records, life@16). Same
+    ;      gravity/fade; compact by swapping the last live textured particle down. ----
+    xor     ebx, ebx                     ; i = 0
+pudx_loop:
+    cmp     ebx, [rip + ptTexCount]
+    jge     pudx_done
+    lea     rdi, [rip + ptTexPool]
+    mov     eax, ebx
+    imul    eax, eax, PTX_STRIDE         ; i*40
+    add     rdi, rax                     ; rdi -> textured particle i
+
+    ; x += vx ; y += vy.
+    movss   xmm0, [rdi + 0]
+    addss   xmm0, [rdi + 8]
+    movss   [rdi + 0], xmm0
+    movss   xmm1, [rdi + 4]
+    addss   xmm1, [rdi + 12]
+    movss   [rdi + 4], xmm1
+    ; vy += gravity.
+    movss   xmm2, [rdi + 12]
+    addss   xmm2, [rip + ptGravity]
+    movss   [rdi + 12], xmm2
+    ; life -= fade.
+    movss   xmm3, [rdi + 16]
+    subss   xmm3, [rip + ptFade]
+    movss   [rdi + 16], xmm3
+
+    xorps   xmm4, xmm4
+    comiss  xmm3, xmm4                   ; life > 0 ?
+    ja      pudx_next
+
+    ; dead -> copy the last live textured particle into slot i (40 bytes), shrink.
+    mov     eax, [rip + ptTexCount]
+    dec     eax
+    mov     [rip + ptTexCount], eax
+    cmp     ebx, eax
+    jge     pudx_loop                    ; i was the last -> nothing to move
+    lea     rsi, [rip + ptTexPool]
+    mov     ecx, eax
+    imul    ecx, ecx, PTX_STRIDE         ; (ptTexCount-1)*40
+    add     rsi, rcx                     ; rsi -> the last live textured particle
+    ; 40-byte copy (5 qwords) src(rsi) -> dst(rdi).
+    mov     rax, [rsi + 0]
+    mov     [rdi + 0], rax
+    mov     rax, [rsi + 8]
+    mov     [rdi + 8], rax
+    mov     rax, [rsi + 16]
+    mov     [rdi + 16], rax
+    mov     rax, [rsi + 24]
+    mov     [rdi + 24], rax
+    mov     rax, [rsi + 32]
+    mov     [rdi + 32], rax
+    jmp     pudx_loop                    ; re-process slot i
+pudx_next:
+    inc     ebx
+    jmp     pudx_loop
+pudx_done:
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtBuild — fill ptInstData with one 28-byte instance per live particle from the
+; pool. Instance = { x, y, size, r, g, b, alpha } where alpha = life (clamped 0..1,
+; the PS multiplies the radial falloff by it so particles FADE as they die). The
+; quad size is the global ptSize. Internal (PtDraw calls it).
+; ===========================================================================
+PtBuild:
+    push    rbx
+    push    rsi
+    push    rdi
+    ; ptSize is reloaded each instance into a VOLATILE xmm (xmm2) — xmm6..xmm15 are
+    ; callee-saved on the Windows x64 ABI; this proc must not clobber them.
+    xor     ebx, ebx                     ; i
+ptb_loop:
+    cmp     ebx, [rip + ptCount]
+    jge     ptb_done
+    lea     rsi, [rip + ptPool]
+    mov     eax, ebx
+    shl     eax, 5                       ; i*32
+    add     rsi, rax                     ; rsi -> pool particle i
+    lea     rdi, [rip + ptInstData]
+    mov     eax, ebx
+    imul    eax, eax, PT_INST            ; i*28
+    add     rdi, rax                     ; rdi -> instance i
+
+    ; x,y straight across.
+    movss   xmm0, [rsi + 0]
+    movss   [rdi + 0], xmm0              ; x
+    movss   xmm0, [rsi + 4]
+    movss   [rdi + 4], xmm0              ; y
+    movss   xmm2, [rip + ptSize]
+    movss   [rdi + 8], xmm2             ; size
+    ; r,g,b.
+    movss   xmm0, [rsi + 20]
+    movss   [rdi + 12], xmm0            ; r
+    movss   xmm0, [rsi + 24]
+    movss   [rdi + 16], xmm0            ; g
+    movss   xmm0, [rsi + 28]
+    movss   [rdi + 20], xmm0            ; b
+    ; alpha = saturate(life).
+    movss   xmm0, [rsi + 16]            ; life
+    xorps   xmm1, xmm1
+    maxss   xmm0, xmm1                  ; max(life,0)
+    movss   xmm1, [rip + ptOneF]
+    minss   xmm0, xmm1                  ; min(.,1)
+    movss   [rdi + 24], xmm0           ; alpha
+    inc     ebx
+    jmp     ptb_loop
+ptb_done:
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtUpload — copy ptInstData (ptCount*28 bytes) into the dynamic instance VB via
+; Map(WRITE_DISCARD)/memcpy/Unmap. Internal (PtDraw calls it after PtBuild).
+; ===========================================================================
+PtUpload:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    pContext.Map([rip + pPtInstVB], 0, 4, 0, ptMapped)  ; D3D11_MAP_WRITE_DISCARD
+    test    eax, eax
+    js      ptu_done                     ; Map failed -> skip safely
+
+    mov     rdi, [rip + ptMapped + 0]    ; dst (GPU)
+    lea     rsi, [rip + ptInstData]      ; src
+    mov     ecx, [rip + ptCount]
+    imul    ecx, ecx, PT_INST            ; *28 = byte count
+    test    ecx, ecx
+    jz      ptu_unmap
+ptu_cpy:
+    mov     al, [rsi]
+    mov     [rdi], al
+    inc     rsi
+    inc     rdi
+    dec     ecx
+    jnz     ptu_cpy
+ptu_unmap:
+    pContext.Unmap([rip + pPtInstVB], 0)
+ptu_done:
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtxBuild — fill ptxInstData with one 32-byte sprite-style instance per live textured
+; particle from ptTexPool. Instance = { x, y, atlasX, atlasY, w, h, palSlot, alpha }
+; with alpha = saturate(life). Internal (PtDraw calls it).
+; ===========================================================================
+PtxBuild:
+    push    rbx
+    push    rsi
+    push    rdi
+    xor     ebx, ebx                     ; i
+ptxb_loop:
+    cmp     ebx, [rip + ptTexCount]
+    jge     ptxb_done
+    lea     rsi, [rip + ptTexPool]
+    mov     eax, ebx
+    imul    eax, eax, PTX_STRIDE         ; i*40
+    add     rsi, rax                     ; rsi -> pool particle i
+    lea     rdi, [rip + ptxInstData]
+    mov     eax, ebx
+    imul    eax, eax, PTX_INST           ; i*32
+    add     rdi, rax                     ; rdi -> instance i
+
+    ; x, y straight across.
+    movss   xmm0, [rsi + 0]
+    movss   [rdi + 0], xmm0              ; x
+    movss   xmm0, [rsi + 4]
+    movss   [rdi + 4], xmm0              ; y
+    ; atlasX, atlasY (already floats in the pool).
+    movss   xmm0, [rsi + 20]
+    movss   [rdi + 8], xmm0             ; atlasX
+    movss   xmm0, [rsi + 24]
+    movss   [rdi + 12], xmm0            ; atlasY
+    ; w, h.
+    movss   xmm0, [rsi + 28]
+    movss   [rdi + 16], xmm0           ; w
+    movss   xmm0, [rsi + 32]
+    movss   [rdi + 20], xmm0           ; h
+    ; palette slot.
+    movss   xmm0, [rsi + 36]
+    movss   [rdi + 24], xmm0           ; palSlot
+    ; alpha = saturate(life).
+    movss   xmm0, [rsi + 16]           ; life
+    xorps   xmm1, xmm1
+    maxss   xmm0, xmm1
+    movss   xmm1, [rip + ptOneF]
+    minss   xmm0, xmm1
+    movss   [rdi + 28], xmm0          ; alpha
+    inc     ebx
+    jmp     ptxb_loop
+ptxb_done:
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtxUpload — copy ptxInstData (ptTexCount*32 bytes) into the textured dynamic
+; instance VB via Map(WRITE_DISCARD)/memcpy/Unmap. Internal (PtDraw calls it).
+; ===========================================================================
+PtxUpload:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    pContext.Map([rip + pPtxInstVB], 0, 4, 0, ptxMapped)  ; D3D11_MAP_WRITE_DISCARD
+    test    eax, eax
+    js      ptxu_done                    ; Map failed -> skip safely
+
+    mov     rdi, [rip + ptxMapped + 0]   ; dst (GPU)
+    lea     rsi, [rip + ptxInstData]      ; src
+    mov     ecx, [rip + ptTexCount]
+    imul    ecx, ecx, PTX_INST           ; *32 = byte count
+    test    ecx, ecx
+    jz      ptxu_unmap
+ptxu_cpy:
+    mov     al, [rsi]
+    mov     [rdi], al
+    inc     rsi
+    inc     rdi
+    dec     ecx
+    jnz     ptxu_cpy
+ptxu_unmap:
+    pContext.Unmap([rip + pPtxInstVB], 0)
+ptxu_done:
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtDraw(rcx=dstRTV) — build the instance records, upload them, then draw ALL live
+; particles onto dstRTV in ONE DrawInstanced call. Binds the input layout, the
+; dynamic instance VB (slot 0, stride 28), the particle VS/PS, the ADDITIVE blend
+; state, TRIANGLESTRIP topology, DrawInstanced(4, ptCount, 0, 0).
+;
+; The caller has set dstRTV up (the composited back buffer) + the matching viewport;
+; we re-bind the RT here too so the particle pass writes into it. No SRVs (procedural).
+; If ptCount is 0 the DrawInstanced draws nothing — harmless.
+; ===========================================================================
+.globl PtDraw
+PtDraw:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+
+    mov     rdi, rcx                     ; dstRTV
+
+    call    PtBuild
+    call    PtUpload
+
+    ; bind the dst RT.
+    mov     [rip + ptRTVTmp], rdi
+    pContext.OMSetRenderTargets(1, ptRTVTmp, 0)
+
+    ; input layout + instance VB (slot 0, stride 28, offset 0).
+    pContext.IASetInputLayout([rip + pPtLayout])
+    mov     rax, [rip + pPtInstVB]
+    mov     [rip + ptVBArr], rax
+    pContext.IASetVertexBuffers(0, 1, ptVBArr, ptStride, ptOffset)
+
+    ; shaders + raster.
+    pContext.VSSetShader([rip + pPtVS], 0, 0)
+    pContext.PSSetShader([rip + pPtPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+
+    ; the ADDITIVE blend state (SRC_ALPHA / ONE).
+    pContext.OMSetBlendState([rip + pPtBlendAdd], blendFactor, 0xFFFFFFFF)
+
+    ; TRIANGLESTRIP (4 verts -> a quad).
+    pContext.IASetPrimitiveTopology(5)
+    ; DrawInstanced(VertexCountPerInstance=4, InstanceCount=ptCount, 0, 0).
+    mov     eax, [rip + ptCount]
+    mov     qword ptr [rip + ptDrawCount], 0
+    mov     [rip + ptDrawCount], eax
+    pContext.DrawInstanced(4, [rip + ptDrawCount], 0, 0)
+
+    ; ===================== TEXTURED fragment pass =====================
+    ; Draw the sprite-shatter fragments over the same RT with the SECOND shader +
+    ; the sprite atlas/palette SRVs + the alpha-over blend (solid pixels, not glow).
+    ; Skip entirely when no textured particles are live, so a procedural-only game
+    ; never touches gpu/sprite.was's SRVs (and need not include it).
+    mov     eax, [rip + ptTexCount]
+    test    eax, eax
+    jz      ptd_done
+
+    call    PtxBuild
+    call    PtxUpload
+
+    ; RT is still bound from the procedural pass; re-bind layout + the textured VB.
+    pContext.IASetInputLayout([rip + pPtxLayout])
+    mov     rax, [rip + pPtxInstVB]
+    mov     [rip + ptxVBArr], rax
+    pContext.IASetVertexBuffers(0, 1, ptxVBArr, ptxStride, ptxOffset)
+
+    ; textured shaders + raster.
+    pContext.VSSetShader([rip + pPtxVS], 0, 0)
+    pContext.PSSetShader([rip + pPtxPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+
+    ; sprite atlas SRV at t0, palette SRV at t1 (set by PtSetAtlas from gpu/sprite.was's
+    ; pSprSRVatlas/pSprSRVpal — held in LOCAL cells so this module stays self-contained).
+    mov     rax, [rip + ptAtlasSRV]
+    mov     [rip + ptxSrvArr + 0], rax
+    mov     rax, [rip + ptPalSRV]
+    mov     [rip + ptxSrvArr + 8], rax
+    pContext.PSSetShaderResources(0, 2, ptxSrvArr)
+
+    ; G1 alpha-over blend (SRC_ALPHA / INV_SRC_ALPHA) — solid sprite pixels.
+    pContext.OMSetBlendState([rip + pBlendAlpha], blendFactor, 0xFFFFFFFF)
+
+    pContext.IASetPrimitiveTopology(5)    ; TRIANGLESTRIP
+    mov     eax, [rip + ptTexCount]
+    mov     qword ptr [rip + ptTexDrawCount], 0
+    mov     [rip + ptTexDrawCount], eax
+    pContext.DrawInstanced(4, [rip + ptTexDrawCount], 0, 0)
+ptd_done:
+
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtClear — drop all particles (ptCount = 0). Optional reset hook for a game over /
+; level restart.
+; ===========================================================================
+.globl PtClear
+PtClear:
+    mov     dword ptr [rip + ptCount], 0
+    mov     dword ptr [rip + ptTexCount], 0
+    ret
+
+.balign 16
+.DATA
+.balign 16
+; PtBurst's per-call spill cells (the spawn point / speed / colour, kept across the
+; spawn loop's xmm reuse).
+pbX     DWORD ?
+pbY     DWORD ?
+pbSpeed DWORD ?
+pbR     DWORD ?
+pbG     DWORD ?
+pbB     DWORD ?
+ptOneF  DWORD 0x3F800000               ; 1.0f
+; PtBurstSprite's per-call spill cells (the spawn anchor / speed / cell size / centre).
+pbsX     DWORD ?
+pbsY     DWORD ?
+pbsSpeed DWORD ?
+pbsCellW DWORD ?                        ; cell width  (atlas texels = screen px)
+pbsCellH DWORD ?                        ; cell height
+pbsCx0   DWORD ?                        ; (gridX-1)/2 as float
+pbsCy0   DWORD ?                        ; (gridY-1)/2 as float
+.balign 16
+ptTailPad QWORD 0                       ; tail padding (keeps the .DATA 16-aligned)

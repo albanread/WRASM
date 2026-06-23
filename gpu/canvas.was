@@ -780,15 +780,15 @@ proc Pset in rcx rdx r8
     add     ecx, [rip + canvasOX]         ; logical -> physical (draw origin)
     add     edx, [rip + canvasOY]
     cmp     ecx, 640                      ; unsigned: a negative x wraps high -> rejected
-    jae     ps_done
+    jae     pset_done
     cmp     edx, 360
-    jae     ps_done
+    jae     pset_done
     mov     eax, edx
     imul    eax, eax, 640
     add     eax, ecx
     lea     r9, [rip + idxBuf]
     mov     [r9 + rax], r8b
-ps_done:
+pset_done:
 endproc
 
 ; ---- Pget(ecx=x, edx=y) -> eax = index (0 if off-screen) ----
@@ -798,15 +798,15 @@ proc Pget in rcx rdx
     add     edx, [rip + canvasOY]
     xor     eax, eax
     cmp     ecx, 640
-    jae     pg_done
+    jae     pget_done
     cmp     edx, 360
-    jae     pg_done
+    jae     pget_done
     mov     eax, edx
     imul    eax, eax, 640
     add     eax, ecx
     lea     r8, [rip + idxBuf]
     movzx   eax, byte ptr [r8 + rax]
-pg_done:
+pget_done:
 endproc
 
 ; ---- HLine(ecx=x, edx=y, r8d=len, r9b=index): clipped horizontal run ----
@@ -919,9 +919,9 @@ endproc
 .globl Rect
 proc Rect uses rbx rsi rdi r12 r13 frame in rcx rdx r8 r9 r10
     test    r8d, r8d
-    jle     rc_done
+    jle     rect_done
     test    r9d, r9d
-    jle     rc_done
+    jle     rect_done
     mov     esi, ecx
     mov     edi, edx
     mov     ebx, r8d
@@ -951,7 +951,7 @@ proc Rect uses rbx rsi rdi r12 r13 frame in rcx rdx r8 r9 r10
     mov     r8d, r12d
     movzx   r9d, r13b
     call    VLine
-rc_done:
+rect_done:
 endproc
 
 ; ---- Line(ecx=x0, edx=y0, r8d=x1, r9d=y1, r10b=index): Bresenham ----

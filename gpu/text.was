@@ -68,6 +68,7 @@
 txtSrc:
 .ASCIISTRING
 Texture2D<uint> fontAtlas:register(t0);
+cbuffer TXF:register(b0){float4 txf;};
 struct VO{float4 p:SV_Position;float2 atl:TEXCOORD0;nointerpolation float3 col:TEXCOORD1;
           nointerpolation float2 org:TEXCOORD2;};
 VO TXVS(uint vid:SV_VertexID,
@@ -80,7 +81,13 @@ VO TXVS(uint vid:SV_VertexID,
   // FillRect clip constants, this NDC transform all share it). Text x,y arrive
   // already biased by the draw origin (gpu/canvas.was Text), so a 320x200 LOGICAL
   // game lands in the centred physical region — same place its fills do.
-  o.p=float4(pos.x/320.0-1.0, 1.0-pos.y/180.0, 0.0, 1.0);
+  // txf transforms pos: txf.xy = scale, txf.zw = offset. Identity = (1,1,0,0)
+  // (the default in pTxtXfCB / txtXform) reproduces the un-scaled placement and
+  // scales the corner*8 glyph size with pos, so callers that never set it (gpu_g4,
+  // gpu_g6) render byte-for-byte as before. brickout_fx sets (1.8,1.8,-256,-144)
+  // to match the WLPS board upscale (idxBuf(160,80)->screen(32,0)).
+  float2 op=pos*txf.xy+txf.zw;
+  o.p=float4(op.x/320.0-1.0, 1.0-op.y/180.0, 0.0, 1.0);
   o.atl=atl+corner*8.0;
   o.col=col;
   o.org=atl;
@@ -124,6 +131,7 @@ comobj pVSBlobX : ID3DBlob
 comobj pPSBlobX : ID3DBlob
 comobj pFontTex : ID3D11Texture2D         ; 128x64 R8_UINT font atlas
 comobj pTxtInstVB : ID3D11Buffer          ; dynamic per-instance vertex buffer
+comobj pTxtXfCB : ID3D11Buffer            ; 16-byte VS transform CB (b0): float4 txf
 
 pTxtVS      QWORD ?
 pTxtPS      QWORD ?
@@ -144,6 +152,12 @@ txtDrawCount QWORD 0
 ; the current text colour (3 floats r,g,b), set by TxtSetColour; default white.
 .balign 16
 txtCol      DWORD 0x3F800000, 0x3F800000, 0x3F800000   ; 1,1,1
+
+; the VS transform float4 txf {scaleX, scaleY, offX, offY}; default IDENTITY
+; (1,1,0,0) so demos that never call TxtSetXform (gpu_g4, gpu_g6) upload identity
+; and render byte-for-byte as before. The upload SOURCE for pTxtXfCB.
+.balign 16
+txtXform    DWORD 0x3F800000, 0x3F800000, 0, 0          ; 1.0, 1.0, 0.0, 0.0
 
 ; per-instance stride (8 floats = 32 bytes) + IASetVertexBuffers stride/offset arrays.
 txtStride   DWORD 32
@@ -189,6 +203,12 @@ sdFont struct D3D11_SUBRESOURCE_DATA
     SysMemPitch = 128
 ends
 
+; initial data for pTxtXfCB = txtXform (identity 1,1,0,0). pSysMem patched at init.
+; Creating the CB WITH this init data means demos that never call TxtSetXform still
+; have an identity transform bound (-> byte-identical text), no setter required.
+sdTxf struct D3D11_SUBRESOURCE_DATA
+ends
+
 ; the DYNAMIC instance vertex buffer: 4096*32 = 131072 bytes, DYNAMIC +
 ; CPU_ACCESS_WRITE + BIND_VERTEX_BUFFER (Map WRITE_DISCARD each frame).
 txvbDesc struct D3D11_BUFFER_DESC
@@ -196,6 +216,15 @@ txvbDesc struct D3D11_BUFFER_DESC
     Usage          = 2                     ; D3D11_USAGE_DYNAMIC
     BindFlags      = 1                     ; D3D11_BIND_VERTEX_BUFFER
     CPUAccessFlags = 0x10000               ; D3D11_CPU_ACCESS_WRITE
+ends
+
+; the VS transform constant buffer: 16 bytes (float4 txf), DEFAULT usage +
+; BIND_CONSTANT_BUFFER (UpdateSubresource'd from txtXform when TxtSetXform runs).
+; Mirrors gpu/wallfx.was's wcbDesc.
+txxfDesc struct D3D11_BUFFER_DESC
+    ByteWidth      = 16
+    Usage          = 0                     ; D3D11_USAGE_DEFAULT
+    BindFlags      = 4                     ; D3D11_BIND_CONSTANT_BUFFER
 ends
 
 .balign 16
@@ -308,6 +337,13 @@ TxtInit:
 
     ; ---- the dynamic instance vertex buffer ----
     pDevice.CreateBuffer(txvbDesc, 0, pTxtInstVB)
+    test    eax, eax
+    js      xi_fail_d3d
+
+    ; ---- the VS transform CB (b0), created WITH identity init data (txtXform) ----
+    lea     rax, [rip + txtXform]
+    mov     [rip + sdTxf + D3D11_SUBRESOURCE_DATA.pSysMem], rax
+    pDevice.CreateBuffer(txxfDesc, sdTxf, pTxtXfCB)
     test    eax, eax
     js      xi_fail_d3d
 
@@ -430,6 +466,28 @@ TxtSetColour:
     cvtsi2ss xmm0, edx
     divss   xmm0, [rip + txtF255]
     movss   [rip + txtCol + 8], xmm0
+    ret
+
+; ===========================================================================
+; TxtSetXform(xmm0=scaleX, xmm1=scaleY, xmm2=offX, xmm3=offY) — set the text VS
+; transform float4 txf {sx, sy, ox, oy}. The VS computes op = pos*txf.xy + txf.zw,
+; so this scales the HUD text to match a scaled board (default IDENTITY (1,1,0,0)
+; leaves placement unchanged; demos that never call this render byte-for-byte as
+; before). Writes txtXform then UpdateSubresource's pTxtXfCB (DEFAULT-usage CB, like
+; gpu/wallfx.was's WallFxRender uploads wallCB). The 4 floats arrive in xmm0..xmm3
+; per the Win64 float ABI — no `proc` register marshalling needed.
+; ===========================================================================
+.globl TxtSetXform
+TxtSetXform:
+    push    rbx
+    sub     rsp, 32
+    movss   [rip + txtXform + 0], xmm0     ; scaleX
+    movss   [rip + txtXform + 4], xmm1     ; scaleY
+    movss   [rip + txtXform + 8], xmm2     ; offX
+    movss   [rip + txtXform + 12], xmm3    ; offY
+    pContext.UpdateSubresource([rip + pTxtXfCB], 0, 0, txtXform, 0, 0)
+    add     rsp, 32
+    pop     rbx
     ret
 
 ; ===========================================================================
@@ -606,6 +664,12 @@ TxtFlush:
     pContext.PSSetShader([rip + pTxtPS], 0, 0)
     pContext.RSSetState([rip + pRast])
 
+    ; bind the transform CB at b0 (default IDENTITY -> unchanged placement; a caller
+    ; may TxtSetXform it to scale the HUD with a scaled board). Stage the ptr (trap #9).
+    mov     rax, [rip + pTxtXfCB]
+    mov     [rip + txtCBArr], rax
+    pContext.VSSetConstantBuffers(0, 1, txtCBArr)
+
     mov     rax, [rip + pTxtSRVfont]
     mov     [rip + txtSrvArr + 0], rax
     pContext.PSSetShaderResources(0, 1, txtSrvArr)
@@ -630,3 +694,4 @@ TxtFlush:
 .balign 16
 txtF255   DWORD 0x437F0000                ; 255.0f
 txtSrvArr QWORD 0                          ; single-element SRV array (t0 = font)
+txtCBArr  QWORD 0                          ; single-element CB array (b0 = txf), trap #9
