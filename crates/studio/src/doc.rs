@@ -758,6 +758,34 @@ impl Doc {
         let t = &line[s..e];
         (t.len() >= 2 && t.chars().all(is_word)).then(|| t.to_string())
     }
+
+    /// Select the byte range `[s, e)` on `row` (used to land on a find match).
+    pub fn select_range(&mut self, row: usize, s: usize, e: usize) {
+        self.goal_col = None;
+        let row = row.min(self.lines.len().saturating_sub(1));
+        self.anchor = Some(Caret { row, col: self.snap(row, s) });
+        self.caret = Caret { row, col: self.snap(row, e) };
+    }
+
+    /// Replace every match of `needle` with `with` in one undo step; returns the
+    /// count. The caret collapses to the top of the buffer.
+    pub fn replace_all(&mut self, needle: &str, with: &str, case_sensitive: bool) -> usize {
+        let hits = self.find_all(needle, case_sensitive);
+        if hits.is_empty() {
+            return 0;
+        }
+        self.push_undo();
+        self.coalescing = false;
+        self.goal_col = None;
+        // Right-to-left (find_all yields row-then-start order) so each replacement
+        // leaves the still-pending, earlier offsets valid as the length changes.
+        for &(row, s, e) in hits.iter().rev() {
+            self.lines[row].replace_range(s..e, with);
+        }
+        self.anchor = None;
+        self.caret = Caret { row: 0, col: 0 };
+        hits.len()
+    }
 }
 
 const INDENT: &str = "  ";
@@ -1219,6 +1247,19 @@ mod tests {
         let mut d = Doc::from_str("a\nb\nc");
         d.select_line(1);
         assert_eq!(d.selected_text().as_deref(), Some("b\n"));
+    }
+
+    #[test]
+    fn replace_all_one_undo_step_and_length_change() {
+        let mut d = Doc::from_str("rax rax\nrbx rax");
+        assert_eq!(d.replace_all("rax", "r10", false), 3);
+        assert_eq!(d.text(), "r10 r10\nrbx r10");
+        d.undo();
+        assert_eq!(d.text(), "rax rax\nrbx rax");
+
+        let mut d = Doc::from_str("a x a x a");
+        assert_eq!(d.replace_all("a", "yyy", false), 3); // grows; right-to-left keeps offsets valid
+        assert_eq!(d.text(), "yyy x yyy x yyy");
     }
 
     #[test]

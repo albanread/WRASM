@@ -64,8 +64,8 @@ mod gui {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F5, VK_F6,
-        VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP, VIRTUAL_KEY,
+        GetKeyState, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F12, VK_F3, VK_F5,
+        VK_F6, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
@@ -148,7 +148,7 @@ mod gui {
     const BYTE_COLOR: u32 = 0x6E_6E_6E; // listing bytes, dim gray
     const GHOST_COLOR: u32 = 0x86_86_86; // expanded ghost asm, gray
     const SELECTION: u32 = 0x26_4F_78; // selection highlight (VS Code blue)
-    const VK_F: VIRTUAL_KEY = VIRTUAL_KEY(0x46); // 'F' (Ctrl+F = search)
+    const VK_F: VIRTUAL_KEY = VIRTUAL_KEY(0x46); // 'F' (Ctrl+F find, Ctrl+Shift+F API)
     const VK_A: VIRTUAL_KEY = VIRTUAL_KEY(0x41);
     const VK_C: VIRTUAL_KEY = VIRTUAL_KEY(0x43);
     const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
@@ -167,6 +167,7 @@ mod gui {
     const CUR_LINE: u32 = 0x1B_1B_24; // current-line highlight (subtle)
     const BRACKET_HL: u32 = 0x3A_5A_3A; // matching-bracket box
     const OCCUR: u32 = 0x2E_34_42; // other occurrences of the word at the caret
+    const FIND_HL: u32 = 0x5A_46_1E; // find-bar match highlight (amber)
 
     // The go-to-label palette.
     const FIND_ITEM_H: f32 = 22.0;
@@ -527,6 +528,35 @@ main:
         /// Multi-click (double = word, triple = line) detection.
         click_count: u32,
         last_click: Option<(std::time::Instant, f32, f32)>,
+
+        /// In-document find/replace bar (Ctrl+F). `fbar_matches` is the live hit
+        /// list; `fbar_idx` is the current one; `fbar_on_replace` is field focus.
+        fbar_open: bool,
+        fbar_needle: String,
+        fbar_replace: String,
+        fbar_matches: Vec<(usize, usize, usize)>,
+        fbar_idx: usize,
+        fbar_on_replace: bool,
+        /// The seeded needle is "selected": the first keystroke replaces it.
+        fbar_fresh: bool,
+    }
+
+    /// Pixel rects of the find-bar widgets, shared by drawing + hit-testing.
+    struct FbarParts {
+        panel: (f32, f32, f32, f32),
+        needle: (f32, f32, f32, f32),
+        replace: (f32, f32, f32, f32),
+        count: (f32, f32, f32, f32),
+        prev: (f32, f32, f32, f32),
+        next: (f32, f32, f32, f32),
+        do_replace: (f32, f32, f32, f32),
+        do_all: (f32, f32, f32, f32),
+        close: (f32, f32, f32, f32),
+    }
+
+    /// Point-in-rect test for `(x, y, w, h)`.
+    fn in_rect(r: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
+        x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
     }
 
     impl App {
@@ -588,6 +618,13 @@ main:
                 find_labels: Vec::new(),
                 click_count: 0,
                 last_click: None,
+                fbar_open: false,
+                fbar_needle: String::new(),
+                fbar_replace: String::new(),
+                fbar_matches: Vec::new(),
+                fbar_idx: 0,
+                fbar_on_replace: false,
+                fbar_fresh: false,
             };
             unsafe { app.build_menu() };
             app.update_title();
@@ -1102,6 +1139,10 @@ main:
             if self.find_active {
                 self.draw_find(target, split, vh);
             }
+            // The find/replace bar overlays the top-right of the editor pane.
+            if self.fbar_open {
+                self.draw_find_bar(target, split);
+            }
 
             let _ = target.EndDraw(None, None);
         }
@@ -1312,14 +1353,20 @@ main:
             render::fill_rect(t, 0.0, 0.0, SRC_X - 4.0, editor_h, 0x18_18_18); // margin bg
             render::fill_rect(t, SRC_X - 4.0, 0.0, 1.0, editor_h, theme::BORDER); // rule
 
-            // Other occurrences of the word at the caret (boxed faintly). Only when
-            // there are at least two, so a unique symbol isn't decorated.
-            let occ: Vec<(usize, usize, usize)> = match self.doc.occurrence_needle() {
-                Some(n) => {
-                    let m = self.doc.find_all(&n, true);
-                    if m.len() >= 2 { m } else { Vec::new() }
-                }
-                None => Vec::new(),
+            // Boxed matches: the find bar's hits when it's open, else other
+            // occurrences of the word at the caret (only when 2+, so a unique
+            // symbol isn't decorated).
+            let (occ, occ_col): (Vec<(usize, usize, usize)>, u32) = if self.fbar_open {
+                (self.fbar_matches.clone(), FIND_HL)
+            } else {
+                let m = match self.doc.occurrence_needle() {
+                    Some(n) => {
+                        let h = self.doc.find_all(&n, true);
+                        if h.len() >= 2 { h } else { Vec::new() }
+                    }
+                    None => Vec::new(),
+                };
+                (m, OCCUR)
             };
 
             let rows = self.row_layout();
@@ -1370,14 +1417,14 @@ main:
                     }
                 }
 
-                // Other-occurrence boxes (under the selection + text).
+                // Match boxes (find hits / word occurrences), under selection + text.
                 for &(_, ms, me) in occ.iter().filter(|m| m.0 == row) {
                     let a = ms.min(line.len());
                     let b = me.min(line.len());
                     let ox = SRC_X + measure(&line[..a]);
                     if ox <= text_right {
                         let ow = (measure(&line[..b]) - measure(&line[..a])).max(2.0);
-                        render::fill_rect(t, ox, sy, ow, LINE_H, OCCUR);
+                        render::fill_rect(t, ox, sy, ow, LINE_H, occ_col);
                     }
                 }
 
@@ -1512,7 +1559,7 @@ main:
             let (tx, ty) = (bx + 8.0, by + (bh - 15.0) * 0.5);
             if self.search.is_empty() && !self.search_active {
                 render::draw_text(
-                    t, tx, ty, bw - 16.0, 18.0, "Search the Windows API…  (Ctrl+F)",
+                    t, tx, ty, bw - 16.0, 18.0, "Search the Windows API…  (Ctrl+Shift+F)",
                     theme::BODY_FONT, 13.0, false, true, theme::TEXT_DIM, false,
                 );
             } else {
@@ -1578,6 +1625,141 @@ main:
         fn find_layout(&self, split: f32) -> (f32, f32, f32) {
             let w = (split - 60.0).clamp(180.0, 460.0);
             (((split - w) * 0.5).max(8.0), 54.0, w)
+        }
+
+        /// Pixel layout of the find-bar overlay (top-right of the editor pane).
+        fn fbar_parts(&self, split: f32) -> FbarParts {
+            let pad = 8.0;
+            let w = (split - 24.0).clamp(248.0, 430.0);
+            let x = (split - w - 12.0).max(8.0);
+            let y = 8.0;
+            let rh = 24.0;
+            let gap = 6.0;
+            let ph = pad + rh + gap + rh + pad;
+            let r1 = y + pad;
+            let r2 = r1 + rh + gap;
+            // Row 1 right cluster: [count] [prev] [next] [x].
+            let close = (x + w - pad - 14.0, r1 + 4.0, 14.0, 14.0);
+            let next = (close.0 - 5.0 - 18.0, r1, 18.0, rh);
+            let prev = (next.0 - 2.0 - 18.0, r1, 18.0, rh);
+            let count = (prev.0 - 6.0 - 52.0, r1, 52.0, rh);
+            let needle = (x + pad, r1, count.0 - 6.0 - (x + pad), rh);
+            // Row 2: [replace field] [Replace] [All].
+            let do_all = (x + w - pad - 38.0, r2, 38.0, rh);
+            let do_replace = (do_all.0 - 5.0 - 60.0, r2, 60.0, rh);
+            let replace = (x + pad, r2, do_replace.0 - 6.0 - (x + pad), rh);
+            FbarParts {
+                panel: (x, y, w, ph),
+                needle,
+                replace,
+                count,
+                prev,
+                next,
+                do_replace,
+                do_all,
+                close,
+            }
+        }
+
+        /// A text input field with a 1px border (brighter when focused) and a
+        /// caret; shows `placeholder` dimmed when empty.
+        unsafe fn draw_field(
+            &self,
+            t: &ID2D1RenderTarget,
+            r: (f32, f32, f32, f32),
+            text: &str,
+            placeholder: &str,
+            focused: bool,
+        ) {
+            let (fx, fy, fw, fh) = r;
+            render::fill_rect(t, fx, fy, fw, fh, theme::SIDEBAR_BG);
+            let bd = if focused { theme::LINK } else { theme::BORDER };
+            render::fill_rect(t, fx, fy, fw, 1.0, bd);
+            render::fill_rect(t, fx, fy + fh - 1.0, fw, 1.0, bd);
+            render::fill_rect(t, fx, fy, 1.0, fh, bd);
+            render::fill_rect(t, fx + fw - 1.0, fy, 1.0, fh, bd);
+            let sz = EDITOR_SIZE * 0.9;
+            let (s, col) = if text.is_empty() {
+                (placeholder, theme::TEXT_DIM)
+            } else {
+                (text, theme::TEXT_BRIGHT)
+            };
+            render::draw_text(t, fx + 6.0, fy + 2.0, fw - 12.0, fh, s, EDITOR_FONT, sz, false, false, col, false);
+            if focused {
+                let tw = render::measure_text(text, EDITOR_FONT, sz, false, false).min(fw - 14.0);
+                render::fill_rect(t, fx + 6.0 + tw + 1.0, fy + 3.0, 1.5, fh - 6.0, CARET_COLOR);
+            }
+        }
+
+        /// A small labelled button.
+        unsafe fn draw_button(&self, t: &ID2D1RenderTarget, r: (f32, f32, f32, f32), label: &str) {
+            let (bx, by, bw, bh) = r;
+            render::fill_rect(t, bx, by, bw, bh, theme::SIDEBAR_SEL);
+            render::draw_text(
+                t, bx, by + 2.0, bw, bh, label, EDITOR_FONT, EDITOR_SIZE * 0.82, false, false,
+                theme::TEXT_BRIGHT, true,
+            );
+        }
+
+        /// Draw the in-document find/replace bar (Ctrl+F).
+        unsafe fn draw_find_bar(&self, t: &ID2D1RenderTarget, split: f32) {
+            let p = self.fbar_parts(split);
+            let (px, py, pw, ph) = p.panel;
+            render::fill_rect(t, px - 1.0, py - 1.0, pw + 2.0, ph + 2.0, SPLIT_GLOW);
+            render::fill_rect(t, px, py, pw, ph, PALETTE_BG);
+
+            self.draw_field(t, p.needle, &self.fbar_needle, "Find  (Ctrl+Shift+F = API)", !self.fbar_on_replace);
+            self.draw_field(t, p.replace, &self.fbar_replace, "Replace", self.fbar_on_replace);
+
+            let count = if self.fbar_needle.is_empty() {
+                String::new()
+            } else if self.fbar_matches.is_empty() {
+                "0/0".to_string()
+            } else {
+                format!("{}/{}", self.fbar_idx + 1, self.fbar_matches.len())
+            };
+            let ccol = if self.fbar_matches.is_empty() && !self.fbar_needle.is_empty() {
+                diag_color(studio::lang::Severity::Error)
+            } else {
+                theme::TEXT_DIM
+            };
+            render::draw_text(
+                t, p.count.0, p.count.1 + 2.0, p.count.2, p.count.3, &count, EDITOR_FONT,
+                EDITOR_SIZE * 0.82, false, false, ccol, false,
+            );
+            self.draw_button(t, p.prev, "\u{25B2}"); // ▲ previous
+            self.draw_button(t, p.next, "\u{25BC}"); // ▼ next
+            self.draw_button(t, p.do_replace, "Replace");
+            self.draw_button(t, p.do_all, "All");
+            render::draw_text(
+                t, p.close.0, p.close.1 - 1.0, p.close.2, p.close.3, "\u{2715}", EDITOR_FONT,
+                EDITOR_SIZE * 0.9, false, false, theme::TEXT_DIM, false,
+            );
+        }
+
+        /// Handle a click inside the find bar. Returns true if it hit a widget.
+        fn fbar_click(&mut self, x: f32, y: f32, split: f32) -> bool {
+            let p = self.fbar_parts(split);
+            if !in_rect(p.panel, x, y) {
+                return false;
+            }
+            if in_rect(p.close, x, y) {
+                self.fbar_open = false;
+            } else if in_rect(p.needle, x, y) {
+                self.fbar_on_replace = false;
+            } else if in_rect(p.replace, x, y) {
+                self.fbar_on_replace = true;
+            } else if in_rect(p.prev, x, y) {
+                self.fbar_step(true);
+            } else if in_rect(p.next, x, y) {
+                self.fbar_step(false);
+            } else if in_rect(p.do_replace, x, y) {
+                self.fbar_replace_one();
+            } else if in_rect(p.do_all, x, y) {
+                self.fbar_replace_all();
+            }
+            self.invalidate();
+            true
         }
 
         /// Draw the palette: a filter header over a colour-coded list — blue for
@@ -1677,9 +1859,145 @@ main:
             true
         }
 
+        // ── in-document find / replace bar (Ctrl+F) ────────────────────────────
+
+        /// Open the find bar, seeding the needle from the selection (single line)
+        /// or the word at the caret, and recompute matches.
+        fn fbar_open(&mut self) {
+            match self.doc.selected_text() {
+                Some(sel) if !sel.is_empty() && !sel.contains('\n') => self.fbar_needle = sel,
+                _ if self.fbar_needle.is_empty() => {
+                    if let Some(w) = self.doc.occurrence_needle() {
+                        self.fbar_needle = w;
+                    }
+                }
+                _ => {}
+            }
+            self.fbar_open = true;
+            self.fbar_on_replace = false;
+            self.fbar_fresh = !self.fbar_needle.is_empty(); // seed is "selected"
+            self.search_active = false;
+            self.find_active = false;
+            self.fbar_recompute(true);
+            self.fbar_select_current(); // land on the nearest match
+            self.invalidate();
+        }
+
+        /// Recompute the match list (case-insensitive). When `seek`, point the
+        /// current index at the first match on/after the caret.
+        fn fbar_recompute(&mut self, seek: bool) {
+            self.fbar_matches = if self.fbar_needle.is_empty() {
+                Vec::new()
+            } else {
+                self.doc.find_all(&self.fbar_needle, false)
+            };
+            if self.fbar_matches.is_empty() {
+                self.fbar_idx = 0;
+            } else if seek {
+                // Seek from the selection start (stable as the needle grows) or the caret.
+                let c = self.doc.selection().map(|(s, _)| s).unwrap_or(self.doc.caret);
+                self.fbar_idx = self
+                    .fbar_matches
+                    .iter()
+                    .position(|&(r, s, _)| (r, s) >= (c.row, c.col))
+                    .unwrap_or(0);
+            } else {
+                self.fbar_idx = self.fbar_idx.min(self.fbar_matches.len() - 1);
+            }
+        }
+
+        /// Step to the next (or previous) match and select it.
+        fn fbar_step(&mut self, back: bool) {
+            let n = self.fbar_matches.len();
+            if n == 0 {
+                return;
+            }
+            self.fbar_idx = if back { (self.fbar_idx + n - 1) % n } else { (self.fbar_idx + 1) % n };
+            self.fbar_fresh = false; // navigating commits the seed
+            self.fbar_select_current();
+        }
+
+        /// Select the current match and scroll it into view.
+        fn fbar_select_current(&mut self) {
+            if let Some(&(r, s, e)) = self.fbar_matches.get(self.fbar_idx) {
+                self.doc.select_range(r, s, e);
+                self.ensure_caret_visible();
+                self.invalidate();
+            }
+        }
+
+        /// Replace the current match, then settle on the next one.
+        fn fbar_replace_one(&mut self) {
+            if let Some(&(r, s, e)) = self.fbar_matches.get(self.fbar_idx) {
+                self.doc.select_range(r, s, e);
+                self.doc.insert(&self.fbar_replace);
+                self.after_edit();
+                self.fbar_recompute(false);
+                if !self.fbar_matches.is_empty() {
+                    self.fbar_idx %= self.fbar_matches.len();
+                    self.fbar_select_current();
+                }
+                self.invalidate();
+            }
+        }
+
+        /// Replace every match in one undo step.
+        fn fbar_replace_all(&mut self) {
+            let n = self.doc.replace_all(&self.fbar_needle, &self.fbar_replace, false);
+            if n > 0 {
+                self.after_edit();
+                self.fbar_recompute(true);
+                self.notice = format!("replaced {n}");
+            }
+            self.invalidate();
+        }
+
         /// A printable / editing character from WM_CHAR — routed to the search box
         /// when it has focus, otherwise to the editor.
         fn on_char(&mut self, ch: u32) {
+            // Find bar: type into the focused field; Enter steps (or replaces);
+            // Esc closes. Navigation keys are handled in on_key.
+            if self.fbar_open {
+                match ch {
+                    0x1b => self.fbar_open = false,
+                    0x09 => {} // Tab switches field, handled in on_key
+                    0x0d => {
+                        if self.fbar_on_replace {
+                            self.fbar_replace_one();
+                        } else {
+                            self.fbar_step(false);
+                        }
+                    }
+                    0x08 => {
+                        if self.fbar_on_replace {
+                            self.fbar_replace.pop();
+                        } else {
+                            self.fbar_fresh = false;
+                            self.fbar_needle.pop();
+                            self.fbar_recompute(true);
+                            self.fbar_select_current();
+                        }
+                    }
+                    c if c >= 0x20 && c != 0x7f => {
+                        if let Some(c) = char::from_u32(c) {
+                            if self.fbar_on_replace {
+                                self.fbar_replace.push(c);
+                            } else {
+                                if self.fbar_fresh {
+                                    self.fbar_needle.clear(); // first keystroke replaces the seed
+                                    self.fbar_fresh = false;
+                                }
+                                self.fbar_needle.push(c);
+                                self.fbar_recompute(true);
+                                self.fbar_select_current(); // live-jump to the nearest match
+                            }
+                        }
+                    }
+                    _ => return,
+                }
+                self.invalidate();
+                return;
+            }
             // Go-to-label palette: typing filters; Enter jumps; Esc closes.
             if self.find_active {
                 match ch {
@@ -1753,6 +2071,20 @@ main:
 
         /// A navigation / command key from WM_KEYDOWN. Returns true if handled.
         fn on_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> bool {
+            // Find bar focused: nav keys act, everything else is swallowed (text +
+            // Enter + Backspace arrive via WM_CHAR / on_char).
+            if self.fbar_open {
+                match vk {
+                    VK_ESCAPE => self.fbar_open = false,
+                    VK_TAB => self.fbar_on_replace = !self.fbar_on_replace,
+                    VK_UP => self.fbar_step(true),
+                    VK_DOWN => self.fbar_step(false),
+                    VK_F3 => self.fbar_step(shift), // Shift+F3 = previous
+                    _ => {}
+                }
+                self.invalidate();
+                return true;
+            }
             // Go-to-label palette: arrows move the selection, Esc closes; all
             // keys are swallowed (text + Enter arrive via WM_CHAR / on_char).
             if self.find_active {
@@ -1836,7 +2168,8 @@ main:
                     VK_D => return self.edit(|d| d.duplicate_line()),
                     VK_K if shift => return self.edit(|d| d.delete_line()),
                     VK_SLASH => return self.edit(|d| d.toggle_comment()),
-                    VK_F => self.search_active = true,
+                    VK_F if shift => self.search_active = true, // API knowledge search
+                    VK_F => self.fbar_open(),                   // in-document find
                     VK_G => self.find_open(),
                     VK_A => self.doc.select_all(),
                     VK_C => self.clipboard_copy(),
@@ -2245,6 +2578,13 @@ main:
         /// the selection from the current caret. Ctrl+click over an equate jumps
         /// to its definition (go-to-definition).
         fn on_press(&mut self, x: f32, y: f32, shift: bool, ctrl: bool) {
+            // Find bar overlays the editor's top-right; its widgets take clicks first.
+            if self.fbar_open {
+                let split = self.split_x(self.viewport().0);
+                if self.fbar_click(x, y, split) {
+                    return;
+                }
+            }
             // Go-to-label palette open: a click on a row jumps there; a click
             // anywhere else dismisses it.
             if self.find_active {
@@ -2530,6 +2870,9 @@ main:
             "pageup" | "prior" => 0x21,
             "pagedown" | "next" => 0x22,
             "/" | "slash" => 0xBF, // VK_OEM_2
+            s if s.starts_with('f') && s[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)) => {
+                0x6F + s[1..].parse::<u16>().unwrap() // F1=0x70 .. F12=0x7B
+            }
             s if s.len() == 1 => s.chars().next().unwrap().to_ascii_uppercase() as u16,
             _ => return None,
         };
@@ -2707,6 +3050,15 @@ main:
         r.register("caret-col", Arity::exact(0), |_, _| {
             Ok(Value::new(with_app(|app| app.doc.caret.col.to_string())))
         });
+        r.register("selection", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.doc.selected_text().unwrap_or_default())))
+        });
+        r.register("fbar-count", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.fbar_matches.len().to_string())))
+        });
+        r.register("fbar-needle", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.fbar_needle.clone())))
+        });
         r.register("notice", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.notice.clone()))));
         r.register("card-md", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.card_md.clone()))));
         r.register("split-frac", Arity::exact(0), |_, _| {
@@ -2791,7 +3143,8 @@ TCL UI SCRIPTING (--script / --exec)
     * expr is integer-only here — use literal numbers for coordinates
     * use forward slashes in paths (TCL treats backslash as an escape)
     * an assert* failure exits non-zero, so scripts double as UI tests
-    * editor shortcuts: Ctrl+G = go-to-label palette, Ctrl+F = Windows API search
+    * editor shortcuts: Ctrl+F = find in file, Ctrl+Shift+F = Windows API search,
+      Ctrl+G = go-to-label palette
 
   input     type \"text\"            type characters into the editor
             key NAME               one key: Enter Backspace Delete Tab Escape
