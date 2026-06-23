@@ -94,7 +94,13 @@ pub enum Request {
     /// buffer's `comobj` name→interface bindings (for typed-pointer completion).
     Complete { id: u64, line: String, cursor: usize, binds: Vec<(String, String)> },
     /// Tooltip for the token under the caret (`line` at byte offset `cursor`).
-    Hover { id: u64, line: String, cursor: usize },
+    /// `equates` are the buffer's user-defined equates (name → expr/value/line);
+    /// a hovered equate name renders its own tip and takes precedence over the
+    /// winkb constant lookup. Mirrors how [`Request::Complete`] carries `binds`.
+    Hover { id: u64, line: String, cursor: usize, equates: Vec<was::EquateDef> },
+    /// The buffer's user-defined equates — the editor caches these (it has no
+    /// `Kb` of its own) to drive equate hover and go-to-definition.
+    Equates { id: u64, src: String },
     /// Signature help for an `invoke` at `line`/`cursor`.
     Signature { id: u64, line: String, cursor: usize },
     /// The machine-code bytes for a single source line (the live-bytes view).
@@ -121,6 +127,8 @@ pub enum Response {
     Completions { id: u64, items: Vec<Completion>, replace_start: usize },
     /// Hover / signature tooltip markdown, or `None` if there's nothing to show.
     Tip { id: u64, markdown: Option<String> },
+    /// The buffer's user-defined equates (answer to [`Request::Equates`]).
+    Equates { id: u64, equates: Vec<was::EquateDef> },
     /// The bytes a single line encodes to (empty if it isn't self-encodable,
     /// e.g. a label-only line or one that references an undefined label).
     LineBytes { id: u64, bytes: Vec<u8> },
@@ -141,6 +149,7 @@ impl Response {
             | Response::Suggest { id, .. }
             | Response::Completions { id, .. }
             | Response::Tip { id, .. }
+            | Response::Equates { id, .. }
             | Response::LineBytes { id, .. }
             | Response::Listing { id, .. }
             | Response::Error { id, .. } => *id,
@@ -235,6 +244,17 @@ impl Lang {
         let _ = self.tx.send(Request::Complete { id, line: line.to_string(), cursor, binds });
         id
     }
+    pub fn post_hover(&self, line: &str, cursor: usize, equates: Vec<was::EquateDef>) -> u64 {
+        let id = self.alloc();
+        let _ = self.tx.send(Request::Hover { id, line: line.to_string(), cursor, equates });
+        id
+    }
+    /// Refresh the buffer's equate table asynchronously (caller caches the reply).
+    pub fn post_equates(&self, src: &str) -> u64 {
+        let id = self.alloc();
+        let _ = self.tx.send(Request::Equates { id, src: src.to_string() });
+        id
+    }
 
     /// Non-blocking drain — the GUI calls this each message-loop pass. Replies a
     /// prior [`call`](Lang::call) buffered come out first, in arrival order.
@@ -298,8 +318,16 @@ impl Lang {
     pub fn complete(&self, line: &str, cursor: usize, binds: Vec<(String, String)>) -> Option<Response> {
         self.call(|id| Request::Complete { id, line: line.to_string(), cursor, binds: binds.clone() })
     }
-    pub fn hover(&self, line: &str, cursor: usize) -> Option<Response> {
-        self.call(|id| Request::Hover { id, line: line.to_string(), cursor })
+    pub fn hover(&self, line: &str, cursor: usize, equates: Vec<was::EquateDef>) -> Option<Response> {
+        self.call(|id| Request::Hover {
+            id,
+            line: line.to_string(),
+            cursor,
+            equates: equates.clone(),
+        })
+    }
+    pub fn equates(&self, src: &str) -> Option<Response> {
+        self.call(|id| Request::Equates { id, src: src.to_string() })
     }
     pub fn signature(&self, line: &str, cursor: usize) -> Option<Response> {
         self.call(|id| Request::Signature { id, line: line.to_string(), cursor })
@@ -402,6 +430,7 @@ fn coalesce_tag(req: &Request) -> Option<u8> {
         Request::Signature { .. } => Some(3),
         Request::LineBytes { .. } => Some(4),
         Request::Listing { .. } => Some(5),
+        Request::Equates { .. } => Some(6),
         _ => None,
     }
 }
@@ -438,6 +467,7 @@ fn request_id(req: &Request) -> u64 {
         | Request::Suggest { id, .. }
         | Request::Complete { id, .. }
         | Request::Hover { id, .. }
+        | Request::Equates { id, .. }
         | Request::Signature { id, .. }
         | Request::LineBytes { id, .. }
         | Request::Listing { id, .. } => *id,
@@ -486,10 +516,13 @@ fn handle(kb: &Kb, req: Request) -> Response {
                 replace_start: ctx.start,
             }
         }
-        Request::Hover { id, line, cursor } => {
+        Request::Hover { id, line, cursor, equates } => {
             let markdown = crate::hover::token_at(&line, cursor)
-                .and_then(|t| hover_markdown(kb, &line[t.start..t.end]));
+                .and_then(|t| hover_markdown(kb, &line[t.start..t.end], &equates));
             Response::Tip { id, markdown }
+        }
+        Request::Equates { id, src } => {
+            Response::Equates { id, equates: was::equate_table(&src, kb) }
         }
         Request::Signature { id, line, cursor } => {
             let markdown = crate::sig::active_param(&line, cursor)
@@ -660,7 +693,20 @@ fn interface_methods(kb: &Kb, iface: &str) -> Vec<(String, i64)> {
 
 /// A concise tooltip for a token: a constant's value, a function's one-line
 /// signature, or a type's size — whichever winkb knows. `None` if unknown.
-fn hover_markdown(kb: &Kb, word: &str) -> Option<String> {
+fn hover_markdown(kb: &Kb, word: &str, equates: &[was::EquateDef]) -> Option<String> {
+    // Equate-first: a name the buffer defines as an equate is *this buffer's*
+    // meaning, so its tip wins over a winkb constant of the same name. If it also
+    // names a Windows constant, say so — the equate shadows it here.
+    if let Some(eq) = equates.iter().find(|e| e.name == word) {
+        let mut md = format!(
+            "**{}** — your equate\n\n`{} = {}` = **{}**\n\ndefined at line {}",
+            eq.name, eq.name, eq.expr, eq.value, eq.line,
+        );
+        if kb.resolve(word).map(|v| !v.is_empty()).unwrap_or(false) {
+            md.push_str(&format!("\n\n_shadows the Windows constant `{word}`_"));
+        }
+        return Some(md);
+    }
     if let Ok(vals) = kb.resolve(word) {
         if let Some(v) = vals.first() {
             let ns = v.namespace.as_deref().unwrap_or("");
@@ -944,7 +990,7 @@ mod tests {
     fn hover_resolves_a_constant_value() {
         let Some(l) = lang() else { return };
         let line = "mov eax, OPEN_EXISTING";
-        match l.hover(line, 12) {
+        match l.hover(line, 12, vec![]) {
             Some(Response::Tip { markdown: Some(md), .. }) => {
                 assert!(md.contains("OPEN_EXISTING") && md.contains("0x"), "{md}")
             }
@@ -955,8 +1001,45 @@ mod tests {
     #[test]
     fn hover_on_a_register_is_empty() {
         let Some(l) = lang() else { return };
-        match l.hover("mov rax, 1", 4) {
+        match l.hover("mov rax, 1", 4, vec![]) {
             Some(Response::Tip { markdown, .. }) => assert!(markdown.is_none()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_an_equate_renders_its_tip() {
+        let Some(l) = lang() else { return };
+        // The buffer's equate table, as the editor would supply it.
+        let equates = match l.equates("WIDTH equ 50\nHEIGHT equ 40\nCELLS equ WIDTH * HEIGHT\n") {
+            Some(Response::Equates { equates, .. }) => equates,
+            other => panic!("{other:?}"),
+        };
+        // Hover the `CELLS` token on a use line.
+        let line = "mov ecx, CELLS";
+        match l.hover(line, 10, equates) {
+            Some(Response::Tip { markdown: Some(md), .. }) => {
+                assert!(md.contains("CELLS") && md.contains("your equate"), "{md}");
+                assert!(md.contains("WIDTH * HEIGHT") && md.contains("2000"), "{md}");
+                assert!(md.contains("defined at line 3"), "{md}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_equate_shadowing_a_winkb_constant_is_noted() {
+        let Some(l) = lang() else { return };
+        // Define an equate whose name collides with a real Windows constant.
+        let equates = match l.equates("OPEN_EXISTING equ 7\n") {
+            Some(Response::Equates { equates, .. }) => equates,
+            other => panic!("{other:?}"),
+        };
+        // If winkb lacks the constant here, the equate still renders (no shadow note).
+        match l.hover("mov eax, OPEN_EXISTING", 12, equates) {
+            Some(Response::Tip { markdown: Some(md), .. }) => {
+                assert!(md.contains("your equate") && md.contains("**7**"), "{md}");
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -1064,6 +1147,7 @@ mod tests {
             | Request::Suggest { id, .. }
             | Request::Complete { id, .. }
             | Request::Hover { id, .. }
+            | Request::Equates { id, .. }
             | Request::Signature { id, .. }
             | Request::LineBytes { id, .. }
             | Request::Listing { id, .. } => *id,
@@ -1077,7 +1161,7 @@ mod tests {
             Request::Complete { id: 1, line: "a".into(), cursor: 1, binds: vec![] },
             Request::Card { id: 2, query: "RECT".into() },
             Request::Complete { id: 3, line: "ab".into(), cursor: 2, binds: vec![] },
-            Request::Hover { id: 4, line: "x".into(), cursor: 0 },
+            Request::Hover { id: 4, line: "x".into(), cursor: 0, equates: vec![] },
         ];
         let ids: Vec<u64> = coalesce_superseded(batch).iter().map(req_id).collect();
         // Complete#1 superseded by #3; Card and the lone Hover survive; order kept.

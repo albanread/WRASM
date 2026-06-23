@@ -437,6 +437,11 @@ main:
         recent_menu: HMENU,
         /// `comobj NAME : Interface` bindings in the buffer (for COM-aware cards).
         com_binds: Vec<(String, String)>,
+        /// The buffer's user-defined equates, cached from the language thread
+        /// (the editor has no `Kb`): drives equate hover + go-to-definition.
+        equates: Vec<was::EquateDef>,
+        /// The in-flight equates-refresh request id (matches an `Equates` reply).
+        pending_equates: u64,
         /// Active autocomplete candidates (empty = the popup is hidden).
         comp: Vec<Completion>,
         /// Highlighted candidate index.
@@ -488,6 +493,8 @@ main:
                 recent: load_recent(),
                 recent_menu: HMENU::default(),
                 com_binds: Vec::new(),
+                equates: Vec::new(),
+                pending_equates: 0,
                 comp: Vec::new(),
                 comp_sel: 0,
                 comp_start: 0,
@@ -524,6 +531,9 @@ main:
                 let text = self.doc.text();
                 self.pending_check = lang.post_check(&text);
                 self.pending_listing = lang.post_listing(&text);
+                // The equate table needs a `Kb` to fold values, so it's computed
+                // on the worker; cache the reply for hover + go-to-definition.
+                self.pending_equates = lang.post_equates(&text);
             }
             self.com_binds = was::com_bindings(&self.doc.text());
             self.after_caret();
@@ -649,6 +659,9 @@ main:
                 if let Some(Response::Listing { rows, .. }) = lang.listing(&text) {
                     self.line_listing = rows;
                 }
+                if let Some(Response::Equates { equates, .. }) = lang.equates(&text) {
+                    self.equates = equates;
+                }
             }
             self.com_binds = was::com_bindings(&self.doc.text());
             if !self.search_active {
@@ -685,6 +698,10 @@ main:
                         self.comp_start = replace_start;
                         self.invalidate();
                     }
+                    Response::Equates { id, equates } if id == self.pending_equates => {
+                        self.equates = equates;
+                        self.invalidate();
+                    }
                     _ => {} // a superseded reply, or one for a sync call() already taken
                 }
             }
@@ -705,6 +722,20 @@ main:
         fn refresh_card(&mut self, word: Option<String>) {
             let Some(word) = word else { return };
             if word == self.card_word {
+                return;
+            }
+            // Equate-first: a name the buffer defines as an equate is this buffer's
+            // meaning, so surface its definition (value + source line) ahead of any
+            // winkb card. Ctrl+click the name to jump to the definition.
+            if let Some(eq) = self.equates.iter().find(|e| e.name == word) {
+                self.card_word = word;
+                self.card_md = format!(
+                    "## {} — your equate\n\n`{} = {}` = **{}**\n\nDefined at line **{}**. \
+                     Ctrl+click the name to jump there.\n",
+                    eq.name, eq.name, eq.expr, eq.value, eq.line,
+                );
+                self.card_layout = None;
+                self.card_scroll = 0.0;
                 return;
             }
             if let Some(md) = ide::local_card(&self.doc.text(), &word) {
@@ -1711,8 +1742,9 @@ main:
 
         /// A mouse press: position the editor caret (starting a drag-selection),
         /// focus the search box, or follow a card link — by pane. Shift extends
-        /// the selection from the current caret.
-        fn on_press(&mut self, x: f32, y: f32, shift: bool) {
+        /// the selection from the current caret. Ctrl+click over an equate jumps
+        /// to its definition (go-to-definition).
+        fn on_press(&mut self, x: f32, y: f32, shift: bool, ctrl: bool) {
             let (vw, vh) = self.viewport();
             let split = vw * SPLIT_FRAC;
             let editor_h = (vh - OUTPUT_H).max(0.0);
@@ -1725,6 +1757,14 @@ main:
                 }
             } else if y < editor_h {
                 self.search_active = false;
+                // Ctrl+click: if the clicked token is a defined equate, jump to
+                // its definition instead of placing an editing caret.
+                if ctrl {
+                    let (row, col) = self.caret_at_xy(x, y);
+                    if self.goto_equate(row, col) {
+                        return;
+                    }
+                }
                 if shift {
                     self.doc.start_selection();
                 } else {
@@ -1736,6 +1776,25 @@ main:
                 }
                 self.dragging = true;
             }
+        }
+
+        /// Go-to-definition for an equate: if the token at `(row, col)` names a
+        /// user-defined equate, move the caret to its definition line (1-based in
+        /// the table → 0-based row) and scroll it into view. Returns whether it
+        /// jumped, so the caller can fall through to normal click handling.
+        fn goto_equate(&mut self, row: usize, col: usize) -> bool {
+            let line = self.doc.line(row).to_string();
+            let Some(tok) = studio::hover::token_at(&line, col) else { return false };
+            let name = &line[tok.start..tok.end];
+            let Some(def) = self.equates.iter().find(|e| e.name == name) else { return false };
+            let (def_name, def_line) = (def.name.clone(), def.line);
+            let target = def_line.saturating_sub(1).min(self.doc.line_count().saturating_sub(1));
+            self.doc.clear_selection();
+            self.doc.set_caret(target, 0);
+            self.after_caret();
+            self.notice = format!("jumped to `{def_name}` (line {def_line})");
+            self.invalidate();
+            true
         }
 
         /// Extend the selection by dragging (no per-move card refresh).
@@ -2016,7 +2075,8 @@ main:
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 * scale;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 * scale;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                app.on_press(x, y, shift);
+                let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                app.on_press(x, y, shift, ctrl);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {

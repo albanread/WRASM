@@ -1661,6 +1661,81 @@ fn collect_equate_defs(src: &str) -> Vec<(String, usize)> {
     defs
 }
 
+/// One user-defined equate, surfaced for the IDE: its name, the *source*
+/// expression text it was defined with, the folded `i64` value that expression
+/// evaluates to, and the 1-based source line of the definition. The IDE uses this
+/// for hover ("`CELLS = WIDTH * HEIGHT` = **2000**") and go-to-definition.
+#[derive(Debug, Clone)]
+pub struct EquateDef {
+    pub name: String,
+    pub expr: String,
+    pub value: i64,
+    pub line: usize,
+}
+
+/// Every equate a buffer defines, with its source expression, its folded value,
+/// and its 1-based line. Uses exactly the recognition of [`preprocess_equates`]
+/// (`parse_equate` + struct / raw-string-block tracking) and accumulates an `eqs`
+/// map top-to-bottom so a later equate that references an earlier one — e.g.
+/// `A equ W * H` — folds correctly (define-before-use).
+///
+/// Unlike `preprocess_equates` this is *non-failing*: an equate whose expression
+/// doesn't evaluate (an unknown name, a syntax error mid-edit) is simply skipped
+/// rather than aborting the whole table — the IDE wants whatever it can resolve.
+/// Register-shadowing equates (which `preprocess_equates` rejects) are likewise
+/// dropped here, since they never become real equates.
+pub fn equate_table(src: &str, kb: &Kb) -> Vec<EquateDef> {
+    let mut eqs: HashMap<String, i64> = HashMap::new();
+    let mut out = Vec::new();
+    let mut in_struct = false;
+    let mut raw_end: Option<&str> = None;
+    for (i, raw) in src.lines().enumerate() {
+        let t = strip_comment(raw).trim();
+        if let Some(end) = raw_end {
+            if raw.trim().eq_ignore_ascii_case(end) {
+                raw_end = None;
+            }
+            continue;
+        }
+        if t.eq_ignore_ascii_case(".asciistring") {
+            raw_end = Some(".endasciistring");
+            continue;
+        }
+        if t.eq_ignore_ascii_case(".widestring") {
+            raw_end = Some(".endwidestring");
+            continue;
+        }
+        if parse_struct_open(t).is_some() {
+            in_struct = true;
+            continue;
+        }
+        if t == "ends" || t == "endstruct" {
+            in_struct = false;
+            continue;
+        }
+        if let Some((name, expr)) = parse_equate(t, in_struct) {
+            // A register-named equate is rejected by the real preprocessor; it
+            // never resolves to a usable equate, so don't surface one.
+            if is_register(name) {
+                continue;
+            }
+            // The rhs may reference earlier equates by name; substitute first
+            // (so `A equ W * H` works), then fold. Keep the *original* expr text.
+            let sub = substitute_equates(expr, &eqs);
+            if let Ok(v) = eval_expr(&sub, &eqs, kb) {
+                eqs.insert(name.to_string(), v);
+                out.push(EquateDef {
+                    name: name.to_string(),
+                    expr: expr.to_string(),
+                    value: v,
+                    line: i + 1,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Interpolate `{{NAME}}` placeholders inside a string span with the equate's
 /// integer value (decimal). Everything else — including multibyte UTF-8 — is copied
 /// verbatim. An unknown `{{NAME}}` (or one with no closing `}}`) is left untouched,
@@ -3710,6 +3785,21 @@ mod tests {
         let Some(kb) = kb() else { return };
         let low = lower("main:\n  F equ 0x10 | 1\n  mov eax, F\n", &kb).unwrap();
         assert!(low.contains("mov eax, 17"), "0x10 | 1 == 17:\n{low}");
+    }
+
+    #[test]
+    fn equate_table_folds_and_records_lines() {
+        let Some(kb) = kb() else { return };
+        let table = equate_table("W equ 4\nH equ 5\nA equ W * H\n", &kb);
+        let names: Vec<&str> = table.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["W", "H", "A"]);
+        let a = table.iter().find(|e| e.name == "A").expect("A is in the table");
+        assert_eq!(a.value, 20, "A equ W * H == 4 * 5 == 20: {table:?}");
+        assert!(a.expr.contains("W * H"), "A keeps its source expr: {:?}", a.expr);
+        assert_eq!(a.line, 3, "A is defined on the 3rd line");
+        // The earlier equates fold to their literals.
+        assert_eq!(table.iter().find(|e| e.name == "W").unwrap().value, 4);
+        assert_eq!(table.iter().find(|e| e.name == "H").unwrap().value, 5);
     }
 
     #[test]
