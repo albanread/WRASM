@@ -16,9 +16,14 @@
 ;     2. WallComposite       — upload idxBuf, resolve it through the palette LUT with
 ;        the DISCARD-INDEX-0 pixel shader (gpu/wallfx.was), alpha-over. The game Cls()s
 ;        the play area to index 0, so index 0 is DISCARDED -> the wall shows through;
-;        the HUD bar / bricks / paddle / ball (all non-zero indices) draw OPAQUE on top.
-;     3. text                — TxtUpload + TxtFlush over the resolved board.
-;     4. Present.
+;        the HUD bar + bricks (the only INDEXED-LAYER elements now) draw OPAQUE on top.
+;     3. PtDraw              — additive shatter debris + (optional) ball-trail glow.
+;     4. DrawSprites         — the bat, the round balls and the faceted power-up GEMS
+;        are real COMPOSITED SPRITES (gpu/sprite.was): an indexed atlas frame (index 0
+;        transparent -> any shape) through a per-sprite palette, alpha-over, in ONE
+;        DrawInstanced. They are NOT blitted into the indexed board.
+;     5. text                — TxtUpload + TxtFlush over the resolved board.
+;     6. Present.
 ;
 ; WHY A LOCAL HARNESS: gpu/harness.was's GameFrame is hardwired to the OPAQUE
 ; GpuComposite (clears to black, no fx). brickout_fx needs the wall-aware present, so
@@ -41,6 +46,7 @@
 ; canvas.was and is all the BMP gate needs.
 .include "../gpu/canvas.was"               ; idxBuf + palette LUTs + indexed primitives (320x200 logical)
 .include "../gpu/blit.was"                 ; blend states (pBlendOpaque / pBlendAlpha)
+.include "../gpu/sprite.was"               ; NEW: the G3 instanced sprite compositor (any-shape gems, round balls, the bat)
 .include "../gpu/text.was"                 ; the instanced 5x7 text layer (Text -> DrawText)
 .include "../gpu/input.was"                ; keyboard + actions (arrows / Esc=quit)
 .include "../gpu/wallfx.was"               ; NEW: brick-wall fx + discard-index-0 LUT
@@ -64,8 +70,14 @@ BALL_STRIDE equ 24                 ; { x@0, y@4, dx@8, dy@12 (fixed-pt), active@
 ;      grey jewels. Caught (overlap the paddle) -> the kind's effect + Coin SFX. ----
 DROP_MAX    equ 8                  ; max simultaneous falling packs
 DROP_STRIDE equ 16                 ; { x@0, y@4 (fixed-pt board), kind@8, active@12 }
-DROP_W      equ 12                 ; gem width  (logical px)
-DROP_H      equ 9                  ; gem height (logical px)
+DROP_W      equ 12                 ; gem catch-box width  (logical px)
+DROP_H      equ 9                  ; gem catch-box height (logical px)
+
+; ---- sprite frame dimensions (atlas pixels = 640x360 screen px; the board is drawn
+;      at scale 1.8, so these roughly match the catch-boxes once placed). ----
+GEM_W       equ 20                 ; faceted-gem sprite width
+GEM_H       equ 16                 ; faceted-gem sprite height
+BALL_PX     equ 8                  ; round-ball sprite (square)
 
 .DATA
 .balign 16
@@ -86,8 +98,10 @@ bricksLeft DWORD ?
 gameState DWORD ?
 paddleW   DWORD ?                  ; current paddle width px (40 normal / 64 WIDE / 28 NARROW)
 stickyMode DWORD ?                 ; 1 = STICKY pack active (ball catches on the paddle)
+trailMode DWORD ?                  ; 1 = BALL-TRAIL pack active (the glow trail is OFF by default)
 ballLost  DWORD ?                  ; the core sets this when the scratch ball drains off-bottom
 packMsgTimer DWORD ?               ; frames left to show the pack-pickup banner (0 = none)
+gTick     DWORD ?                  ; global animation tick (gem twinkle phase)
 
 ; ---- the brick grid: 8 cols x 5 rows = 40 bricks. STRENGTH BRICKS: each entry is
 ; the brick's HEALTH (hit points), not a 1/0 alive flag. 0 = broken. Initial health
@@ -210,6 +224,7 @@ proc ResetGame frame
     mov     dword ptr [rip + paddleX], 140 * 256
     mov     dword ptr [rip + paddleW], 40        ; normal paddle width
     mov     dword ptr [rip + stickyMode], 0      ; no STICKY pack active
+    mov     dword ptr [rip + trailMode], 0       ; ball trail OFF until a TRAIL pack is caught
     mov     dword ptr [rip + packMsgTimer], 0    ; no pickup banner
     call    BuildBricks
     call    ResetBall
@@ -729,6 +744,9 @@ endproc
 ; PtUpdate/PtDraw, so the dots are advanced + faded by the existing particle pipeline.
 ; ===========================================================================
 proc BallGlow uses rbx rsi frame
+    mov     eax, [rip + trailMode]       ; the trail is a PACK — off until TRAIL is caught
+    test    eax, eax
+    jz      bg_done
     lea     rsi, [rip + ballPool]
     xor     ebx, ebx                     ; ball slot
 bg_loop:
@@ -1041,7 +1059,7 @@ endproc
 
 ; ===========================================================================
 ; DropApply(ecx=kind) — apply a caught pack. Touches ONLY volatile registers so the
-; caller's pool pointers survive. 0=WIDE 1=NARROW 2=MULTI 3=STICKY 4=FAST.
+; caller's pool pointers survive. 0=WIDE 1=NARROW 2=MULTI 3=STICKY 4=FAST 5=TRAIL.
 ; ===========================================================================
 proc DropApply in rcx
     cmp     ecx, 0
@@ -1052,6 +1070,8 @@ proc DropApply in rcx
     je      da_multi
     cmp     ecx, 3
     je      da_sticky
+    cmp     ecx, 5
+    je      da_trail
     jmp     da_fast                      ; kind 4
 da_wide:
     mov     dword ptr [rip + paddleW], 64
@@ -1061,6 +1081,9 @@ da_narrow:
     jmp     da_done
 da_sticky:
     mov     dword ptr [rip + stickyMode], 1
+    jmp     da_done
+da_trail:
+    mov     dword ptr [rip + trailMode], 1   ; turn the ball glow trail ON
     jmp     da_done
 da_multi:
     ; find the first active ball, then clone it into up to 2 free slots.
@@ -1153,6 +1176,9 @@ proc SetPackMsg in rcx
     lea     rdx, [rip + sPkSticky]
     cmp     ecx, 3
     je      spm_set
+    lea     rdx, [rip + sPkTrail]
+    cmp     ecx, 5
+    je      spm_set
     lea     rdx, [rip + sPkFast]
 spm_set:
     mov     [rip + packMsgPtr], rdx
@@ -1160,63 +1186,90 @@ spm_set:
 endproc
 
 ; ===========================================================================
-; DrawGem(ecx=x_log, edx=y_log, r8d=kind) — draw one pack as a faceted gem sprite:
-; a body rect, a bright top/left facet, and (good packs only) a white sparkle. Good
-; packs are coloured + shiny; bad packs are dull grey (gemBody/gemHi/gemSpark tables).
+; ============================  SPRITE COMPOSITING  =========================
+; The bat, the balls and the gems are real instanced SPRITES (gpu/sprite.was): an
+; indexed atlas frame (index 0 transparent -> ANY shape) resolved through a per-
+; sprite palette, alpha-over. They are queued each frame (SprPush) and drawn in one
+; DrawInstanced after WallComposite. NOTHING here writes the indexed board.
 ; ===========================================================================
-proc DrawGem uses rbx rsi rdi frame in rcx rdx r8
-    mov     ebx, ecx                     ; x
-    mov     esi, edx                     ; y
-    mov     edi, r8d                     ; kind
-    ; body: DROP_W x DROP_H in the kind's body colour.
-    lea     rax, [rip + gemBody]
-    movzx   r10d, byte ptr [rax + rdi]
+
+; ---- ScrFromLogical(ecx=logX, edx=logY) -> xmm1=screenX, xmm2=screenY. The board is
+;      composited at scale 1.8 with offset; this is the EXACT transform the shatter
+;      bursts use, so sprites land on the same pixels the indexed board does. ----
+proc ScrFromLogical in rcx rdx
+    add     ecx, [rip + canvasOX]
+    cvtsi2ss xmm1, ecx
+    mulss   xmm1, [rip + fxTxScaleX]     ; *1.8
+    addss   xmm1, [rip + fxTxOffX]       ; -256.0 -> screen X
+    add     edx, [rip + canvasOY]
+    cvtsi2ss xmm2, edx
+    mulss   xmm2, [rip + fxTxScaleY]
+    addss   xmm2, [rip + fxTxOffY]       ; -144.0 -> screen Y
+endproc
+
+; ---- BatPush — queue the bat sprite. Three width frames (NARROW/normal/WIDE) keep
+;      the sprite size matched to paddleW; the bat is anchored top-left at the paddle. ----
+proc BatPush uses rbx frame
+    mov     eax, [rip + paddleW]
+    mov     ecx, [rip + fidBat1]         ; default 40px paddle
+    cmp     eax, 28
+    jne     bt_w64
+    mov     ecx, [rip + fidBat0]
+    jmp     bt_have
+bt_w64:
+    cmp     eax, 64
+    jne     bt_have
+    mov     ecx, [rip + fidBat2]
+bt_have:
+    mov     ebx, ecx                     ; frameId (survives ScrFromLogical)
+    mov     ecx, [rip + paddleX]
+    sar     ecx, 8                       ; paddle left (logical)
+    mov     edx, 185
+    call    ScrFromLogical               ; xmm1/xmm2 = top-left screen
+    movss   xmm3, [rip + fAlpha1]
     mov     ecx, ebx
-    mov     edx, esi
-    mov     r8d, DROP_W
-    mov     r9d, DROP_H
-    call    FillRect
-    ; top facet: a 10x3 highlight band inset by 1.
-    lea     rax, [rip + gemHi]
-    movzx   r10d, byte ptr [rax + rdi]
-    mov     ecx, ebx
-    add     ecx, 1
-    mov     edx, esi
-    add     edx, 1
-    mov     r8d, 10
-    mov     r9d, 3
-    call    FillRect
-    ; left facet: a 2x6 highlight column inset by 1.
-    lea     rax, [rip + gemHi]
-    movzx   r10d, byte ptr [rax + rdi]
-    mov     ecx, ebx
-    add     ecx, 1
-    mov     edx, esi
-    add     edx, 1
-    mov     r8d, 2
-    mov     r9d, 6
-    call    FillRect
-    ; sparkle: a 2x2 white glint — good packs only (gemSpark[kind] != 0).
-    lea     rax, [rip + gemSpark]
-    movzx   eax, byte ptr [rax + rdi]
-    test    eax, eax
-    jz      dg_done
-    mov     ecx, ebx
-    add     ecx, 2
-    mov     edx, esi
+    mov     r8d, 7                       ; bat palette slot
+    call    SprPush
+endproc
+
+; ---- BallsPush — a round-ball sprite per active ball, centred on the ball. ----
+proc BallsPush uses rbx rsi frame
+    lea     rsi, [rip + ballPool]
+    xor     ebx, ebx
+blp_loop:
+    cmp     ebx, BALL_MAX
+    jge     blp_done
+    mov     eax, ebx
+    imul    eax, eax, BALL_STRIDE
+    lea     rax, [rsi + rax]
+    mov     ecx, [rax + 16]              ; active?
+    test    ecx, ecx
+    jz      blp_next
+    mov     ecx, [rax + 0]
+    sar     ecx, 8
+    add     ecx, 2                       ; ball centre x (ball is 4 logical wide)
+    mov     edx, [rax + 4]
+    sar     edx, 8
     add     edx, 2
-    mov     r8d, 2
-    mov     r9d, 2
-    mov     r10b, 15                     ; white glint
-    call    FillRect
-dg_done:
+    call    ScrFromLogical
+    subss   xmm1, [rip + fHalfBall]      ; centre -> top-left
+    subss   xmm2, [rip + fHalfBall]
+    movss   xmm3, [rip + fAlpha1]
+    mov     ecx, [rip + fidBall]
+    mov     r8d, 6                       ; ball palette slot
+    call    SprPush
+blp_next:
+    inc     ebx
+    jmp     blp_loop
+blp_done:
 endproc
 
 ; ===========================================================================
-; DropDraw — FillRect every active pack as a gem (called from DrawScene, over the
-; resolved board so it's opaque like the bricks).
+; DropDraw — queue a faceted-GEM sprite for every active pack. The gem is centred on
+; its catch-box; good packs TWINKLE (alpha pulse), bad packs are steady + dull. The
+; palette slot is the kind id (0..5), so one gem frame yields six coloured gems.
 ; ===========================================================================
-proc DropDraw uses rbx rsi rdi frame
+proc DropDraw uses rbx rsi rdi r12 frame
     lea     rsi, [rip + dropPool]
     xor     ebx, ebx
 dd_loop:
@@ -1228,16 +1281,276 @@ dd_loop:
     mov     eax, [rdi + 12]              ; active?
     test    eax, eax
     jz      dd_next
+    ; catch-box centre (board) -> screen, then top-left = centre - half gem frame.
     mov     ecx, [rdi + 0]
-    sar     ecx, 8                       ; x_log
+    sar     ecx, 8
+    add     ecx, 6                       ; + DROP_W/2 -> centre x
     mov     edx, [rdi + 4]
-    sar     edx, 8                       ; y_log
-    mov     r8d, [rdi + 8]               ; kind
-    call    DrawGem
+    sar     edx, 8
+    add     edx, 4                       ; + DROP_H/2 -> centre y
+    call    ScrFromLogical
+    subss   xmm1, [rip + fHalfGemW]
+    subss   xmm2, [rip + fHalfGemH]
+    mov     r12d, [rdi + 8]             ; kind = palette slot
+    ; alpha: good gems twinkle (alphaTwk[(gTick>>2 + kind)&3]); bad gems steady 1.0.
+    movss   xmm3, [rip + fAlpha1]
+    lea     rax, [rip + gemGood]
+    movzx   eax, byte ptr [rax + r12]
+    test    eax, eax
+    jz      dd_push
+    mov     eax, [rip + gTick]
+    sar     eax, 2
+    add     eax, r12d
+    and     eax, 3
+    lea     rcx, [rip + alphaTwk]
+    movss   xmm3, [rcx + rax*4]
+dd_push:
+    mov     ecx, [rip + fidGem]
+    mov     r8d, r12d                    ; palette slot = kind
+    call    SprPush
 dd_next:
     inc     ebx
     jmp     dd_loop
 dd_done:
+endproc
+
+; ===========================================================================
+; BuildSprAssets — synthesize the gem / ball / 3 bat frames into the atlas, set the
+; per-kind + ball + bat palettes, and upload both. Called once from FxBoot (after
+; SprInit). Mirrors gpu_g3.was's BuildSpriteFrames + BuildSpritePalettes flow.
+; ===========================================================================
+proc BuildSprAssets frame
+    call    BuildGemPix
+    call    BuildBallPix
+    lea     rcx, [rip + batPix0]
+    mov     edx, 50
+    mov     r8d, 10
+    call    BuildBatPix                  ; NARROW (28*1.8 ~ 50)
+    lea     rcx, [rip + batPix1]
+    mov     edx, 72
+    mov     r8d, 10
+    call    BuildBatPix                  ; normal (40*1.8 ~ 72)
+    lea     rcx, [rip + batPix2]
+    mov     edx, 115
+    mov     r8d, 10
+    call    BuildBatPix                  ; WIDE (64*1.8 ~ 115)
+    ; append frames (the order fixes the ids); store each id.
+    lea     rcx, [rip + gemPix]
+    mov     edx, GEM_W
+    mov     r8d, GEM_H
+    call    SprAddFrame
+    mov     [rip + fidGem], eax
+    lea     rcx, [rip + ballPix]
+    mov     edx, BALL_PX
+    mov     r8d, BALL_PX
+    call    SprAddFrame
+    mov     [rip + fidBall], eax
+    lea     rcx, [rip + batPix0]
+    mov     edx, 50
+    mov     r8d, 10
+    call    SprAddFrame
+    mov     [rip + fidBat0], eax
+    lea     rcx, [rip + batPix1]
+    mov     edx, 72
+    mov     r8d, 10
+    call    SprAddFrame
+    mov     [rip + fidBat1], eax
+    lea     rcx, [rip + batPix2]
+    mov     edx, 115
+    mov     r8d, 10
+    call    SprAddFrame
+    mov     [rip + fidBat2], eax
+    call    SprUploadAtlas
+    call    SetupSprPalettes
+    call    SprUploadPalette
+endproc
+
+; ---- BuildGemPix — a faceted diamond GEM_W x GEM_H: index 1 body, 2 upper-half facet
+;      (catches light), 3 a 2x2 sparkle; index 0 (transparent) outside the diamond. ----
+proc BuildGemPix uses rbx rdi r12 r13
+    lea     rdi, [rip + gemPix]
+    xor     r12d, r12d                   ; y
+bgm_y:
+    cmp     r12d, GEM_H
+    jge     bgm_done
+    xor     r13d, r13d                   ; x
+bgm_x:
+    cmp     r13d, GEM_W
+    jge     bgm_yn
+    ; inside diamond? |2x-19|*16 + |2y-15|*20 <= 320  (= GEM_W*GEM_H)
+    mov     eax, r13d
+    add     eax, eax
+    sub     eax, 19
+    mov     ecx, eax
+    sar     ecx, 31
+    xor     eax, ecx
+    sub     eax, ecx                     ; |2x-19|
+    imul    eax, eax, 16
+    mov     ebx, r12d
+    add     ebx, ebx
+    sub     ebx, 15
+    mov     ecx, ebx
+    sar     ecx, 31
+    xor     ebx, ecx
+    sub     ebx, ecx                     ; |2y-15|
+    imul    ebx, ebx, 20
+    add     eax, ebx
+    cmp     eax, 320
+    jg      bgm_zero
+    ; inside: facet(2) on the upper half (2y-15 < 0), else body(1).
+    mov     eax, 1
+    mov     ecx, r12d
+    add     ecx, ecx
+    sub     ecx, 15
+    jns     bgm_spark
+    mov     eax, 2
+bgm_spark:
+    ; sparkle 2x2 at x in {5,6}, y in {3,4} -> index 3.
+    cmp     r13d, 5
+    jl      bgm_put
+    cmp     r13d, 6
+    jg      bgm_put
+    cmp     r12d, 3
+    jl      bgm_put
+    cmp     r12d, 4
+    jg      bgm_put
+    mov     eax, 3
+bgm_put:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     bgm_x
+bgm_zero:
+    mov     byte ptr [rdi], 0
+    inc     rdi
+    inc     r13d
+    jmp     bgm_x
+bgm_yn:
+    inc     r12d
+    jmp     bgm_y
+bgm_done:
+endproc
+
+; ---- BuildBallPix — a round disc BALL_PX^2: index 1 body, 2 an upper-left highlight. ----
+proc BuildBallPix uses rbx rdi r12 r13
+    lea     rdi, [rip + ballPix]
+    xor     r12d, r12d
+bbp_y:
+    cmp     r12d, BALL_PX
+    jge     bbp_done
+    xor     r13d, r13d
+bbp_x:
+    cmp     r13d, BALL_PX
+    jge     bbp_yn
+    ; disc: (2x-7)^2 + (2y-7)^2 <= 49
+    mov     eax, r13d
+    add     eax, eax
+    sub     eax, 7
+    imul    eax, eax
+    mov     ebx, r12d
+    add     ebx, ebx
+    sub     ebx, 7
+    imul    ebx, ebx
+    add     eax, ebx
+    cmp     eax, 49
+    jg      bbp_zero
+    mov     eax, 1
+    cmp     r13d, 3
+    jge     bbp_put
+    cmp     r12d, 3
+    jge     bbp_put
+    mov     eax, 2                       ; upper-left glint
+bbp_put:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     bbp_x
+bbp_zero:
+    mov     byte ptr [rdi], 0
+    inc     rdi
+    inc     r13d
+    jmp     bbp_x
+bbp_yn:
+    inc     r12d
+    jmp     bbp_y
+bbp_done:
+endproc
+
+; ---- BuildBatPix(rcx=buf, edx=w, r8d=h) — a bat with FEATURES: rounded corners, an
+;      orange bumper cap at each end (index 3), a chrome top band (index 2), cyan body
+;      (index 1). One builder, called for each of the three widths. ----
+proc BuildBatPix uses rbx rdi r12 r13 r14 in rcx rdx r8
+    mov     rdi, rcx                     ; buf
+    mov     r14d, edx                    ; w
+    mov     ebx, r8d                     ; h
+    xor     r12d, r12d                   ; y
+bxp_y:
+    cmp     r12d, ebx
+    jge     bxp_done
+    xor     r13d, r13d                   ; x
+bxp_x:
+    cmp     r13d, r14d
+    jge     bxp_yn
+    ; rounded corners: corner column (x<2 or x>=w-2) AND top/bottom row -> transparent.
+    cmp     r13d, 2
+    jl      bxp_corner
+    mov     ecx, r14d
+    sub     ecx, 2
+    cmp     r13d, ecx
+    jl      bxp_body                     ; middle column -> never a corner
+bxp_corner:
+    test    r12d, r12d
+    jz      bxp_zero                     ; top row
+    mov     ecx, ebx
+    dec     ecx
+    cmp     r12d, ecx
+    je      bxp_zero                     ; bottom row
+bxp_body:
+    ; bumper caps: x<4 or x>=w-4 -> index 3.
+    cmp     r13d, 4
+    jl      bxp_bump
+    mov     ecx, r14d
+    sub     ecx, 4
+    cmp     r13d, ecx
+    jge     bxp_bump
+    ; chrome top band: y<2 -> index 2 ; else body index 1.
+    cmp     r12d, 2
+    jl      bxp_chrome
+    mov     eax, 1
+    jmp     bxp_put
+bxp_bump:
+    mov     eax, 3
+    jmp     bxp_put
+bxp_chrome:
+    mov     eax, 2
+    jmp     bxp_put
+bxp_zero:
+    xor     eax, eax
+bxp_put:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     bxp_x
+bxp_yn:
+    inc     r12d
+    jmp     bxp_y
+bxp_done:
+endproc
+
+; ---- SetupSprPalettes — walk sprPalTab {slot,index,rgb} triples (999 terminates),
+;      writing each per-sprite palette entry. ----
+proc SetupSprPalettes uses rbx frame
+    lea     rbx, [rip + sprPalTab]
+sps_loop:
+    mov     ecx, [rbx + 0]
+    cmp     ecx, 999
+    je      sps_done
+    mov     edx, [rbx + 4]
+    mov     r8d, [rbx + 8]
+    call    SprSetPalette
+    add     rbx, 12
+    jmp     sps_loop
+sps_done:
 endproc
 
 ; ===========================================================================
@@ -1331,40 +1644,15 @@ db_bnext:
     jmp     db_brick
 
 db_paddle:
-    mov     ecx, [rip + paddleX]
-    sar     ecx, 8
-    mov     edx, 185
-    mov     r8d, [rip + paddleW]     ; WIDE/NARROW aware
-    mov     r9d, 5
-    mov     r10b, 11                 ; light cyan
-    call    FillRect
-
-    ; --- balls: one 4x4 white sprite per active ball (multi-ball) ---
-    lea     r13, [rip + ballPool]
-    xor     r12d, r12d
-db_ball:
-    cmp     r12d, BALL_MAX
-    jge     db_banner
-    mov     eax, r12d
-    imul    eax, eax, BALL_STRIDE
-    lea     rsi, [r13 + rax]         ; rsi -> record (callee-saved, survives FillRect)
-    mov     eax, [rsi + 16]          ; active?
-    test    eax, eax
-    jz      db_bnball
-    mov     ecx, [rsi + 0]
-    sar     ecx, 8
-    mov     edx, [rsi + 4]
-    sar     edx, 8
-    mov     r8d, 4
-    mov     r9d, 4
-    mov     r10b, 15
-    call    FillRect
-db_bnball:
-    inc     r12d
-    jmp     db_ball
+    ; the bat, the balls and the gems are no longer FillRect'd into the indexed
+    ; board — they are real COMPOSITED SPRITES queued here and drawn (alpha-over,
+    ; any-shape) in the sprite pass after WallComposite. Only the rectangular HUD bar
+    ; and bricks stay in the indexed layer.
+    call    BatPush                  ; the bat sprite (3 width frames, rounded caps + chrome)
+    call    BallsPush                ; a round-ball sprite per active ball
 
 db_banner:
-    call    DropDraw                 ; falling power-up gems over the board
+    call    DropDraw                 ; falling power-up GEMS (faceted sprites) over the board
 
     mov     eax, [rip + gameState]
     cmp     eax, 0
@@ -1508,9 +1796,11 @@ FxBoot:
     mov     rcx, [rip + fxHwnd]
     call    GpuInit
     call    BlitInit
+    call    SprInit                  ; NEW: the instanced sprite pass (gems / balls / bat)
     call    TxtInit
     call    WallFxInit
     call    PtInit                   ; NEW: bring up the GPU particle system
+    call    BuildSprAssets           ; NEW: synthesize the gem/ball/bat atlas frames + palettes
 
     ; scale the HUD text to match the WLPS-upscaled board: the resolve shader maps
     ; idxBuf(160,80)->screen(32,0) at scale 1.8 (barX=32). The text VS transform
@@ -1553,10 +1843,12 @@ FxFrame:
     sub     rsp, 8
 
     call    TxtClear
+    call    SprClear                 ; reset the sprite instance list (gems / balls / bat are re-queued in DrawScene)
+    inc     dword ptr [rip + gTick]  ; global animation tick (gem twinkle)
     call    InputPoll
 
     call    WallFxSetTime            ; advance the wall sheen drift
-    call    GameStep                 ; logic + draw into idxBuf + queue Text (spawns shatter bursts)
+    call    GameStep                 ; logic + draw into idxBuf + queue Text + queue sprites
     call    PtUpdate                 ; advance + fade + compact the shatter debris
 
     ; ---- the wall-aware compositor present ----
@@ -1571,6 +1863,12 @@ FxFrame:
     pContext.RSSetViewports(1, vp)
     mov     rcx, [rip + pRTV]
     call    PtDraw                   ; particles -> additive glow over the resolved board
+
+    ; the sprite layer (bat, balls, gems) composites OVER the board + glow, under text.
+    call    SprUpload
+    pContext.RSSetViewports(1, vp)
+    mov     rcx, [rip + pRTV]
+    call    DrawSprites              ; one DrawInstanced: bat + balls + gems, alpha-over
 
     call    TxtUpload
     pContext.RSSetViewports(1, vp)
@@ -1852,11 +2150,16 @@ proc FxDemoDrops frame
     mov     edx, 114
     mov     r8d, 4
     call    DropPlace
+    mov     ecx, 196                 ; TRAIL (good, magenta)
+    mov     edx, 96
+    mov     r8d, 5
+    call    DropPlace
     ; split the live ball so the captured frame shows multi-ball.
     mov     ecx, 2                   ; MULTI
     call    DropApply
-    ; widen the paddle + announce a pack so the BMP shows both effects.
+    ; widen the paddle, turn the trail ON, and announce a pack so the BMP shows it all.
     mov     dword ptr [rip + paddleW], 64
+    mov     dword ptr [rip + trailMode], 1
     mov     ecx, 2                   ; "MULTI BALL"
     call    SetPackMsg
 endproc
@@ -1942,22 +2245,57 @@ popF255   DWORD 0x437F0000                              ; 255.0f
 popPool   BYTE  512 dup(0)                              ; POP_MAX(32) * POP_STRIDE(16)
 popNumBuf BYTE  "+0000000", 0                           ; scratch for the "+N" pop text
 
-; ---- POWER-UP "PACKS": gem appearance + kind weighting + names. Kinds: 0=WIDE,
-;      1=NARROW, 2=MULTI, 3=STICKY, 4=FAST. Good packs (WIDE/MULTI/STICKY) are bright,
-;      shiny gems (white facet + sparkle); bad packs (NARROW/FAST) are dull grey jewels
-;      (grey facet, no sparkle). kindMap[(roll>>4)&7] weights good 6/8, bad 2/8. ----
-gemBody   BYTE 10, 8, 14, 11, 8        ; body colour: green/grey/yellow/cyan/grey
-gemHi     BYTE 15, 7, 15, 15, 7        ; facet: white (shiny good) / light-grey (dull bad)
-gemSpark  BYTE 1, 0, 1, 1, 0           ; white sparkle? good packs only
-kindMap   BYTE 0, 2, 3, 0, 2, 3, 1, 4  ; (roll>>4)&7 -> kind (good-weighted)
+; ---- POWER-UP "PACKS": kind weighting + names. Kinds: 0=WIDE 1=NARROW 2=MULTI
+;      3=STICKY 4=FAST 5=TRAIL. Appearance now lives in the SPRITE atlas + palettes
+;      (sprPalTab) below, not flat colour tables. kindMap[(roll>>4)&7] weights good
+;      packs (WIDE/MULTI/STICKY/TRAIL) 6/8 vs bad (NARROW/FAST) 2/8. ----
+kindMap   BYTE 0, 2, 3, 5, 0, 2, 1, 4  ; (roll>>4)&7 -> kind (good-weighted)
+gemGood   BYTE 1, 0, 1, 1, 0, 1        ; by kind: does this gem TWINKLE? (good packs do)
 dropSeed  DWORD 0x12345678             ; LCG state for the drop dice (mixed with score)
 sPkWide   BYTE "WIDE PADDLE", 0
 sPkNarrow BYTE "SMALL PADDLE", 0
 sPkMulti  BYTE "MULTI BALL", 0
 sPkSticky BYTE "STICKY BALL", 0
 sPkFast   BYTE "FAST BALL", 0
+sPkTrail  BYTE "BALL TRAIL", 0
 .balign 8
 packMsgPtr QWORD ?                     ; -> the current pack-pickup banner string
+
+; ---- SPRITE assets: frame ids (set by SprAddFrame order), float constants for SprPush
+;      (top-left = centre - half-frame; gem twinkle alphas), the indexed frame pixel
+;      scratch buffers, and the per-sprite palette table {slot, index, 0x00RRGGBB}. ----
+fidGem    DWORD ?
+fidBall   DWORD ?
+fidBat0   DWORD ?                       ; NARROW (50px) / normal (72) / WIDE (115)
+fidBat1   DWORD ?
+fidBat2   DWORD ?
+.balign 16
+fAlpha1   DWORD 0x3F800000             ; 1.0f
+fHalfGemW DWORD 0x41200000             ; 10.0f  (GEM_W/2)
+fHalfGemH DWORD 0x41000000             ; 8.0f   (GEM_H/2)
+fHalfBall DWORD 0x40800000             ; 4.0f   (BALL_PX/2)
+alphaTwk  DWORD 0x3F800000, 0x3F4CCCCD, 0x3F333333, 0x3F4CCCCD   ; 1.0, 0.8, 0.7, 0.8 twinkle
+
+.balign 16
+gemPix    BYTE  320 dup(0)             ; GEM_W(20) * GEM_H(16)
+ballPix   BYTE  64  dup(0)             ; BALL_PX(8)^2
+batPix0   BYTE  500 dup(0)             ; 50 * 10 (NARROW)
+batPix1   BYTE  720 dup(0)             ; 72 * 10 (normal)
+batPix2   BYTE  1150 dup(0)            ; 115 * 10 (WIDE)
+
+.balign 16
+; per-sprite palette: rows {slot, index, 0x00RRGGBB}; slot 999 terminates. Good gems
+; get a white facet (2) + white sparkle (3); bad gems are grey through-and-through.
+sprPalTab:
+    DWORD 0, 1, 0x0040E040,  0, 2, 0x00A0FFA0,  0, 3, 0x00FFFFFF   ; 0 WIDE   green (good)
+    DWORD 1, 1, 0x00585858,  1, 2, 0x00888888,  1, 3, 0x00A8A8A8   ; 1 NARROW grey  (bad)
+    DWORD 2, 1, 0x00FFC020,  2, 2, 0x00FFE890,  2, 3, 0x00FFFFFF   ; 2 MULTI  gold  (good)
+    DWORD 3, 1, 0x0030D0E0,  3, 2, 0x00A0F0FF,  3, 3, 0x00FFFFFF   ; 3 STICKY cyan  (good)
+    DWORD 4, 1, 0x00585858,  4, 2, 0x00888888,  4, 3, 0x00A8A8A8   ; 4 FAST   grey  (bad)
+    DWORD 5, 1, 0x00E040E0,  5, 2, 0x00FFA0FF,  5, 3, 0x00FFFFFF   ; 5 TRAIL  magenta(good)
+    DWORD 6, 1, 0x00FFFFFF,  6, 2, 0x00C0E0FF                      ; 6 ball   white + glint
+    DWORD 7, 1, 0x0030C0E0,  7, 2, 0x00E0FFFF,  7, 3, 0x00FF8030   ; 7 bat    cyan/chrome/bumper
+    DWORD 999, 0, 0
 
 ; ---- the BALL pool (multi-ball) and the falling-PACK pool. Records are 16-aligned
 ;      (pool bases .balign 16, strides 24/16) so every DWORD field is 4-aligned. ----
