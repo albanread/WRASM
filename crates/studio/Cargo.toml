@@ -29,6 +29,9 @@ rasm = { path = "../.." }
 docpane = { path = "../../../WF66/crates/docpane" }
 # Timestamp for the offscreen PNG snapshots (also already in the docpane tree).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Embedded TCL interpreter — drives the IDE for scripted UI tests (type, click,
+# drag splitters, screenshot, assert). From e:\doccrate; pure Rust, no deps.
+rust-tcl = { path = "../../../doccrate/crates/rust-tcl" }
 
 # Win32 + Direct2D, only for the windowed `studio` binary. The render core is
 # docpane's; here we just own the window, the message loop, and the editor pane.

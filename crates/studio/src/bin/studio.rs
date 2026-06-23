@@ -87,6 +87,7 @@ mod gui {
 
     use docpane::layout::Layout;
     use docpane::{layout as dlayout, parser, render, theme};
+    use rust_tcl::{Arity, Error as TclError, Registry, Value};
 
     use studio::diagnostics;
     use studio::doc::Doc;
@@ -1098,9 +1099,18 @@ main:
         /// it needs no visible desktop, which is what makes it reviewable headless
         /// (and is the whole point of the `--shot` mode). Returns the file path.
         fn snapshot(&mut self, dir: &Path) -> anyhow::Result<PathBuf> {
-            // Headless (`--shot`, no window yet): adopt a default viewport and
-            // reveal the caret, so the frame matches a real first paint. A live
-            // F12 keeps the window's current size and scroll.
+            let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let path = dir.join(format!("studio_shot_{stamp}.png"));
+            self.render_png(&path)?;
+            Ok(path)
+        }
+
+        /// Render the current frame to `path` as a PNG via an offscreen WIC
+        /// target — the same `render_frame` the window draws, no desktop needed.
+        /// Shared by `--shot`, the F12 snapshot, and the TCL `screenshot` verb.
+        fn render_png(&mut self, path: &Path) -> anyhow::Result<()> {
+            // Headless (no window yet): adopt a default viewport and reveal the
+            // caret, so the frame matches a real first paint.
             if self.client_w == 0 {
                 self.client_w = 1100;
                 self.client_h = 720;
@@ -1108,8 +1118,6 @@ main:
             }
             let (vw, vh) = self.viewport();
             let (pw, ph) = (vw.ceil() as u32, vh.ceil() as u32);
-            let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-            let path = dir.join(format!("studio_shot_{stamp}.png"));
 
             unsafe {
                 let wic: IWICImagingFactory =
@@ -1151,7 +1159,7 @@ main:
                 frame.Commit()?;
                 encoder.Commit()?;
             }
-            Ok(path)
+            Ok(())
         }
 
         /// Per-source-row `(top, height)` in DIPs. A row is one text line tall,
@@ -2091,6 +2099,261 @@ main:
             .to_string()
     }
 
+    // ── TCL UI scripting: drive the IDE for headless, screenshot-able UI tests ──
+    //
+    // An embedded TCL interpreter runs a script against a (windowless) `App`,
+    // with verbs that type, move/click/drag the mouse, set the splitters, open
+    // files, screenshot to PNG, read back state, and assert. The VM runs
+    // synchronously on this thread, so verbs reach the `App` through a
+    // thread-local pointer set for the duration of `eval` — no locking, and the
+    // `App` need not be `Send`.
+
+    thread_local! {
+        static SCRIPT_APP: std::cell::Cell<*mut App> = std::cell::Cell::new(std::ptr::null_mut());
+    }
+
+    /// Run `f` against the script's bound `App` (valid only while a script runs).
+    fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> R {
+        let p = SCRIPT_APP.with(|c| c.get());
+        assert!(!p.is_null(), "no App bound for the TCL script");
+        f(unsafe { &mut *p })
+    }
+
+    fn num(a: &[Value], i: usize) -> Result<f32, TclError> {
+        a.get(i)
+            .and_then(|v| v.as_str().parse::<f32>().ok())
+            .ok_or_else(|| TclError::runtime(format!("argument {} must be a number", i + 1)))
+    }
+    fn uint(a: &[Value], i: usize) -> Result<usize, TclError> {
+        a.get(i)
+            .and_then(|v| v.as_str().parse::<usize>().ok())
+            .ok_or_else(|| TclError::runtime(format!("argument {} must be an integer", i + 1)))
+    }
+    fn boolstr(b: bool) -> Value {
+        Value::new(if b { "1" } else { "0" })
+    }
+
+    /// Map a key name (optionally `Ctrl+`/`Shift+` prefixed) to a virtual key +
+    /// modifiers, for the `key` verb.
+    fn map_key(spec: &str) -> Option<(VIRTUAL_KEY, bool, bool)> {
+        let (mut ctrl, mut shift, mut name) = (false, false, spec);
+        for part in spec.split('+') {
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                _ => name = part,
+            }
+        }
+        let code: u16 = match name.to_ascii_lowercase().as_str() {
+            "enter" | "return" => 0x0D,
+            "backspace" | "back" => 0x08,
+            "delete" | "del" => 0x2E,
+            "tab" => 0x09,
+            "escape" | "esc" => 0x1B,
+            "left" => 0x25,
+            "up" => 0x26,
+            "right" => 0x27,
+            "down" => 0x28,
+            "home" => 0x24,
+            "end" => 0x23,
+            "pageup" | "prior" => 0x21,
+            "pagedown" | "next" => 0x22,
+            s if s.len() == 1 => s.chars().next().unwrap().to_ascii_uppercase() as u16,
+            _ => return None,
+        };
+        Some((VIRTUAL_KEY(code), ctrl, shift))
+    }
+
+    fn set_pane(pane: &str, open: bool) -> Result<Value, TclError> {
+        match pane {
+            "assistant" => with_app(|app| {
+                app.assistant_open = open;
+                app.card_layout = None;
+            }),
+            "output" => with_app(|app| {
+                app.output_open = open;
+                app.clamp_editor_scroll();
+            }),
+            other => return Err(TclError::runtime(format!("unknown pane: {other} (assistant|output)"))),
+        }
+        Ok(Value::new(""))
+    }
+
+    /// TCL core verbs (`set`/`if`/`expr`/`foreach`/…) plus the IDE-driving verbs.
+    fn script_registry() -> Registry {
+        let mut r = Registry::with_core();
+
+        // input
+        r.register("type", Arity::exact(1), |_, a| {
+            let text = a[0].as_str().to_string();
+            with_app(|app| {
+                for ch in text.chars() {
+                    app.on_char(ch as u32);
+                }
+            });
+            Ok(Value::new(""))
+        });
+        r.register("key", Arity::exact(1), |_, a| {
+            let (vk, ctrl, shift) = map_key(a[0].as_str())
+                .ok_or_else(|| TclError::runtime(format!("unknown key: {}", a[0].as_str())))?;
+            with_app(|app| {
+                app.on_key(vk, ctrl, shift);
+            });
+            Ok(Value::new(""))
+        });
+        r.register("caret", Arity::exact(2), |_, a| {
+            let (row, col) = (uint(a, 0)?, uint(a, 1)?);
+            with_app(|app| {
+                app.doc.set_caret(row, col);
+                app.after_caret();
+            });
+            Ok(Value::new(""))
+        });
+
+        // pointer
+        r.register("move", Arity::exact(2), |_, a| {
+            let (x, y) = (num(a, 0)?, num(a, 1)?);
+            with_app(|app| {
+                app.last_mouse = (x, y);
+                app.on_mouse_move(x, y);
+            });
+            Ok(Value::new(""))
+        });
+        r.register("click", Arity::exact(2), |_, a| {
+            let (x, y) = (num(a, 0)?, num(a, 1)?);
+            with_app(|app| {
+                app.on_press(x, y, false, false);
+                app.dragging = false;
+                app.drag_split = None;
+            });
+            Ok(Value::new(""))
+        });
+        r.register("drag", Arity::exact(4), |_, a| {
+            let (x1, y1, x2, y2) = (num(a, 0)?, num(a, 1)?, num(a, 2)?, num(a, 3)?);
+            with_app(|app| {
+                app.on_press(x1, y1, false, false);
+                app.last_mouse = (x2, y2);
+                app.on_mouse_move(x2, y2);
+                app.dragging = false;
+                app.drag_split = None;
+            });
+            Ok(Value::new(""))
+        });
+
+        // panes / splitters
+        r.register("splitter", Arity::exact(2), |_, a| {
+            let v = num(a, 1)?;
+            match a[0].as_str() {
+                "col" => with_app(|app| {
+                    app.split_frac = v.clamp(0.05, 0.95);
+                    app.assistant_open = true;
+                    app.card_layout = None;
+                }),
+                "row" => with_app(|app| {
+                    app.output_h = v.max(0.0);
+                    app.output_open = true;
+                    app.clamp_editor_scroll();
+                }),
+                other => return Err(TclError::runtime(format!("splitter: expected col|row, got {other}"))),
+            }
+            Ok(Value::new(""))
+        });
+        r.register("collapse", Arity::exact(1), |_, a| set_pane(a[0].as_str(), false));
+        r.register("expand", Arity::exact(1), |_, a| set_pane(a[0].as_str(), true));
+
+        // files / window
+        r.register("open", Arity::exact(1), |_, a| {
+            let p = PathBuf::from(a[0].as_str());
+            with_app(|app| app.file_open(&p));
+            Ok(Value::new(""))
+        });
+        r.register("new", Arity::exact(0), |_, _| {
+            with_app(|app| app.file_new());
+            Ok(Value::new(""))
+        });
+        r.register("size", Arity::exact(2), |_, a| {
+            let (w, h) = (uint(a, 0)? as u32, uint(a, 1)? as u32);
+            with_app(|app| {
+                app.client_w = w;
+                app.client_h = h;
+                app.card_layout = None;
+            });
+            Ok(Value::new(""))
+        });
+
+        // screenshot
+        r.register("screenshot", Arity::exact(1), |_, a| {
+            let p = PathBuf::from(a[0].as_str());
+            with_app(|app| app.render_png(&p))
+                .map_err(|e| TclError::runtime(format!("screenshot: {e:#}")))?;
+            Ok(Value::new(a[0].as_str()))
+        });
+
+        // state read-back (for assertions)
+        r.register("text", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.doc.text()))));
+        r.register("line", Arity::exact(1), |_, a| {
+            let n = uint(a, 0)?;
+            Ok(Value::new(with_app(|app| app.doc.line(n).to_string())))
+        });
+        r.register("linecount", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.doc.line_count().to_string())))
+        });
+        r.register("caret-row", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.doc.caret.row.to_string())))
+        });
+        r.register("caret-col", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.doc.caret.col.to_string())))
+        });
+        r.register("notice", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.notice.clone()))));
+        r.register("split-frac", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| format!("{:.4}", app.split_frac))))
+        });
+        r.register("output-h", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| format!("{:.1}", app.output_h))))
+        });
+        r.register("assistant-open", Arity::exact(0), |_, _| Ok(boolstr(with_app(|app| app.assistant_open))));
+        r.register("output-open", Arity::exact(0), |_, _| Ok(boolstr(with_app(|app| app.output_open))));
+        r.register("hover-split", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| match app.hover_split {
+                Some(Split::Col) => "col",
+                Some(Split::Row) => "row",
+                None => "none",
+            })))
+        });
+
+        // assertions (a failure aborts the script with a non-zero exit)
+        r.register("assert", Arity::range(1, 2), |_, a| {
+            let v = a[0].as_str();
+            if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false") {
+                Err(TclError::runtime(
+                    a.get(1).map(|m| m.as_str().to_string()).unwrap_or_else(|| format!("assertion failed: {v}")),
+                ))
+            } else {
+                Ok(Value::new(""))
+            }
+        });
+        r.register("assert-eq", Arity::range(2, 3), |_, a| {
+            let (x, y) = (a[0].as_str(), a[1].as_str());
+            if x == y {
+                Ok(Value::new(""))
+            } else {
+                let pfx = a.get(2).map(|m| format!("{}: ", m.as_str())).unwrap_or_default();
+                Err(TclError::runtime(format!("{pfx}expected `{y}`, got `{x}`")))
+            }
+        });
+
+        r
+    }
+
+    /// Run a TCL `source` script against `app`, returning its captured output.
+    fn run_script(source: &str, app: &mut App) -> anyhow::Result<String> {
+        let registry = script_registry();
+        SCRIPT_APP.with(|c| c.set(app as *mut App));
+        let result = rust_tcl::eval(source, &registry);
+        SCRIPT_APP.with(|c| c.set(std::ptr::null_mut()));
+        result.map(|r| r.output).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     pub fn run() -> anyhow::Result<()> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // for WIC (snapshots)
@@ -2114,6 +2377,25 @@ main:
             let mut app = App::new(HWND::default(), lang);
             let path = app.snapshot(&dir)?;
             println!("wrote {}", path.display());
+            return Ok(());
+        }
+
+        // Headless TCL UI script: `--script <file>` or `--exec "<tcl>"`. Drives a
+        // windowless App (type / click / drag splitters / screenshot / assert)
+        // and exits — so UI tests run from the shell and the shots are reviewable.
+        let script_src = if let Some(i) = args.iter().position(|a| a == "--script") {
+            let f = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--script needs a file path"))?;
+            Some(std::fs::read_to_string(f).map_err(|e| anyhow::anyhow!("read {f}: {e}"))?)
+        } else if let Some(i) = args.iter().position(|a| a == "--exec") {
+            Some(args.get(i + 1).cloned().ok_or_else(|| anyhow::anyhow!("--exec needs a script string"))?)
+        } else {
+            None
+        };
+        if let Some(src) = script_src {
+            let lang = Lang::spawn(&db).ok();
+            let mut app = App::new(HWND::default(), lang);
+            let out = run_script(&src, &mut app)?;
+            print!("{out}");
             return Ok(());
         }
 
