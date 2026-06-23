@@ -78,6 +78,12 @@ DROP_H      equ 9                  ; gem catch-box height (logical px)
 GEM_W       equ 20                 ; faceted-gem sprite width
 GEM_H       equ 16                 ; faceted-gem sprite height
 BALL_PX     equ 8                  ; round-ball sprite (square)
+MINE_PX     equ 16                 ; spinning-mine sprite (square)
+
+; ---- MINES: red bricks scatter 3 spinning grey mines that fall at slightly random
+;      angles; if one reaches the BAT the bat explodes (a life lost). ----
+MINE_MAX    equ 16                 ; max mines in flight
+MINE_STRIDE equ 24                 ; { x@0, y@4, vx@8, vy@12 (fixed-pt), active@16, phase@20 }
 
 .DATA
 .balign 16
@@ -186,6 +192,18 @@ GameInit:
     lea     rdx, [rip + coinFrames]
     call    CopySfx
 
+    ; --- bake the two melodic jingles (note sequences -> stereo buffers) ---
+    lea     rcx, [rip + powerUpBuf]
+    lea     rdx, [rip + powerUpFrames]
+    lea     r8, [rip + puNotes]
+    mov     r9d, 4
+    call    BakeJingle
+    lea     rcx, [rip + gameOverBuf]
+    lea     rdx, [rip + gameOverFrames]
+    lea     r8, [rip + goNotes]
+    mov     r9d, 4
+    call    BakeJingle
+
     ; --- start the looping soundtrack (ABC text -> midiOut scheduler thread) ---
     mov     dword ptr [rip + gMusicLoop], 1
     lea     rcx, [rip + soundtrack]
@@ -226,8 +244,14 @@ proc ResetGame frame
     mov     dword ptr [rip + stickyMode], 0      ; no STICKY pack active
     mov     dword ptr [rip + trailMode], 0       ; ball trail OFF until a TRAIL pack is caught
     mov     dword ptr [rip + packMsgTimer], 0    ; no pickup banner
+    mov     dword ptr [rip + musicVol], 127      ; soundtrack back to full
+    mov     dword ptr [rip + musicTarget], 127
+    mov     dword ptr [rip + duckHold], 0
     call    BuildBricks
     call    ResetBall
+    call    MineClear
+    mov     ecx, 127
+    call    MusicSetVol                          ; restore the channel volume baseline
 endproc
 
 ; ===========================================================================
@@ -310,6 +334,7 @@ GameStep:
 gs_playing:
     call    UpdatePaddle
     call    UpdateBall
+    call    MineUpdate               ; fall the mines; a bat hit explodes the bat
     call    DropUpdate               ; fall + catch the falling power-up gems
     mov     eax, [rip + bricksLeft]
     test    eax, eax
@@ -317,6 +342,7 @@ gs_playing:
     mov     dword ptr [rip + gameState], 2       ; WIN
 gs_draw:
     call    BallGlow                 ; emit the ball's glowing trail (BEFORE PtUpdate/PtDraw)
+    call    BatMagnetGlow            ; magnet glow at the bat while STICKY
     call    PopsUpdate               ; float the score-pops up + fade them
     call    DrawScene
     ret
@@ -467,20 +493,7 @@ ub_ocnext:
 ub_ochk:
     test    edx, edx
     jnz     ub_oalive
-    ; whole pool drained -> lose a life (one explode, not one per ball)
-    dec     dword ptr [rip + lives]
-    lea     rcx, [rip + explodeBuf]
-    mov     edx, [rip + explodeFrames]
-    call    Play
-    mov     eax, [rip + lives]
-    test    eax, eax
-    jg      ub_orepark
-    mov     dword ptr [rip + gameState], 3   ; GAMEOVER
-    jmp     ub_oalive
-ub_orepark:
-    mov     dword ptr [rip + paddleW], 40    ; death clears the size/sticky packs
-    mov     dword ptr [rip + stickyMode], 0
-    call    ResetBall
+    call    LoseLife                         ; explode the bat, reset packs, repark or GAME OVER
 ub_oalive:
 endproc
 
@@ -689,6 +702,17 @@ ubsf_col:
     mov     edx, esi
     add     edx, 5                   ; logical centre Y
     call    DropMaybe
+
+    ; --- RED bricks (rows 0,1) scatter 3 spinning mines on the kill ---
+    mov     eax, r12d
+    sar     eax, 3                   ; row
+    cmp     eax, 2
+    jge     ub_brkbounce
+    mov     ecx, ebx
+    add     ecx, 18                  ; centre X
+    mov     edx, esi
+    add     edx, 5                   ; centre Y
+    call    MineScatter
 ub_brkbounce:
     mov     edi, [rip + ballDX]
     sar     edi, 8
@@ -1044,10 +1068,18 @@ du_loop:
     call    DropApply
     mov     ecx, [rdi + 8]
     call    SetPackMsg
-    mov     dword ptr [rdi + 12], 0      ; free the slot
     lea     rcx, [rip + coinBuf]
     mov     edx, [rip + coinFrames]
     call    Play
+    ; good packs get the upbeat pickup jingle (+ soundtrack duck).
+    mov     eax, [rdi + 8]
+    lea     rcx, [rip + gemGood]
+    movzx   eax, byte ptr [rcx + rax]
+    test    eax, eax
+    jz      du_caught_done
+    call    PlayPowerUp
+du_caught_done:
+    mov     dword ptr [rdi + 12], 0      ; free the slot
     jmp     du_next
 du_free:
     mov     dword ptr [rdi + 12], 0      ; missed -> free
@@ -1319,7 +1351,7 @@ endproc
 ; per-kind + ball + bat palettes, and upload both. Called once from FxBoot (after
 ; SprInit). Mirrors gpu_g3.was's BuildSpriteFrames + BuildSpritePalettes flow.
 ; ===========================================================================
-proc BuildSprAssets frame
+proc BuildSprAssets uses rdi frame
     call    BuildGemPix
     call    BuildBallPix
     lea     rcx, [rip + batPix0]
@@ -1360,6 +1392,43 @@ proc BuildSprAssets frame
     mov     r8d, 10
     call    SprAddFrame
     mov     [rip + fidBat2], eax
+    ; four spinning mine frames -> fidMineTab[0..3]
+    lea     rcx, [rip + minePix0]
+    xor     edx, edx
+    call    BuildMinePix
+    lea     rcx, [rip + minePix1]
+    mov     edx, 1
+    call    BuildMinePix
+    lea     rcx, [rip + minePix2]
+    mov     edx, 2
+    call    BuildMinePix
+    lea     rcx, [rip + minePix3]
+    mov     edx, 3
+    call    BuildMinePix
+    lea     rcx, [rip + minePix0]
+    mov     edx, MINE_PX
+    mov     r8d, MINE_PX
+    call    SprAddFrame
+    lea     rdi, [rip + fidMineTab]
+    mov     [rdi + 0], eax
+    lea     rcx, [rip + minePix1]
+    mov     edx, MINE_PX
+    mov     r8d, MINE_PX
+    call    SprAddFrame
+    lea     rdi, [rip + fidMineTab]
+    mov     [rdi + 4], eax
+    lea     rcx, [rip + minePix2]
+    mov     edx, MINE_PX
+    mov     r8d, MINE_PX
+    call    SprAddFrame
+    lea     rdi, [rip + fidMineTab]
+    mov     [rdi + 8], eax
+    lea     rcx, [rip + minePix3]
+    mov     edx, MINE_PX
+    mov     r8d, MINE_PX
+    call    SprAddFrame
+    lea     rdi, [rip + fidMineTab]
+    mov     [rdi + 12], eax
     call    SprUploadAtlas
     call    SetupSprPalettes
     call    SprUploadPalette
@@ -1553,6 +1622,465 @@ sps_loop:
 sps_done:
 endproc
 
+; ---- BuildMinePix(rcx=buf, edx=frame) — a classic grey naval MINE (16x16): a dark
+;      sphere (index 1) with a glint (index 3) and 8 spikes (index 2) whose tips come
+;      from mineSpikes[frame] — four frames step the spikes round, so the mine SPINS. ----
+proc BuildMinePix uses rbx rsi rdi r12 r13 r14 in rcx rdx
+    mov     rbx, rcx                     ; buf base (kept)
+    mov     r14d, edx                    ; frame
+    mov     rdi, rbx                     ; walking ptr
+    xor     r12d, r12d                   ; y
+mnp_y:
+    cmp     r12d, 16
+    jge     mnp_spikes
+    xor     r13d, r13d                   ; x
+mnp_x:
+    cmp     r13d, 16
+    jge     mnp_yn
+    ; sphere: (2x-15)^2 + (2y-15)^2 <= 64  (radius 4)
+    mov     eax, r13d
+    add     eax, eax
+    sub     eax, 15
+    imul    eax, eax
+    mov     esi, r12d
+    add     esi, esi
+    sub     esi, 15
+    imul    esi, esi
+    add     eax, esi
+    cmp     eax, 64
+    jg      mnp_zero
+    mov     eax, 1                       ; body
+    cmp     r13d, 4
+    jge     mnp_put
+    cmp     r12d, 4
+    jge     mnp_put
+    mov     eax, 3                       ; upper-left glint
+mnp_put:
+    mov     [rdi], al
+    inc     rdi
+    inc     r13d
+    jmp     mnp_x
+mnp_zero:
+    mov     byte ptr [rdi], 0
+    inc     rdi
+    inc     r13d
+    jmp     mnp_x
+mnp_yn:
+    inc     r12d
+    jmp     mnp_y
+mnp_spikes:
+    ; spikes: 8 tips from mineSpikes + frame*16; plot the tip + a midpoint to the body.
+    lea     rsi, [rip + mineSpikes]
+    mov     eax, r14d
+    shl     eax, 4
+    add     rsi, rax
+    xor     r12d, r12d                   ; spike 0..7
+mnp_sk:
+    cmp     r12d, 8
+    jge     mnp_done
+    movzx   ecx, byte ptr [rsi + 0]      ; tipX
+    movzx   edx, byte ptr [rsi + 1]      ; tipY
+    mov     eax, edx
+    shl     eax, 4
+    add     eax, ecx
+    mov     byte ptr [rbx + rax], 2      ; tip pixel
+    ; midpoint between centre(8,8) and tip
+    mov     eax, ecx
+    add     eax, 8
+    sar     eax, 1                       ; midX
+    mov     r13d, edx
+    add     r13d, 8
+    sar     r13d, 1                      ; midY
+    mov     ecx, r13d
+    shl     ecx, 4
+    add     ecx, eax
+    mov     byte ptr [rbx + rcx], 2
+    add     rsi, 2
+    inc     r12d
+    jmp     mnp_sk
+mnp_done:
+endproc
+
+; ===========================================================================
+; MineScatter(ecx=centreX, edx=centreY logical) — spawn 3 mines from a broken RED
+; brick, each at a slightly different downward angle (LCG jitter). Stored x,y is the
+; mine CENTRE (board coords, fixed-point).
+; ===========================================================================
+proc MineScatter uses rbx rsi rdi r12 r13 in rcx rdx
+    mov     r12d, ecx                    ; centre X
+    mov     r13d, edx                    ; centre Y
+    xor     edi, edi                     ; spawned 0..2
+mns_each:
+    cmp     edi, 3
+    jge     mns_done
+    lea     rsi, [rip + minePool]
+    xor     ecx, ecx
+mns_find:
+    cmp     ecx, MINE_MAX
+    jge     mns_done                     ; pool full -> stop
+    mov     eax, ecx
+    imul    eax, eax, MINE_STRIDE
+    lea     rbx, [rsi + rax]
+    mov     eax, [rbx + 16]
+    test    eax, eax
+    jz      mns_use
+    inc     ecx
+    jmp     mns_find
+mns_use:
+    mov     eax, r12d
+    shl     eax, 8
+    mov     [rbx + 0], eax               ; x (fixed-pt)
+    mov     eax, r13d
+    shl     eax, 8
+    mov     [rbx + 4], eax               ; y
+    ; LCG jitter
+    mov     eax, [rip + dropSeed]
+    mov     ecx, 1103515245
+    imul    eax, ecx
+    add     eax, 12345
+    mov     [rip + dropSeed], eax
+    mov     ecx, eax
+    and     ecx, 127
+    sub     ecx, 64                      ; jitter -64..63
+    ; vx base by spawn index: -200 / 0 / +200 (fixed-pt) + jitter
+    mov     edx, 0
+    cmp     edi, 0
+    jne     mns_v1
+    mov     edx, -200
+    jmp     mns_vset
+mns_v1:
+    cmp     edi, 1
+    jne     mns_v2
+    mov     edx, 0
+    jmp     mns_vset
+mns_v2:
+    mov     edx, 200
+mns_vset:
+    add     edx, ecx
+    mov     [rbx + 8], edx               ; vx
+    mov     eax, ecx
+    sar     eax, 1
+    add     eax, 300                     ; vy = 300 + jitter/2 (~1.2 px/frame down)
+    mov     [rbx + 12], eax
+    mov     dword ptr [rbx + 16], 1      ; active
+    mov     [rbx + 20], edi              ; phase = spawn index (spin variety)
+    inc     edi
+    jmp     mns_each
+mns_done:
+endproc
+
+; ===========================================================================
+; MineUpdate — fall every active mine; on overlap with the BAT the bat explodes
+; (LoseLife); off the bottom it vanishes. Called each frame in GameStep (PLAYING).
+; ===========================================================================
+proc MineUpdate uses rbx rsi rdi r12 r13 frame
+    lea     rsi, [rip + minePool]
+    xor     ebx, ebx
+mnu_loop:
+    cmp     ebx, MINE_MAX
+    jge     mnu_done
+    mov     eax, ebx
+    imul    eax, eax, MINE_STRIDE
+    lea     rdi, [rsi + rax]
+    mov     eax, [rdi + 16]
+    test    eax, eax
+    jz      mnu_next
+    mov     eax, [rdi + 8]               ; x += vx
+    add     [rdi + 0], eax
+    mov     eax, [rdi + 12]              ; y += vy
+    add     [rdi + 4], eax
+    mov     r12d, [rdi + 0]
+    sar     r12d, 8                      ; x_log (centre)
+    mov     r13d, [rdi + 4]
+    sar     r13d, 8                      ; y_log (centre)
+    cmp     r13d, 200
+    jg      mnu_free                     ; off the bottom -> vanish
+    ; bat band? centre y within [182,194] (paddle 185-190 + mine radius)
+    cmp     r13d, 182
+    jl      mnu_next
+    cmp     r13d, 194
+    jg      mnu_next
+    ; x overlap with the paddle [px, px+paddleW], mine half-width ~5
+    mov     edx, [rip + paddleX]
+    sar     edx, 8                       ; px
+    mov     ecx, r12d
+    add     ecx, 5
+    cmp     ecx, edx
+    jl      mnu_next                     ; mine right edge left of paddle
+    mov     ecx, edx
+    add     ecx, [rip + paddleW]
+    mov     eax, r12d
+    sub     eax, 5
+    cmp     eax, ecx
+    jg      mnu_next                     ; mine left edge right of paddle
+    ; --- BAT HIT: explode + lose a life (LoseLife clears the whole mine pool) ---
+    mov     dword ptr [rdi + 16], 0
+    call    LoseLife
+    jmp     mnu_done
+mnu_free:
+    mov     dword ptr [rdi + 16], 0
+mnu_next:
+    inc     ebx
+    jmp     mnu_loop
+mnu_done:
+endproc
+
+; ---- MineClear — deactivate every mine (a fresh life / a new game). ----
+proc MineClear uses rdi
+    lea     rdi, [rip + minePool]
+    mov     ecx, MINE_MAX
+mnc_loop:
+    mov     dword ptr [rdi + 16], 0
+    add     rdi, MINE_STRIDE
+    dec     ecx
+    jnz     mnc_loop
+endproc
+
+; ---- MineDraw — queue a spinning-mine sprite per active mine (frame cycles on the
+;      global tick + the mine's phase). ----
+proc MineDraw uses rbx rsi rdi r12 frame
+    lea     rsi, [rip + minePool]
+    xor     ebx, ebx
+mnd_loop:
+    cmp     ebx, MINE_MAX
+    jge     mnd_done
+    mov     eax, ebx
+    imul    eax, eax, MINE_STRIDE
+    lea     rdi, [rsi + rax]
+    mov     eax, [rdi + 16]
+    test    eax, eax
+    jz      mnd_next
+    mov     ecx, [rdi + 0]
+    sar     ecx, 8
+    mov     edx, [rdi + 4]
+    sar     edx, 8
+    call    ScrFromLogical
+    subss   xmm1, [rip + fHalfMine]
+    subss   xmm2, [rip + fHalfMine]
+    movss   xmm3, [rip + fAlpha1]
+    mov     eax, [rip + gTick]
+    sar     eax, 2
+    add     eax, [rdi + 20]              ; + phase
+    and     eax, 3
+    lea     rcx, [rip + fidMineTab]
+    mov     ecx, [rcx + rax*4]           ; this frame's mine id
+    mov     r8d, 8                       ; mine palette slot
+    call    SprPush
+mnd_next:
+    inc     ebx
+    jmp     mnd_loop
+mnd_done:
+endproc
+
+; ===========================================================================
+; LoseLife — the bat is destroyed (drained ball OR a mine hit): orange explosion +
+; Explode SFX, ALL pack benefits reset (user spec), mines cleared, then repark one
+; ball — or GAME OVER + the sad jingle when the last life is gone.
+; ===========================================================================
+proc LoseLife frame
+    dec     dword ptr [rip + lives]
+    ; explosion particles at the bat centre.
+    mov     ecx, [rip + paddleX]
+    sar     ecx, 8
+    mov     edx, [rip + paddleW]
+    sar     edx, 1
+    add     ecx, edx
+    add     ecx, [rip + canvasOX]
+    cvtsi2ss xmm0, ecx
+    mulss   xmm0, [rip + fxTxScaleX]
+    addss   xmm0, [rip + fxTxOffX]
+    mov     edx, 187
+    add     edx, [rip + canvasOY]
+    cvtsi2ss xmm1, edx
+    mulss   xmm1, [rip + fxTxScaleY]
+    addss   xmm1, [rip + fxTxOffY]
+    movss   xmm4, [rip + explR]
+    movss   xmm5, [rip + explG]
+    movss   xmm6, [rip + explB]
+    movss   xmm3, [rip + explSpeed]
+    mov     ecx, 40                      ; a big debris burst
+    call    PtBurst
+    lea     rcx, [rip + explodeBuf]
+    mov     edx, [rip + explodeFrames]
+    call    Play
+    ; reset EVERY pack benefit — a new life starts plain (user spec).
+    mov     dword ptr [rip + paddleW], 40
+    mov     dword ptr [rip + stickyMode], 0
+    mov     dword ptr [rip + trailMode], 0
+    call    MineClear
+    mov     eax, [rip + lives]
+    test    eax, eax
+    jg      ll_repark
+    mov     dword ptr [rip + gameState], 3   ; GAME OVER
+    call    PlayGameOver
+    jmp     ll_done
+ll_repark:
+    call    ResetBall
+ll_done:
+endproc
+
+; ---- BatMagnetGlow — while STICKY, emit a soft blue-violet glow at the bat centre so
+;      it reads as magnetised. Additive particles, like the ball trail. ----
+proc BatMagnetGlow frame
+    mov     eax, [rip + stickyMode]
+    test    eax, eax
+    jz      bmg_done
+    mov     ecx, [rip + paddleX]
+    sar     ecx, 8
+    mov     edx, [rip + paddleW]
+    sar     edx, 1
+    add     ecx, edx
+    add     ecx, [rip + canvasOX]
+    cvtsi2ss xmm0, ecx
+    mulss   xmm0, [rip + fxTxScaleX]
+    addss   xmm0, [rip + fxTxOffX]
+    mov     edx, 186
+    add     edx, [rip + canvasOY]
+    cvtsi2ss xmm1, edx
+    mulss   xmm1, [rip + fxTxScaleY]
+    addss   xmm1, [rip + fxTxOffY]
+    movss   xmm4, [rip + magR]
+    movss   xmm5, [rip + magG]
+    movss   xmm6, [rip + magB]
+    movss   xmm3, [rip + magSpeed]
+    mov     ecx, 3
+    call    PtBurst
+bmg_done:
+endproc
+
+; ===========================================================================
+; BakeJingle(rcx=destBuf, rdx=destFramesPtr, r8=noteTab, r9d=noteCount) — render a
+; note sequence {freqHz,durMs,wave} into one stereo buffer (each note placed after the
+; previous), via the synth's Tone+sndBuf. Pre-baked once at boot; Played on events.
+; ===========================================================================
+proc BakeJingle uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx r8 r9
+    mov     rdi, rcx                     ; destBuf
+    mov     r15, rdx                     ; destFramesPtr
+    mov     rbx, r8                      ; noteTab
+    mov     r12d, r9d                    ; noteCount
+    xor     r13d, r13d                   ; note index
+    xor     r14d, r14d                   ; cursor (frames)
+bj_loop:
+    cmp     r13d, r12d
+    jge     bj_done
+    mov     ecx, [rbx + 0]               ; freq
+    mov     edx, [rbx + 4]               ; durMs
+    mov     r8d, [rbx + 8]               ; wave
+    call    Tone                         ; -> sndBuf, sndFrames
+    mov     eax, [rip + sndFrames]       ; this note's frames
+    ; room left in the 44100-frame buffer
+    mov     ecx, 44100
+    sub     ecx, r14d
+    jle     bj_advance                   ; no room -> still advance the cursor
+    cmp     eax, ecx
+    jle     bj_haveN
+    mov     eax, ecx                     ; clamp to room
+bj_haveN:
+    lea     rsi, [rip + sndBuf]          ; src
+    mov     r9, rdi
+    mov     r8d, r14d
+    shl     r8, 4                        ; cursor*16 bytes (frames*2*8)
+    add     r9, r8                       ; dst = destBuf + cursor*16
+    mov     ecx, eax
+    add     ecx, ecx                     ; reals (qwords) = frames*2
+bj_copy:
+    test    ecx, ecx
+    jz      bj_advance
+    mov     r8, [rsi]
+    mov     [r9], r8
+    add     rsi, 8
+    add     r9, 8
+    dec     ecx
+    jmp     bj_copy
+bj_advance:
+    mov     eax, [rip + sndFrames]
+    add     r14d, eax                    ; cursor += note frames
+    add     rbx, 12
+    inc     r13d
+    jmp     bj_loop
+bj_done:
+    cmp     r14d, 44100
+    jle     bj_store
+    mov     r14d, 44100
+bj_store:
+    mov     [r15], r14d                  ; *destFramesPtr = total frames
+endproc
+
+; ---- PlayPowerUp / PlayGameOver — fire a baked jingle on the waveOut mixer and DUCK
+;      the MIDI soundtrack (fade down, hold for the jingle, then MusicDuckStep fades up). ----
+proc PlayPowerUp frame
+    lea     rcx, [rip + powerUpBuf]
+    mov     edx, [rip + powerUpFrames]
+    call    Play
+    mov     dword ptr [rip + musicTarget], 28    ; duck the tune
+    mov     dword ptr [rip + duckHold], 30       ; ~0.5 s
+endproc
+
+proc PlayGameOver frame
+    lea     rcx, [rip + gameOverBuf]
+    mov     edx, [rip + gameOverFrames]
+    call    Play
+    mov     dword ptr [rip + musicTarget], 10    ; duck deeper
+    mov     dword ptr [rip + duckHold], 70       ; ~1.2 s
+endproc
+
+; ---- MusicSetVol(ecx=0..127) — set MIDI channel volume (CC7) on every channel, so the
+;      soundtrack ducks under the jingles. No-op if the MIDI device isn't open. ----
+proc MusicSetVol uses rbx rsi frame in rcx
+    mov     rax, [rip + hmo]
+    test    rax, rax
+    jz      msv_done
+    and     ecx, 127
+    mov     ebx, ecx                     ; volume
+    xor     esi, esi                     ; channel 0..15
+msv_loop:
+    cmp     esi, 16
+    jge     msv_done
+    mov     eax, 0xB0                    ; control-change status
+    or      eax, esi                     ; | channel
+    or      eax, 0x0700                  ; controller 7 (channel volume)
+    mov     ecx, ebx
+    shl     ecx, 16                      ; value << 16
+    or      eax, ecx
+    mov     [rip + mvMsg], eax
+    invoke  midiOutShortMsg, [rip + hmo], [rip + mvMsg]
+    inc     esi
+    jmp     msv_loop
+msv_done:
+endproc
+
+; ---- MusicDuckStep — once per frame: count down the jingle hold (then aim the music
+;      back to full) and ramp the live volume toward the target, sending CC7 as it moves. ----
+proc MusicDuckStep frame
+    mov     eax, [rip + duckHold]
+    test    eax, eax
+    jz      mds_ramp
+    dec     dword ptr [rip + duckHold]
+    jnz     mds_ramp
+    mov     dword ptr [rip + musicTarget], 127   ; jingle done -> fade the tune back up
+mds_ramp:
+    mov     eax, [rip + musicVol]
+    mov     ecx, [rip + musicTarget]
+    cmp     eax, ecx
+    je      mds_done                     ; already settled -> no CC traffic
+    jl      mds_up
+    sub     eax, 12                      ; fade down
+    cmp     eax, ecx
+    jg      mds_set
+    mov     eax, ecx
+    jmp     mds_set
+mds_up:
+    add     eax, 12                      ; fade up
+    cmp     eax, ecx
+    jl      mds_set
+    mov     eax, ecx
+mds_set:
+    mov     [rip + musicVol], eax
+    mov     ecx, eax
+    call    MusicSetVol
+mds_done:
+endproc
+
 ; ===========================================================================
 ; DrawScene — Cls(0) then HUD, bricks, paddle, ball, and any state banner.
 ; Cls(0) clears the play area to index 0 = TRANSPARENT (the wall shows through);
@@ -1653,6 +2181,7 @@ db_paddle:
 
 db_banner:
     call    DropDraw                 ; falling power-up GEMS (faceted sprites) over the board
+    call    MineDraw                 ; spinning grey mines over the board
 
     mov     eax, [rip + gameState]
     cmp     eax, 0
@@ -1850,6 +2379,7 @@ FxFrame:
     call    WallFxSetTime            ; advance the wall sheen drift
     call    GameStep                 ; logic + draw into idxBuf + queue Text + queue sprites
     call    PtUpdate                 ; advance + fade + compact the shatter debris
+    call    MusicDuckStep            ; fade the soundtrack around any active jingle
 
     ; ---- the wall-aware compositor present ----
     pContext.OMSetRenderTargets(1, pRTV, 0)
@@ -2157,9 +2687,17 @@ proc FxDemoDrops frame
     ; split the live ball so the captured frame shows multi-ball.
     mov     ecx, 2                   ; MULTI
     call    DropApply
-    ; widen the paddle, turn the trail ON, and announce a pack so the BMP shows it all.
+    ; scatter mines from two "red brick" spots so the BMP shows them spinning down.
+    mov     ecx, 90
+    mov     edx, 40
+    call    MineScatter
+    mov     ecx, 230
+    mov     edx, 52
+    call    MineScatter
+    ; widen the paddle, turn the trail + STICKY (magnet glow) ON, announce a pack.
     mov     dword ptr [rip + paddleW], 64
     mov     dword ptr [rip + trailMode], 1
+    mov     dword ptr [rip + stickyMode], 1
     mov     ecx, 2                   ; "MULTI BALL"
     call    SetPackMsg
 endproc
@@ -2269,12 +2807,24 @@ fidBall   DWORD ?
 fidBat0   DWORD ?                       ; NARROW (50px) / normal (72) / WIDE (115)
 fidBat1   DWORD ?
 fidBat2   DWORD ?
+fidMineTab DWORD 4 dup(0)               ; the 4 spinning-mine frame ids
 .balign 16
 fAlpha1   DWORD 0x3F800000             ; 1.0f
 fHalfGemW DWORD 0x41200000             ; 10.0f  (GEM_W/2)
 fHalfGemH DWORD 0x41000000             ; 8.0f   (GEM_H/2)
 fHalfBall DWORD 0x40800000             ; 4.0f   (BALL_PX/2)
+fHalfMine DWORD 0x41000000             ; 8.0f   (MINE_PX/2)
 alphaTwk  DWORD 0x3F800000, 0x3F4CCCCD, 0x3F333333, 0x3F4CCCCD   ; 1.0, 0.8, 0.7, 0.8 twinkle
+
+; magnet glow (blue-violet, lingering) + bat-explosion debris (orange, fast).
+magR      DWORD 0x3ECCCCCD             ; 0.40
+magG      DWORD 0x3E99999A             ; 0.30
+magB      DWORD 0x3F800000             ; 1.00
+magSpeed  DWORD 0x3F19999A             ; 0.60f (lingers)
+explR     DWORD 0x3F800000             ; 1.00
+explG     DWORD 0x3F19999A             ; 0.60
+explB     DWORD 0x3DCCCCCD             ; 0.10
+explSpeed DWORD 0x40600000             ; 3.5f px/frame
 
 .balign 16
 gemPix    BYTE  320 dup(0)             ; GEM_W(20) * GEM_H(16)
@@ -2282,6 +2832,15 @@ ballPix   BYTE  64  dup(0)             ; BALL_PX(8)^2
 batPix0   BYTE  500 dup(0)             ; 50 * 10 (NARROW)
 batPix1   BYTE  720 dup(0)             ; 72 * 10 (normal)
 batPix2   BYTE  1150 dup(0)            ; 115 * 10 (WIDE)
+minePix0  BYTE  256 dup(0)             ; MINE_PX(16)^2, 4 spin frames
+minePix1  BYTE  256 dup(0)
+minePix2  BYTE  256 dup(0)
+minePix3  BYTE  256 dup(0)
+; spinning-mine spike TIP pixel coords (x,y) per frame: 4 frames x 8 spikes x 2.
+mineSpikes BYTE 14,8, 12,12, 8,14, 4,12, 2,8, 4,4, 8,2, 12,4      ; frame 0
+           BYTE 14,9, 11,13, 7,14, 3,11, 2,7, 5,3, 9,2, 13,5      ; frame 1
+           BYTE 14,10, 10,14, 6,14, 2,10, 2,6, 6,2, 10,2, 14,6    ; frame 2
+           BYTE 13,11, 9,14, 5,13, 2,9, 3,5, 7,2, 11,3, 14,7      ; frame 3
 
 .balign 16
 ; per-sprite palette: rows {slot, index, 0x00RRGGBB}; slot 999 terminates. Good gems
@@ -2295,6 +2854,7 @@ sprPalTab:
     DWORD 5, 1, 0x00E040E0,  5, 2, 0x00FFA0FF,  5, 3, 0x00FFFFFF   ; 5 TRAIL  magenta(good)
     DWORD 6, 1, 0x00FFFFFF,  6, 2, 0x00C0E0FF                      ; 6 ball   white + glint
     DWORD 7, 1, 0x0030C0E0,  7, 2, 0x00E0FFFF,  7, 3, 0x00FF8030   ; 7 bat    cyan/chrome/bumper
+    DWORD 8, 1, 0x00585858,  8, 2, 0x00989898,  8, 3, 0x00C8C8C8   ; 8 mine   grey sphere/spikes/glint
     DWORD 999, 0, 0
 
 ; ---- the BALL pool (multi-ball) and the falling-PACK pool. Records are 16-aligned
@@ -2303,4 +2863,27 @@ sprPalTab:
 ballPool  BYTE  192 dup(0)             ; BALL_MAX(8) * BALL_STRIDE(24)
 .balign 16
 dropPool  BYTE  128 dup(0)             ; DROP_MAX(8) * DROP_STRIDE(16)
+.balign 16
+minePool  BYTE  384 dup(0)             ; MINE_MAX(16) * MINE_STRIDE(24)
+.balign 16
+
+; ---- AUDIO: a music DUCK (CC7 channel volume fade) around two baked JINGLES. The
+;      good-pack pickup + the game-over phrase are note sequences rendered into stereo
+;      buffers at boot (BakeJingle), Played on the waveOut mixer while the MIDI tune
+;      fades down (musicVol -> musicTarget) then back up. ----
+musicVol    DWORD 127                  ; current CC7 channel volume (0..127)
+musicTarget DWORD 127                  ; where it's heading
+duckHold    DWORD 0                    ; frames the jingle still occupies (then aim back to 127)
+mvMsg       DWORD 0                    ; staged midiOutShortMsg dwMsg (trap #1)
+
+; note sequences { freqHz, durMs, wave } — wave 0 = sine.
+puNotes   DWORD 523, 80, 0,  659, 80, 0,  784, 80, 0,  1047, 140, 0   ; C-E-G-C ascending (good pack)
+goNotes   DWORD 440, 200, 0, 349, 200, 0, 294, 220, 0, 220, 360, 0    ; A-F-D-A descending (game over)
+
+.balign 16
+powerUpBuf   real8 88200 dup(0.0)      ; baked pickup jingle (1 s stereo)
+powerUpFrames DWORD ?
+.balign 16
+gameOverBuf  real8 88200 dup(0.0)      ; baked game-over phrase
+gameOverFrames DWORD ?
 .balign 16
