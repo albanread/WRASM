@@ -67,6 +67,47 @@ fn main() -> Result<()> {
         }
     }
     tx.commit()?;
-    println!("imported {entries} instructions ({rows} mnemonic rows) into {db}");
+
+    // ── WRASM dialect directives (a sibling table, same shape but `syntax`) ──
+    let dpath = "crates/winkb/data/directives.tsv";
+    let mut dirs = 0usize;
+    if let Ok(dtext) = std::fs::read_to_string(dpath) {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS directives;
+             CREATE TABLE directives (
+                name        TEXT PRIMARY KEY,
+                category    TEXT NOT NULL,
+                syntax      TEXT NOT NULL,
+                summary     TEXT NOT NULL,
+                description TEXT NOT NULL
+             );",
+        )?;
+        let dtx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = dtx.prepare(
+                "INSERT OR REPLACE INTO directives \
+                   (name, category, syntax, summary, description) VALUES (?1,?2,?3,?4,?5)",
+            )?;
+            for line in dtext.lines() {
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.trim().is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 6 {
+                    continue;
+                }
+                let mut names = vec![f[0].trim().to_ascii_lowercase()];
+                names.extend(f[1].split_whitespace().map(|a| a.to_ascii_lowercase()));
+                for name in names {
+                    stmt.execute(params![name, f[2].trim(), f[3].trim(), f[4].trim(), f[5].trim()])?;
+                    dirs += 1;
+                }
+            }
+        }
+        dtx.commit()?;
+    }
+
+    println!("imported {entries} instructions ({rows} rows) + {dirs} directive rows into {db}");
     Ok(())
 }

@@ -57,6 +57,16 @@ pub struct Instruction {
     pub description: String,
 }
 
+/// A WRASM dialect directive/macro explainer (the `directives` table).
+#[derive(Debug, Clone)]
+pub struct Directive {
+    pub name: String,
+    pub category: String,
+    pub syntax: String,
+    pub summary: String,
+    pub description: String,
+}
+
 /// A named integer value resolved from `constants` or `enum_members`.
 #[derive(Debug, Clone)]
 pub struct Value {
@@ -207,6 +217,41 @@ impl Kb {
                         mnemonic: r.get(0)?,
                         category: r.get(1)?,
                         flags: r.get(2)?,
+                        summary: r.get(3)?,
+                        description: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The WRASM directive/macro explainer for `name` (the `directives` table),
+    /// or `None` if absent. Case- and whitespace-insensitive.
+    pub fn directive(&self, name: &str) -> Result<Option<Directive>> {
+        let has: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='directives'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has {
+            return Ok(None);
+        }
+        let n = name.trim().to_ascii_lowercase();
+        self.conn
+            .query_row(
+                "SELECT name, category, syntax, summary, description \
+                   FROM directives WHERE name = ?1",
+                [n],
+                |r| {
+                    Ok(Directive {
+                        name: r.get(0)?,
+                        category: r.get(1)?,
+                        syntax: r.get(2)?,
                         summary: r.get(3)?,
                         description: r.get(4)?,
                     })

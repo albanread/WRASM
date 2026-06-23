@@ -63,6 +63,10 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
     if let Some(md) = register_card(q) {
         return Ok(md);
     }
+    // WRASM dialect directives (invoke / .if / proc / BYTE / …) — our own.
+    if let Some(md) = directive_card(kb, q)? {
+        return Ok(md);
+    }
     // DB-driven instruction explainer (broad, clean-room sourced); the curated
     // `mnemonic_card` is the fallback for anything not (yet) in the db.
     if let Some(md) = instruction_card(kb, q)? {
@@ -242,6 +246,19 @@ fn abi_slot(n: u32, type_name: &str) -> String {
         }
         _ => format!("`[rsp+{}]`", 32 + 8 * (n - 5)),
     }
+}
+
+/// The WRASM dialect directive card (the `directives` table — `invoke`, `.if`,
+/// `proc`, `BYTE`, …). `None` if `name` isn't a documented directive.
+fn directive_card(kb: &Kb, name: &str) -> Result<Option<String>> {
+    let Some(d) = kb.directive(name)? else { return Ok(None) };
+    let mut s = format!("# {}\n\n", d.summary);
+    if !d.syntax.trim().is_empty() {
+        s.push_str(&format!("```was\n{}\n```\n\n", d.syntax));
+    }
+    s.push_str(&format!("{}\n", d.description));
+    s.push_str(&format!("\n_{} · WRASM directive_\n", d.category.trim()));
+    Ok(Some(s))
 }
 
 /// The DB-driven instruction explainer (the `instructions` table — broad,
