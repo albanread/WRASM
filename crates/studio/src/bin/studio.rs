@@ -3123,13 +3123,12 @@ main:
     }
 
     const HELP: &str = "\
-RASM Studio — the WRASM x86-64 assembler IDE (Direct2D).
-
 USAGE
   studio                       open the IDE window
   studio --shot [dir]          render one offscreen frame to a PNG, then exit
   studio --script <file.tcl>   run a TCL UI script headlessly, then exit
   studio --exec \"<tcl>\"        run an inline TCL script, then exit
+  studio --version | -V        print the version
   studio --help | -h           this help
 
   The knowledge DB ($WINKB_DB, else E:\\windows_api\\windows_api.db) backs the
@@ -3195,8 +3194,15 @@ TCL UI SCRIPTING (--script / --exec)
         // Headless `--shot [dir]`: render one offscreen frame to a timestamped
         // PNG and exit — no window, so it works without a visible desktop.
         let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--version" || a == "-V") {
+            println!("RASM Studio {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--help" || a == "-h") {
-            print!("{HELP}");
+            print!(
+                "RASM Studio {} — the WRASM x86-64 assembler IDE (Direct2D).\n\n{HELP}",
+                env!("CARGO_PKG_VERSION")
+            );
             return Ok(());
         }
         if let Some(i) = args.iter().position(|a| a == "--shot") {
