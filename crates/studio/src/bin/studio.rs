@@ -116,7 +116,7 @@ mod gui {
     // each instruction in gray. A macro line (e.g. `invoke`) is followed by gray,
     // view-only "ghost" rows — its literal lowered expansion, `bytes : asm` — so
     // you see the generated code without it touching the source.
-    const LN_W: f32 = 34.0; // line-number column
+    const LN_W: f32 = 58.0; // line-number column (fits 6 digits, right-aligned)
     const BYTES_W: f32 = 188.0; // byte column
     const BYTE_SIZE: f32 = 12.5;
     const SRC_X: f32 = LN_W + BYTES_W + 8.0; // where source / ghost asm begins
@@ -1388,7 +1388,7 @@ main:
 
                 // Line number, top-aligned with the source.
                 render::draw_text(
-                    t, 2.0, sy, LN_W - 6.0, LINE_H, &format!("{:>3}", row + 1),
+                    t, 2.0, sy, LN_W - 6.0, LINE_H, &format!("{:>6}", row + 1),
                     EDITOR_FONT, EDITOR_SIZE * 0.8, false, false, theme::TEXT_DIM, false,
                 );
 
