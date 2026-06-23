@@ -144,8 +144,11 @@ pub fn local_card(src: &str, name: &str) -> Option<String> {
             let hint = format!("Address it `[rip + {name}]`; fields resolve via the db (`[reg + {ty}.field]`).");
             return Some(local_md(name, &kind, exported, lineno, decl, &hint));
         }
-        // `name <TYPE> …` — a data variable.
-        if is_data_type(first) {
+        // `name <TYPE> …` — a data variable. But NOT an instruction's size
+        // override (`mov dword ptr [..]`): a type word followed by `ptr` is an
+        // operand, not a data definition, so `mov` etc. aren't local symbols.
+        let second = after.split_whitespace().nth(1).unwrap_or("");
+        if is_data_type(first) && !second.eq_ignore_ascii_case("ptr") {
             let kind = format!("local data (`{}`)", first.to_ascii_uppercase());
             let hint = format!("Reference it PC-relative: `[rip + {name}]`.");
             return Some(local_md(name, &kind, exported, lineno, decl, &hint));
@@ -808,6 +811,13 @@ mod tests {
 
         let s = ".DATA\nscd struct DXGI_SWAP_CHAIN_DESC\n    BufferCount = 1\nends\n";
         assert!(local_card(s, "scd").unwrap().contains("DXGI_SWAP_CHAIN_DESC"), "struct instance");
+
+        // A mnemonic with a `dword ptr` size override is NOT a local data symbol:
+        // `mov` must fall through to its instruction card, not "local data (DWORD)".
+        let code = "main:\n    mov dword ptr [rip + gMusicLoop], 1\n    mov edx, 400\n";
+        assert!(local_card(code, "mov").is_none(), "size override isn't a data def");
+        // A genuine `name dword …` data definition still resolves.
+        assert!(local_card("gFlags dword 0\n", "gFlags").unwrap().contains("local data (`DWORD`)"));
     }
 
     #[test]
