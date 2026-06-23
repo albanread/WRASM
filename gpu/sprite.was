@@ -52,6 +52,20 @@
 ;
 ; Every .DATA block opens with .balign 16 (trap #8).
 
+; ---------------------------------------------------------------------------
+; Named constants (equates — fold to literals, visible in --emit-asm). The two
+; 262144 buffers stop being mystery numbers: one is SprMaxInst*stride, the other
+; the atlas dimension squared.
+SPR_MAX_INST    equ 8192                 ; brakes-off instance headroom (>> any 16-bit cap)
+SPR_STRIDE      equ 32                   ; per-instance bytes (8 floats)
+SPR_ATLAS_DIM   equ 512                  ; the sprite atlas is SPR_ATLAS_DIM square (R8_UINT)
+SPR_PAL_WIDE    equ 16                   ; palette LUT width (colours 0..15)
+SPR_PAL_SLOTS   equ 32                   ; palette LUT height (per-sprite slots)
+SPR_INST_BYTES  equ SPR_MAX_INST * SPR_STRIDE      ; 262144 — instance VB + CPU mirror
+SPR_ATLAS_PIX   equ SPR_ATLAS_DIM * SPR_ATLAS_DIM   ; 262144 — atlas CPU mirror
+SPR_PAL_ENTRIES equ SPR_PAL_WIDE * SPR_PAL_SLOTS    ; 512 — palette CPU mirror
+SPR_FRAME_TAB   equ 256 * 16                        ; 4096 — frame table (256 frames * 16)
+
 .DATA
 .balign 16
 ; ---------------------------------------------------------------------------
@@ -134,14 +148,14 @@ semA      BYTE "INSTA", 0
 ; Atlas: 512x512 R8_UINT. Palette: 16 wide x SPR_PAL_SLOTS tall.
 .globl SprAtlasW
 .globl SprAtlasH
-SprAtlasW   DWORD 512
-SprAtlasH   DWORD 512
+SprAtlasW   DWORD SPR_ATLAS_DIM
+SprAtlasH   DWORD SPR_ATLAS_DIM
 .globl SprPalSlots
 SprPalSlots DWORD 32                     ; 32 per-sprite 16-colour banks
 
 ; the maximum number of instances the dynamic VB / CPU mirror can hold.
 .globl SprMaxInst
-SprMaxInst  DWORD 8192                   ; brakes-off headroom (>> any 16-bit cap)
+SprMaxInst  DWORD SPR_MAX_INST           ; brakes-off headroom (>> any 16-bit cap)
 
 .balign 16
 ; ---- sprite COM objects + scalar state ----
@@ -166,7 +180,7 @@ tmpSizeS    QWORD ?
 sprFrameCount DWORD 0
 .balign 16
 .globl sprFrameTab
-sprFrameTab   BYTE 4096 dup(0)           ; 256 * 16
+sprFrameTab   BYTE SPR_FRAME_TAB dup(0)   ; 256 * 16
 
 ; the live instance count for the upcoming DrawSprites.
 .globl sprInstCount
@@ -174,7 +188,7 @@ sprInstCount  DWORD 0
 
 ; per-instance stride (8 floats = 32 bytes) + the IASetVertexBuffers stride/offset
 ; single-element arrays (the API wants pointers to u32).
-sprStride   DWORD 32
+sprStride   DWORD SPR_STRIDE
 sprOffset   DWORD 0
 .balign 16
 sprVBArr    QWORD 0                       ; single-element ppVertexBuffers array
@@ -186,26 +200,26 @@ sprMapped   BYTE 16 dup(0)                ; D3D11_MAPPED_SUBRESOURCE out
 ;      8192 * 32 = 262144 bytes. SprPushInstance appends here; SprUpload Maps the
 ;      dynamic VB and copies sprInstCount*32 bytes in.
 .globl sprInstData
-sprInstData  BYTE 262144 dup(0)
+sprInstData  BYTE SPR_INST_BYTES dup(0)
 
 .balign 16
 ; ---- the sprite atlas CPU mirror: 512*512 indexed bytes, index 0 = transparent.
 ;      SprAddFrame stamps frame pixels here; SprUploadAtlas pushes it to the GPU.
 .globl sprAtlasPix
-sprAtlasPix  BYTE 262144 dup(0)          ; 512*512
+sprAtlasPix  BYTE SPR_ATLAS_PIX dup(0)    ; 512*512
 
 .balign 16
 ; ---- the per-sprite palette CPU mirror: 16 * SprPalSlots BGRA entries.
 ;      16 * 32 * 4 = 2048 bytes. row s = slot s's 16 colours.
 .globl sprPalData
-sprPalData   DWORD 512 dup(0)            ; 16 * 32
+sprPalData   DWORD SPR_PAL_ENTRIES dup(0) ; 16 * 32
 
 .balign 16
 ; ---- descriptors --------------------------------------------------------
 ; sprite atlas texture: 512x512, R8_UINT, DEFAULT, BIND_SHADER_RESOURCE.
 tdSprAtlas struct D3D11_TEXTURE2D_DESC
-    Width            = 512
-    Height           = 512
+    Width            = SPR_ATLAS_DIM
+    Height           = SPR_ATLAS_DIM
     MipLevels        = 1
     ArraySize        = 1
     Format           = 62                ; DXGI_FORMAT_R8_UINT
@@ -239,7 +253,7 @@ ends
 
 ; subresource upload descriptors (pSysMem patched at init).
 sdSprAtlas struct D3D11_SUBRESOURCE_DATA
-    SysMemPitch = 512                    ; R8 -> width
+    SysMemPitch = SPR_ATLAS_DIM          ; R8 -> width
 ends
 sdSprPal struct D3D11_SUBRESOURCE_DATA
     SysMemPitch = 64                     ; 16 * 4
@@ -248,7 +262,7 @@ ends
 ; the DYNAMIC instance vertex buffer: 8192*32 = 262144 bytes, DYNAMIC +
 ; CPU_ACCESS_WRITE + BIND_VERTEX_BUFFER (so Map WRITE_DISCARD works each frame).
 vbDesc struct D3D11_BUFFER_DESC
-    ByteWidth      = 262144              ; SprMaxInst * 32
+    ByteWidth      = SPR_INST_BYTES      ; SprMaxInst * 32
     Usage          = 2                   ; D3D11_USAGE_DYNAMIC
     BindFlags      = 1                   ; D3D11_BIND_VERTEX_BUFFER
     CPUAccessFlags = 0x10000             ; D3D11_CPU_ACCESS_WRITE
@@ -446,7 +460,7 @@ SprAddFrame:
     ; ---- shelf-pack: place at (sprCurX, sprCurY); wrap a band if it overflows 512 ----
     mov     eax, [rip + sprCurX]          ; curX
     add     eax, r12d                     ; curX + w
-    cmp     eax, 512
+    cmp     eax, SPR_ATLAS_DIM
     jle     saf_place                     ; fits in this band
     ; new band: curX=0, curY += bandH, bandH=0
     mov     dword ptr [rip + sprCurX], 0
@@ -458,7 +472,7 @@ saf_place:
     ; vertical overflow guard: curY + h must fit in 512.
     mov     eax, [rip + sprCurY]
     add     eax, r13d
-    cmp     eax, 512
+    cmp     eax, SPR_ATLAS_DIM
     jg      saf_fail
 
     mov     r15d, [rip + sprCurX]         ; atlasX = curX
@@ -468,7 +482,7 @@ saf_place:
     ; dst base = (atlasY*512 + atlasX); src stride = w, dst stride = 512.
     lea     rdi, [rip + sprAtlasPix]
     mov     eax, ebp
-    imul    eax, eax, 512
+    imul    eax, eax, SPR_ATLAS_DIM
     add     eax, r15d
     add     rdi, rax                      ; dst top-left
     xor     ecx, ecx                      ; row 0..h-1
@@ -478,7 +492,7 @@ saf_row:
     ; copy w bytes: dst + row*512 <- src + row*w
     mov     r8, rdi
     mov     eax, ecx
-    imul    eax, eax, 512
+    imul    eax, eax, SPR_ATLAS_DIM
     add     r8, rax                       ; dst row
     mov     r9, rsi
     mov     eax, ecx
@@ -556,7 +570,7 @@ saf_fail:
 SprUploadAtlas:
     push    rbx
     sub     rsp, 32
-    pContext.UpdateSubresource([rip + pSprAtlasTex], 0, 0, sprAtlasPix, 512, 0)
+    pContext.UpdateSubresource([rip + pSprAtlasTex], 0, 0, sprAtlasPix, SPR_ATLAS_DIM, 0)
     add     rsp, 32
     pop     rbx
     ret
@@ -626,7 +640,7 @@ SprPush:
 
     ; list-full guard.
     mov     eax, [rip + sprInstCount]
-    cmp     eax, 8192                     ; SprMaxInst
+    cmp     eax, SPR_MAX_INST             ; SprMaxInst
     jae     sp_end
     ; frame-id range guard.
     cmp     ecx, [rip + sprFrameCount]

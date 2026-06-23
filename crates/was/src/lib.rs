@@ -1588,16 +1588,20 @@ fn substitute_equates(line: &str, eqs: &HashMap<String, i64>) -> String {
     while i < b.len() {
         let c = b[i] as char;
         if c == '"' || c == '\'' {
-            out.push(c);
+            // Copy the quoted span verbatim by BYTE RANGE (not byte-by-byte): a
+            // multibyte UTF-8 char inside the string — e.g. an em-dash `—` in a
+            // WCHAR title — must survive intact. `b[i] as char` would split it into
+            // its raw bytes and re-encode them as separate code points.
+            let start = i;
             i += 1;
             while i < b.len() {
-                out.push(b[i] as char);
-                let done = b[i] as char == c;
+                let done = b[i] == c as u8;
                 i += 1;
                 if done {
                     break;
                 }
             }
+            out.push_str(&line[start..i]);
             continue;
         }
         if c.is_ascii_alphabetic() || c == '_' {
@@ -1630,6 +1634,11 @@ fn preprocess_equates(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     // assignment rather than an equate. (`struct` data blocks do not nest, but a
     // counter keeps the bookkeeping simple and robust.)
     let mut struct_depth = 0usize;
+    // Inside a `.ASCIISTRING … .ENDASCIISTRING` (or `.WIDESTRING …`) raw block the
+    // body is verbatim shader/text source — it must NOT be scanned for equates or
+    // conditionals (a line like `ax=clamp(ax, x0, …);` is HLSL, not a `NAME = expr`
+    // equate). Copy every such line through untouched until the matching `.end…`.
+    let mut raw_block_end: Option<&'static str> = None;
 
     let emitting = |conds: &[CondFrame]| conds.iter().all(|f| f.active);
 
@@ -1637,6 +1646,32 @@ fn preprocess_equates(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
         let in_line = i + 1;
         let t = strip_comment(raw).trim();
         let active = emitting(&conds);
+
+        // ── raw string block: pass every line through verbatim (including the
+        //    opening/closing directives) so structural lowering still sees it ───
+        if let Some(end_kw) = raw_block_end {
+            out.push_str(raw);
+            out.push('\n');
+            map.push(in_line);
+            if raw.trim().eq_ignore_ascii_case(end_kw) {
+                raw_block_end = None;
+            }
+            continue;
+        }
+        if active && t.eq_ignore_ascii_case(".asciistring") {
+            raw_block_end = Some(".endasciistring");
+            out.push_str(raw);
+            out.push('\n');
+            map.push(in_line);
+            continue;
+        }
+        if active && t.eq_ignore_ascii_case(".widestring") {
+            raw_block_end = Some(".endwidestring");
+            out.push_str(raw);
+            out.push('\n');
+            map.push(in_line);
+            continue;
+        }
 
         // ── conditional-assembly directives (handled even while skipping, so the
         //    nesting stays balanced) ──────────────────────────────────────────
@@ -3207,6 +3242,29 @@ mod tests {
             this_at > rdx_at && this_at > r8_at,
             "`this` must marshal into rcx AFTER the method's register args:\n{low}"
         );
+    }
+
+    #[test]
+    fn equate_pass_skips_asciistring_shader_body() {
+        let Some(kb) = kb() else { return };
+        // A defined equate activates the preprocessing pass; an HLSL `x = y;` line inside
+        // a raw .ASCIISTRING block must pass through verbatim, NOT be misparsed as a
+        // `NAME = expr` equate (its comma once crashed the tokenizer). Real-code regression.
+        let src = "N equ 5\n.asciistring\nfloat4 c = clamp(p, 0, 1);\n.endasciistring\n.code\n.globl m\nm:\n  mov eax, N\n  ret\n";
+        let low = lower(src, &kb).expect("equate + .asciistring must lower, not crash");
+        assert!(low.contains("mov eax, 5"), "the equate still folds: {low}");
+    }
+
+    #[test]
+    fn equate_substitution_preserves_multibyte_string() {
+        let Some(kb) = kb() else { return };
+        // With an equate defined, every line runs through substitute_equates, which must
+        // copy a quoted span by byte-range, not byte-by-byte: an em-dash (U+2014) in a
+        // WCHAR string stays one UTF-16 unit (.word 8212), not split into its UTF-8 bytes.
+        let src = "N equ 5\n.data\nt WCHAR \"\u{2014}\", 0\n.code\n.globl m\nm:\n  mov eax, N\n  ret\n";
+        let low = lower(src, &kb).expect("equate + multibyte string must lower");
+        assert!(low.contains(".word 8212"), "em-dash stays one UTF-16 unit: {low}");
+        assert!(!low.contains("226"), "not split into its UTF-8 bytes: {low}");
     }
 
     #[test]
