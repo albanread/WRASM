@@ -1,3 +1,5 @@
+module Canvas
+.globl worldBuf
 ; ============================================================================
 ; tile.was — parallax tilemaps: tiles are "sprites in a grid", drawn into fb
 ; ============================================================================
@@ -400,3 +402,4 @@ ct_loop:
     jmp     ct_loop
 ct_done:
 endproc
+endmodule

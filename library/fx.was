@@ -1,3 +1,4 @@
+module Canvas
 ; ============================================================================
 ; fx.was — palette effects: recolour the whole screen for free, no redraw
 ; ============================================================================
@@ -117,3 +118,4 @@ cc_loop:
     mov     [rsi + r8*4], eax         ; palette[lo] = old palette[hi]
 cc_done:
 endproc
+endmodule

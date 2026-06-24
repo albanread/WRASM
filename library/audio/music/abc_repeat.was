@@ -1,3 +1,4 @@
+module Player
 ; abc_repeat.was — repeats |: :| and first/second endings |1 |2 (Sprint M-C).
 ; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included in
 ; the shell BEFORE abc_parse.was so the body bar/colon dispatch can call these.
@@ -112,3 +113,4 @@ ef_stop:
     mov     [rip + txtPtr], rsi
 ef_done:
 endproc
+endmodule

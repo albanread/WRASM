@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/tile.was — GPU Canvas G2 "Tile layers + scroll (parallax / overscan)".
 ;
 ; Built ON TOP of gpu/canvas.was (G0: device/swapchain, the palette LUT textures
@@ -692,3 +693,4 @@ tcbInit struct D3D11_SUBRESOURCE_DATA
     SysMemPitch      = 0
     SysMemSlicePitch = 0
 ends
+endmodule

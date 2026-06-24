@@ -1,3 +1,4 @@
+module Player
 ; abc_chord.was — ParseChord: a chord [CEG] = several notes struck together,
 ; sharing ONE onset and ONE duration (hence ONE offset).  The harmony layer.
 ; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included
@@ -119,3 +120,4 @@ pc_off_loop:
 
 pc_done:
 endproc
+endmodule

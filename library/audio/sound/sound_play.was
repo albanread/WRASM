@@ -1,3 +1,4 @@
+module Sound
 ; ============================================================================
 ; sound_play.was — Sprint 3: the live waveOut mixer thread.
 ; Part of the sound.was shell.  This fragment opens .DATA for its own state,
@@ -50,8 +51,8 @@ hwo          QWORD  0                     ; HWAVEOUT from waveOutOpen
 wfx:
     WORD  1                               ; +0  wFormatTag = WAVE_FORMAT_PCM
     WORD  2                               ; +2  nChannels
-    DWORD 44100                           ; +4  nSamplesPerSec
-    DWORD 176400                          ; +8  nAvgBytesPerSec = 44100*2*2
+    DWORD SAMPLE_RATE                     ; +4  nSamplesPerSec
+    DWORD AUDIO_BPS                       ; +8  nAvgBytesPerSec = 44100*2*2
     WORD  4                               ; +12 nBlockAlign = 2ch*2bytes
     WORD  16                              ; +14 wBitsPerSample
     WORD  0                               ; +16 cbSize
@@ -348,3 +349,4 @@ as_unprep:
     jb      as_unprep
     invoke  waveOutClose, [rip + hwo]
 endproc
+endmodule

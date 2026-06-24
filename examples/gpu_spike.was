@@ -18,6 +18,8 @@
 ; != 0) AND the BMP readback we can Read.
 
 .include "../gpu/canvas.was"
+.include "../gpu/blit.was"       ; pBlendAlpha — gpu/text.was depends on it
+.include "../gpu/text.was"       ; canvas Text() forwards to DrawText/TxtSetColour
 
 .DATA
 .balign 16

@@ -1,3 +1,7 @@
+module Canvas
+.globl fb
+.globl palette
+.globl linePal
 ; ============================================================================
 ; canvas.was — GamesCanvas core: a 320x200 indexed-colour surface (CPU profile)
 ; ============================================================================
@@ -34,10 +38,11 @@
 
 .DATA
 .balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
+.include "gc_const.was"              ; named constants (canvas dims, palette, action ids)
 .include "gc_font.inc"               ; fontTab: 128 glyphs x 7 bytes (5x7)
 
-fb        BYTE  64000 dup(0)         ; 320x200 index framebuffer (top-down)
-pbuf      DWORD 64000 dup(0)         ; 320x200 BGRX present buffer
+fb        BYTE  CANVAS_PIXELS dup(0)  ; 320x200 index framebuffer (top-down)
+pbuf      DWORD CANVAS_PIXELS dup(0)  ; 320x200 BGRX present buffer
 
 ; 256-entry palette, 0x00RRGGBB (little-endian → B,G,R,0 = BGRX, no swizzle).
 ; The canonical CGA/EGA 16, then black.
@@ -46,20 +51,20 @@ palette:
     DWORD 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA
     DWORD 0x555555, 0x5555FF, 0x55FF55, 0x55FFFF
     DWORD 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
-    DWORD 240 dup(0)
+    DWORD PAL_GLOBAL_COUNT dup(0)
 
 ; Per-scanline palette LUT. Background indices 0..15 resolve HERE, per display
 ; row, so each line shows its own 16 colours — a 4-bit-feeling display showing
 ; hundreds of colours at once (the copper/raster trick). Indices 16..255 use the
 ; global `palette` above (the "regular 240"). Seed it with SeedLinePalette, tweak
 ; rows with SetLineColour. Sized for the tallest display (400 rows).
-linePal   DWORD 6400 dup(0)           ; [400 rows][16 colours] of 0x00RRGGBB
+linePal   DWORD LINE_PAL_CELLS dup(0) ; [400 rows][16 colours] of 0x00RRGGBB
 
 ; BITMAPINFO (header only; 32bpp BI_RGB needs no colour table). biHeight < 0 =
 ; top-down, matching the framebuffer.
 bmi:
     DWORD 40                          ; biSize
-    DWORD 320                         ; biWidth
+    DWORD CANVAS_W                    ; biWidth
     DWORD 0xFFFFFF38                  ; biHeight = -200 (top-down)
     WORD  1, 32                       ; biPlanes=1, biBitCount=32
     DWORD 0, 0, 0, 0, 0, 0            ; biCompression(BI_RGB)=0, …
@@ -94,15 +99,15 @@ endproc
 proc Pget in rcx rdx
     xor     eax, eax
     cmp     ecx, 320
-    jae     pg_done
+    jae     pget_done
     cmp     edx, 200
-    jae     pg_done
+    jae     pget_done
     mov     eax, edx
     imul    eax, eax, 320
     add     eax, ecx
     lea     r8, [rip + fb]
     movzx   eax, byte ptr [r8 + rax]
-pg_done:
+pget_done:
 endproc
 
 ; ---- HLine(ecx=x, edx=y, r8d=len, r9b=index): clipped horizontal run ----
@@ -205,9 +210,9 @@ endproc
 ; ---- Rect(ecx=x, edx=y, r8d=w, r9d=h, r10b=index): 1px outline ----
 proc Rect uses rbx rsi rdi r12 r13 frame in rcx rdx r8 r9 r10
     test    r8d, r8d                  ; empty rect → nothing (else x+w-1 / y+h-1
-    jle     rc_done                   ; would paint stray lines outside it)
+    jle     rect_done                   ; would paint stray lines outside it)
     test    r9d, r9d
-    jle     rc_done
+    jle     rect_done
     mov     esi, ecx                  ; x
     mov     edi, edx                  ; y
     mov     ebx, r8d                  ; w
@@ -237,7 +242,7 @@ proc Rect uses rbx rsi rdi r12 r13 frame in rcx rdx r8 r9 r10
     mov     r8d, r12d
     movzx   r9d, r13b
     call    VLine
-rc_done:
+rect_done:
 endproc
 
 ; ---- Line(ecx=x0, edx=y0, r8d=x1, r9d=y1, r10b=index): Bresenham (spec, verbatim) ----
@@ -551,3 +556,4 @@ proc present frame
     call    resolve_present
     call    blit_present
 endproc
+endmodule

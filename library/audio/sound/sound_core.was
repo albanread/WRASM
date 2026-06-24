@@ -1,3 +1,4 @@
+module Sound
 ; sound_core.was — Adsr envelope, Beep, WriteWav (the Sprint-1 core).
 ; Part of the sound.was shell (.CODE).
 
@@ -94,7 +95,7 @@ endproc
 proc Beep uses rbx r12 r13 frame in rcx rdx
     ; frames = 44100 * durationMs / 1000   (capture freq first — div trashes ecx)
     mov     r8d, ecx                   ; r8d = freqHz (saved across the divide)
-    mov     eax, 44100
+    mov     eax, SAMPLE_RATE
     mul     edx                        ; edx:eax = 44100 * durationMs (unsigned)
     mov     ecx, 1000
     xor     edx, edx                   ; clear high dividend before div
@@ -226,3 +227,4 @@ endproc
 ; Sprint 2 — waveforms, the effect renderer, and the preset SFX factories.
 ; ============================================================================
 
+endmodule

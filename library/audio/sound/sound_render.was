@@ -1,3 +1,4 @@
+module Sound
 ; sound_render.was — AdsrFx, the Render pipeline, TanhApprox, RenderEcho, Normalize.
 ; Part of the sound.was shell (.CODE).
 ; ----------------------------------------------------------------------------
@@ -386,3 +387,4 @@ endproc
 ; Duration arrives in xmm0 (seconds); presets ignore freq except where noted.
 ; ============================================================================
 
+endmodule

@@ -1,3 +1,4 @@
+module Player
 ; abc_ornament.was — tuplets `(p[:q[:r]]` and grace notes `{...}` (Sprint M-E).
 ; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included in
 ; the shell BEFORE abc_parse.was so the body '(' / '{' dispatch can call these.
@@ -219,3 +220,4 @@ proc FlushTie frame
     mov     dword ptr [rip + tiePend], 0
 ft_d:
 endproc
+endmodule

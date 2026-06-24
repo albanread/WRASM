@@ -1,3 +1,4 @@
+module Sound
 ; sound_data.inc — sndBuf, f64 constants, the Effect block, WAV header, preset consts.
 ; Included by the sound.was shell inside .DATA. Not standalone.
 
@@ -5,6 +6,8 @@
 
 ; PCM work buffer: 132300 frames x 2 channels = 264600 f64 = ~3.0 s of stereo at
 ; 44100 Hz.  A 500 ms Beep is 22050 frames (44100 f64), comfortably inside this.
+.globl sndBuf                         ; exported: games call Play(sndBuf, sndFrames)
+.globl sndFrames
 sndBuf    real8  264600 dup(0)        ; interleaved L,R,L,R,... in [-1, 1]
 sndFrames DWORD  ?                     ; frame count of the last render
 
@@ -171,8 +174,8 @@ wavHdr:
     DWORD 16                               ; fmt chunk size
     WORD  1                                ; PCM
     WORD  2                                ; channels
-    DWORD 44100                            ; sample rate
-    DWORD 176400                           ; byte rate = 44100*2*2
+    DWORD SAMPLE_RATE                      ; sample rate
+    DWORD AUDIO_BPS                        ; byte rate = 44100*2*2
     WORD  4                                ; block align = 2*2
     WORD  16                               ; bits per sample
     BYTE 0x64, 0x61, 0x74, 0x61            ; "data"
@@ -187,3 +190,4 @@ wavBytes  DWORD  ?                     ; byteCount for the current WriteFile blo
                                       ; scratch for stack args, so a register arg
                                       ; computed into eax would be clobbered)
 
+endmodule

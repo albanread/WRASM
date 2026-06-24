@@ -1,3 +1,4 @@
+module Canvas
 ; ============================================================================
 ; blit.was — the surface blit engine (the keystone for sprites/scroll/buffers)
 ; ============================================================================
@@ -33,7 +34,7 @@ dstBase   QWORD ?                     ; destination surface base pointer
 dstStride DWORD ?                     ; destination bytes-per-row
 dstClipW  DWORD ?                     ; destination width  (clip bound)
 dstClipH  DWORD ?                     ; destination height (clip bound)
-blitKey   DWORD 255                   ; transparent index for BlitKey
+blitKey   DWORD BLIT_KEY              ; transparent index for BlitKey
 blitOpaque BYTE ?                     ; set by the Blit/BlitKey entry points
 
 .CODE
@@ -41,9 +42,9 @@ blitOpaque BYTE ?                     ; set by the Blit/BlitKey entry points
 proc DestFramebuffer
     lea     rax, [rip + fb]
     mov     [rip + dstBase], rax
-    mov     dword ptr [rip + dstStride], 320
-    mov     dword ptr [rip + dstClipW], 320
-    mov     dword ptr [rip + dstClipH], 200
+    mov     dword ptr [rip + dstStride], CANVAS_W
+    mov     dword ptr [rip + dstClipW], CANVAS_W
+    mov     dword ptr [rip + dstClipH], CANVAS_H
 endproc
 
 ; ---- SetDest(rcx=base, edx=stride, r8d=w, r9d=h): aim at a custom surface ----
@@ -186,3 +187,4 @@ bx_b_sk:
     jnz     bx_b_row
 bx_done:
 endproc
+endmodule

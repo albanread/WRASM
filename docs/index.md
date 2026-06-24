@@ -33,12 +33,16 @@ flowchart LR
 |------|----------------|
 | [Quick Start](quickstart.md) | Build, your first program, key command-line flags |
 | [Language](language.md) | Registers, addressing modes, directives, condition codes |
-| [Macros](macros.md) | `invoke`, `proc`/`frame`, `comobj`, `struct`, `.ASCIISTRING` |
+| [Macros](macros.md) | `invoke`, `proc`/`frame`, `comobj`, `struct`, `.ASCIISTRING`, equates, modules |
+| [Structured programming](structured.md) | The `proc` subroutine: its contract, structured control flow, and label scope |
 | [Instructions](instructions.md) | Integer, SSE, AVX — all supported opcodes |
 | [Windows API](windows-api.md) | Knowledge database, `winkb`, symbol resolution, COM |
 | [Examples](examples.md) | Mandelbrot, Direct3D 11, Direct2D, game canvas demos |
+| [**Library API Guide**](api-guide.md) | **For game authors: the GamesCanvas API across the CPU (`library/`) and GPU (`gpu/`) backends** |
 | [Game Canvas Design](gamecanvas.md) | 320×200 indexed-colour framebuffer design |
+| [GPU Canvas Design](gpucanvas.md) | D3D11 shader backend — the `gpu/` profile |
 | [Game Audio Design](gameaudio.md) | SFX synthesis and ABC/audio design |
+| [Studio TCL scripting](studio-tcl.md) | Drive the IDE headlessly (UI tests, screenshots) with the embedded TCL interpreter |
 
 ## At a glance
 

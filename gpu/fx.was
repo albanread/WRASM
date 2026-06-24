@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/fx.was — GPU Canvas G4 "procedural fx layer".
 ;
 ; Built ON TOP of gpu/canvas.was (G0: device/swapchain, pDevice/pContext/pRTV,
@@ -208,3 +209,4 @@ FxRender:
 .DATA
 .balign 16
 fxRTVTmp  QWORD ?                        ; single-element RTV array for OMSetRenderTargets
+endmodule

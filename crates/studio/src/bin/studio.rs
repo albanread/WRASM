@@ -988,13 +988,18 @@ main:
         }
 
         /// The buffer with `.include "file"`s expanded (relative to the saved file's
-        /// directory), so a multi-file program builds/runs in the IDE exactly as it
-        /// does from the `was` CLI. An unsaved buffer has no base directory, so its
+        /// directory) and module-scoped labels applied, so a multi-file program
+        /// builds/runs in the IDE exactly as it does from the `was` CLI (where module
+        /// scoping is on by default). An unsaved buffer has no base directory, so its
         /// includes can't resolve — save first. A missing include is surfaced.
         fn build_source(&self) -> Result<String, String> {
             let text = self.doc.text();
             match &self.path {
-                Some(p) => was::expand_includes(&text, p).map_err(|e| e.to_string()),
+                // expand includes (recording per-line file attribution), then privatise
+                // each module's lowercase labels — matching the CLI default.
+                Some(p) => was::expand_includes_graph(&text, p)
+                    .map(|exp| was::scope_modules_by_file(&exp))
+                    .map_err(|e| e.to_string()),
                 None => Ok(text),
             }
         }

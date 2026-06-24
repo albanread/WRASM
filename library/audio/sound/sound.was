@@ -1,3 +1,4 @@
+module Sound
 ; ============================================================================
 ; sound.was — Sprint 1 of the retro-game audio synth (offline, hand-written asm)
 ; ============================================================================
@@ -20,6 +21,7 @@
 
 .DATA
 .balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
+.include "sound_const.inc"           ; named audio-format constants (sample rate, byte rate)
 .include "sound_data.inc"
 .CODE
 .include "sound_core.was"
@@ -27,3 +29,4 @@
 .include "sound_render.was"
 .include "sound_presets.was"
 .include "sound_play.was"
+endmodule

@@ -1,3 +1,5 @@
+module Canvas
+.globl gPresent
 ; ============================================================================
 ; harness.was — the game machine: window + loop + input + present, your 3 procs
 ; ============================================================================
@@ -60,8 +62,8 @@ proc GameStart uses rbx rsi rdi r12 r13 r14 r15 frame in rcx rdx r8 r9
     mov     [rdi + WNDCLASSEXW.hCursor], rax
     invoke  RegisterClassExW, hWc
     lea     rdi, [rip + hRect]        ; client area 960x600 (320x200 @ 3x)
-    mov     dword ptr [rdi + 8], 960
-    mov     dword ptr [rdi + 12], 600
+    mov     dword ptr [rdi + 8], WIN_W
+    mov     dword ptr [rdi + 12], WIN_H
     invoke  AdjustWindowRect, hRect, 0x10CF0000, 0
     lea     rdi, [rip + hRect]
     mov     eax, [rdi + 8]
@@ -170,7 +172,7 @@ hw_destroy:
     ret
 hw_timer:
     call    GameFrame
-    mov     ecx, 7                    ; QUIT action (Esc / stick) → close
+    mov     ecx, ACT_QUIT             ; QUIT action (Esc / stick) → close
     call    ActionHit
     test    eax, eax
     jz      hw_blit
@@ -181,3 +183,4 @@ hw_blit:
     call    blit_present
     xor     eax, eax
     ret
+endmodule

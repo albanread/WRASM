@@ -1,3 +1,6 @@
+module Gpu
+.globl poolRTV
+.globl poolSRV
 ; gpu/blit.was — GPU Canvas G1 "Texture pool + blitter".
 ;
 ; Built ON TOP of gpu/canvas.was (G0): reuses pDevice / pContext / pRTV / pSwap,
@@ -96,6 +99,7 @@ ends
 
 ; clear colour for a layer RT (transparent black: rgba 0,0,0,0 — so the overlay's
 ; outside-the-quad region stays fully transparent for the alpha pass).
+.globl clearClear                        ; exported: low-level RTV-clear colour
 clearClear DWORD 0,0,0,0
 
 .balign 16
@@ -492,3 +496,4 @@ srvTmp     QWORD ?
 blendTmp   QWORD ?
 blitModeTmp DWORD ?
 f255       DWORD 0x437F0000          ; 255.0f
+endmodule

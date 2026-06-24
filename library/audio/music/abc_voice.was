@@ -1,3 +1,4 @@
+module Player
 ; abc_voice.was — multi-voice / per-voice-instrument / comment helpers.
 ; Part of the abc.was shell (.CODE).  Shares state via abc_data.inc.  Included
 ; in the shell BEFORE abc_parse.was so ParseTune can call these.
@@ -242,3 +243,4 @@ pmd_one:
 pmd_skip:
     call    SkipToEol
 endproc
+endmodule

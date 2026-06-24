@@ -19,6 +19,7 @@
 
 .include "../gpu/canvas.was"
 .include "../gpu/blit.was"
+.include "../gpu/text.was"       ; canvas Text() forwards to DrawText/TxtSetColour
 
 .DATA
 .balign 16

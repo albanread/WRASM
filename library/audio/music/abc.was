@@ -1,3 +1,4 @@
+module Player
 ; ============================================================================
 ; abc.was — ABC-notation music parser CORE (offline, hand-written x86-64, WRASM)
 ; ============================================================================
@@ -84,3 +85,4 @@
 .include "abc_parse.was"
 .include "abc_finalize.was"
 .include "abc_play.was"
+endmodule

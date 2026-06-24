@@ -1,0 +1,46 @@
+; ============================================================================
+; gpu/gc_const.was — named constants for the GamesCanvas GPU (D3D11) backend
+; ============================================================================
+; Auto-included at the top of gpu/canvas.was, so every GPU game gets these names
+; with zero extra include lines (canvas.was is the first gpu/ include).
+;
+; The PUBLIC values below — CANVAS_W/CANVAS_H and the 8 ACT_* action IDs (and
+; KEY_COUNT) — MUST stay byte-for-byte equal to library/gc_const.was, so a game
+; runs identically whether it includes library/ or gpu/. The PHYS_* / BACK_* /
+; PAL_LINE_* values are the GPU's own physical extents.
+;
+; These are `equ` equates: they fold to the same literal you'd have hand-typed
+; (verify with `was … --emit-asm`) — documentation with zero byte changes.
+; ============================================================================
+
+; ---- PUBLIC: logical canvas + the 8 actions (PARITY with the CPU backend) ----
+CANVAS_W       equ 320                        ; logical surface width  (games read this)
+CANVAS_H       equ 200                        ; logical surface height
+ACT_LEFT       equ 0
+ACT_RIGHT      equ 1
+ACT_UP         equ 2
+ACT_DOWN       equ 3
+ACT_FIRE       equ 4
+ACT_PAUSE      equ 5
+ACT_RESTART    equ 6
+ACT_QUIT       equ 7
+ACT_COUNT      equ 8                          ; action count (table size / bound)
+KEY_COUNT      equ 256                        ; raw key-state table size (VK 0..255)
+
+; ---- GPU physical index buffer (the LUT shader upscales it to the swapchain) ----
+PHYS_W         equ 640                        ; physical idxBuf width
+PHYS_H         equ 360                        ; physical idxBuf height
+PHYS_PIXELS    equ PHYS_W * PHYS_H            ; 230400 — idxBuf byte count
+ORIGIN_X       equ (PHYS_W - CANVAS_W) / 2    ; 160 — default draw origin (centre 320x200)
+ORIGIN_Y       equ (PHYS_H - CANVAS_H) / 2    ; 80
+
+; ---- swapchain (integer-scaled present) ----
+PIXEL_SCALE    equ 2                          ; 2 = 720p (default), 4 = 1440p pixel-double
+BACK_W         equ PHYS_W * PIXEL_SCALE       ; 1280 — default backbuffer width
+BACK_H         equ PHYS_H * PIXEL_SCALE       ; 720
+
+; ---- palette LUTs (B8G8R8A8) ----
+PAL_SIZE       equ 256                        ; global palette entries
+PAL_LINE_LEN   equ 16                         ; per-line LUT entries (indices 0..15)
+PAL_LINE_ROWS  equ PHYS_H                     ; one 16-colour row per scanline
+PAL_LINE_CELLS equ PAL_LINE_LEN * PAL_LINE_ROWS    ; 5760 — palLineData element count

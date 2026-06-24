@@ -1,3 +1,4 @@
+module Player
 ; abc_note.was — ParseNotePitch (one note token -> MIDI pitch) + ParseNote.
 ; Part of the abc.was shell (.CODE).
 ; ----------------------------------------------------------------------------
@@ -287,3 +288,4 @@ pn_emit_off:
     call    EmitEvent
 pn_ret:
 endproc
+endmodule

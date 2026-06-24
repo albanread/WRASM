@@ -1,3 +1,5 @@
+module Gpu
+.globl pRTV
 ; gpu/canvas.was — GPU Canvas G0 "spike": the D3D11 LUT background backend.
 ;
 ; The CPU canvas (library/) keeps a 320x200 indexed framebuffer and resolves it
@@ -55,6 +57,7 @@ psTarget  BYTE "ps_4_0", 0
 srcName   BYTE "gpucanvas", 0
 
 .balign 16
+.include "gc_const.was"                  ; named constants (canvas dims, palette, action ids)
 ; ---- public canvas geometry (games read these, never hardcode) ----
 ; PARITY: the CPU canvas (library/canvas.was) is a 320x200 logical surface. The GPU
 ; canvas mirrors that LOGICAL size — CanvasW/CanvasH = 320/200, byte-for-byte the
@@ -66,18 +69,18 @@ srcName   BYTE "gpucanvas", 0
 ; not corner-stuck. Full-screen games call CanvasSetOrigin(0,0) and read CanvasW/H.
 .globl CanvasW
 .globl CanvasH
-CanvasW   DWORD 320
-CanvasH   DWORD 200
+CanvasW   DWORD CANVAS_W
+CanvasH   DWORD CANVAS_H
 
 ; ---- draw origin: added to every primitive's x,y (and Text's). Default centres a
 ; 320x200 logical surface in the 640x360 physical idxBuf. PhysW/PhysH are the real
 ; index-buffer extents the primitives clip to. ----
 .globl canvasOX
 .globl canvasOY
-canvasOX  DWORD 160
-canvasOY  DWORD 80
-PhysW     DWORD 640
-PhysH     DWORD 360
+canvasOX  DWORD ORIGIN_X
+canvasOY  DWORD ORIGIN_Y
+PhysW     DWORD PHYS_W
+PhysH     DWORD PHYS_H
 
 ; ---- the SWAPCHAIN pixel-double scale (G6 "1440p pixel-double", docs §1). The
 ; canvas physical buffer is 640x360; the swapchain integer-scales it. scale 2 =
@@ -90,21 +93,21 @@ PhysH     DWORD 360
 GpuPixelScale DWORD 2                     ; 2 = 720p (default), 4 = 1440p pixel-double
 .globl BackW
 .globl BackH
-BackW     DWORD 1280                      ; actual backbuffer extents (set in GpuInit)
-BackH     DWORD 720
+BackW     DWORD BACK_W                    ; actual backbuffer extents (set in GpuInit)
+BackH     DWORD BACK_H
 
 ; ---- the index buffer the game draws into (640x360, one byte = one index) ----
 .globl idxBuf
-idxBuf    BYTE 230400 dup(0)            ; 640*360
+idxBuf    BYTE PHYS_PIXELS dup(0)       ; 640*360
 
 ; ---- palette LUTs, BGRA (B8G8R8A8_UNORM) one DWORD per colour ----
 ;   palGlobalData : 256 entries (the global 240 + low 16 mirror).
 ;   palLineData   : 16*360 entries — one 16-colour row per scanline, varied
 ;                   top-to-bottom so the per-line path is visibly exercised.
 .globl palGlobalData
-palGlobalData  DWORD 256 dup(0)         ; 256 * 4 = 1024 bytes
+palGlobalData  DWORD PAL_SIZE dup(0)    ; 256 * 4 = 1024 bytes
 .globl palLineData
-palLineData    DWORD 5760 dup(0)        ; 16*360 * 4 = 23040 bytes
+palLineData    DWORD PAL_LINE_CELLS dup(0)  ; 16*360 * 4 = 23040 bytes
 
 .balign 16
 ; ---- COM objects (typed pointers + a type binding) ----
@@ -238,6 +241,7 @@ rdesc struct D3D11_RASTERIZER_DESC
 ends
 
 mapped    BYTE 16 dup(0)                 ; D3D11_MAPPED_SUBRESOURCE out (pData, RowPitch, DepthPitch)
+.globl clearCol                          ; exported: low-level RTV-clear colour
 clearCol  DWORD 0, 0, 0, 0x3F800000      ; black, A=1
 
 .balign 16
@@ -1303,3 +1307,4 @@ cgaTable:
 .balign 16
 srvArray   QWORD 0, 0, 0                     ; scratch: 3 SRV pointers for PSSetShaderResources
 featureLevel DWORD 0
+endmodule

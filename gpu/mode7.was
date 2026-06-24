@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/mode7.was — GPU Canvas G6 "per-layer affine / MODE-7" (the marquee feature).
 ;
 ; Built ON TOP of gpu/canvas.was (G0: device, the palette LUT textures pTexGlobal/
@@ -406,3 +407,4 @@ m7cbInit struct D3D11_SUBRESOURCE_DATA
     SysMemPitch      = 0
     SysMemSlicePitch = 0
 ends
+endmodule

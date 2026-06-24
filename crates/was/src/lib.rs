@@ -1212,9 +1212,50 @@ fn fits_width(v: i64, width: usize) -> bool {
 /// (path relative to the including file's directory), recursively — so a large
 /// program can be composed from a font, a palette, a primitives library, etc.
 /// Call this on the raw text (with the main file's path) before `lower`/`check`.
+/// The result of textual include expansion, plus the structure that flattening
+/// otherwise throws away: which file each output line came from, and the
+/// parent→child `.include` edges. `.include` stays purely textual — `text` is
+/// byte-for-byte what the old expander produced — this merely *records* the
+/// shell-of-includes graph so later passes (and `--include-graph`) can see it.
+pub struct Expansion {
+    /// The fully expanded source.
+    pub text: String,
+    /// Interned file paths; the index is the file id.
+    pub files: Vec<std::path::PathBuf>,
+    /// For each 0-based line of `text`, the id of the file that line came from.
+    pub line_file: Vec<u32>,
+    /// One per `.include`: `(parent file id, child file id, 1-based line in parent)`.
+    pub edges: Vec<(u32, u32, u32)>,
+}
+
+impl Expansion {
+    /// File id for `p`, interning it on first sight (a file included from several
+    /// places is one node with several edges — a DAG, not a tree).
+    fn intern(&mut self, p: &std::path::Path) -> u32 {
+        if let Some(i) = self.files.iter().position(|f| f == p) {
+            return i as u32;
+        }
+        self.files.push(p.to_path_buf());
+        (self.files.len() - 1) as u32
+    }
+}
+
 pub fn expand_includes(src: &str, from: &std::path::Path) -> Result<String> {
+    Ok(expand_includes_graph(src, from)?.text)
+}
+
+/// Like [`expand_includes`], but also returns the include graph + per-line file map.
+pub fn expand_includes_graph(src: &str, from: &std::path::Path) -> Result<Expansion> {
+    let mut e = Expansion {
+        text: String::new(),
+        files: Vec::new(),
+        line_file: Vec::new(),
+        edges: Vec::new(),
+    };
+    let root = e.intern(from);
     let dir = from.parent().unwrap_or_else(|| std::path::Path::new("."));
-    expand_includes_rec(src, dir, 0)
+    expand_includes_rec(src, dir, 0, root, &mut e)?;
+    Ok(e)
 }
 
 fn include_path(line: &str) -> Option<&str> {
@@ -1222,27 +1263,221 @@ fn include_path(line: &str) -> Option<&str> {
     r.strip_prefix('"').and_then(|x| x.strip_suffix('"'))
 }
 
-fn expand_includes_rec(src: &str, dir: &std::path::Path, depth: usize) -> Result<String> {
+fn expand_includes_rec(
+    src: &str,
+    dir: &std::path::Path,
+    depth: usize,
+    file: u32,
+    e: &mut Expansion,
+) -> Result<()> {
     if depth > 32 {
         bail!("`.include` nested too deeply (a cycle?)");
     }
-    let mut out = String::new();
-    for line in src.lines() {
+    for (idx, line) in src.lines().enumerate() {
         if let Some(path) = include_path(line) {
             let full = dir.join(path);
+            let child = e.intern(&full);
+            e.edges.push((file, child, (idx + 1) as u32));
             let content = std::fs::read_to_string(&full)
                 .with_context(|| format!("`.include \"{path}\"`: cannot read {}", full.display()))?;
             let sub = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.to_path_buf());
-            out.push_str(&expand_includes_rec(&content, &sub, depth + 1)?);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
+            expand_includes_rec(&content, &sub, depth + 1, child, e)?;
         } else {
-            out.push_str(line);
-            out.push('\n');
+            e.text.push_str(line);
+            e.text.push('\n');
+            e.line_file.push(file);
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Module-scoped labels (the `--modules` gate), using the include graph's per-line
+/// file attribution. A module is `module NAME … endmodule` markers WITHIN A FILE,
+/// and a region scopes only the lines OF THAT FILE — content pulled in by `.include`
+/// is NOT absorbed (it carries its own file's modules, or none), even though it sits
+/// textually inside the region. A file may hold several module regions; a module may
+/// be declared by many files, and their private labels pool by NAME.
+///
+/// A label whose name starts with a capital is EXPORTED (global, still unique); a
+/// lowercase/`_` name is PRIVATE — mangled `NAME$label` so two modules may reuse a
+/// helper/data name (`loop`, `fb`, `pu_loop`). `.globl`/`.global` pins a name global.
+/// This narrows the old "every label is global" rule; code outside any module is
+/// untouched. Only label *names* change, never bytes (same offsets); line count is
+/// preserved; the mangled names show in `--emit-asm`. `module`/`endmodule` are no-ops
+/// in the lowering pass.
+///
+/// Note the include graph is only the *mechanism* (it tells us which file a line came
+/// from); the module layout is *defined* by the markers, independent of how files are
+/// included.
+pub fn scope_modules_by_file(exp: &Expansion) -> String {
+    scope_modules(&exp.text, &exp.line_file)
+}
+
+/// The core of [`scope_modules_by_file`], split out so it is unit-testable with a
+/// hand-built attribution. `line_file[i]` is the file id of expanded line `i`.
+///
+/// Two nested private tiers, both ONLY inside a module (outside one, every label is
+/// global, exactly as before):
+/// * a label DEFINED inside a `proc … endproc` is private to that **proc**
+///   (`proc$label`) — so two procs in one module may reuse a jump-target name
+///   (`loop`, `done`) you couldn't otherwise see across the module's many files;
+/// * a lowercase label at **module level** (outside any proc) is private to the
+///   module (`Module$label`).
+/// Capitalised and `.globl`'d names stay exported at either level. The proc tier is
+/// strictly finer, so it can only remove collisions (a proc's internals are only
+/// referenced within that proc — nobody jumps into the middle of one).
+fn scope_modules(text: &str, line_file: &[u32]) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() != line_file.len() {
+        return text.to_string(); // attribution mismatch — be safe, do nothing
+    }
+
+    // Per line: the module and the proc it sits in, each tracked per file id so an
+    // `.include`d file keeps its own module/proc instead of being absorbed. A proc is
+    // an inner scope only inside a module. `.ASCIISTRING`/`.WIDESTRING` raw blocks pass
+    // through untouched (no module/proc, never renamed).
+    let mut open_mod: HashMap<u32, &str> = HashMap::new();
+    let mut open_proc: HashMap<u32, &str> = HashMap::new();
+    let mut line_mod: Vec<Option<&str>> = vec![None; lines.len()];
+    let mut line_proc: Vec<Option<&str>> = vec![None; lines.len()];
+    let mut proc_module: HashMap<&str, &str> = HashMap::new(); // proc name -> its module
+    let mut raw_end: Option<&'static str> = None;
+    for (i, raw) in lines.iter().enumerate() {
+        if let Some(end) = raw_end {
+            if raw.trim().eq_ignore_ascii_case(end) {
+                raw_end = None;
+            }
+            continue;
+        }
+        let f = line_file[i];
+        let t = strip_comment(raw).trim();
+        if t.eq_ignore_ascii_case(".asciistring") {
+            raw_end = Some(".endasciistring");
+        } else if t.eq_ignore_ascii_case(".widestring") {
+            raw_end = Some(".endwidestring");
+        } else if let Some(rest) = strip_keyword(t, "module") {
+            open_mod.insert(f, rest.split_whitespace().next().unwrap_or(""));
+        } else if t == "endmodule" {
+            open_mod.remove(&f);
+        } else if let Some(rest) = strip_keyword(t, "proc") {
+            // The proc HEADER is module-level; its body (following lines) is the inner
+            // scope — but only when the proc sits inside a module.
+            let m = open_mod.get(&f).copied().filter(|m| !m.is_empty());
+            line_mod[i] = m;
+            if let (Some(m), Some(p)) = (m, rest.split_whitespace().next()) {
+                if !p.is_empty() {
+                    open_proc.insert(f, p);
+                    proc_module.entry(p).or_insert(m);
+                }
+            }
+        } else if t == "endproc" {
+            open_proc.remove(&f);
+            line_mod[i] = open_mod.get(&f).copied().filter(|m| !m.is_empty());
+        } else if let Some(&m) = open_mod.get(&f) {
+            if !m.is_empty() {
+                line_mod[i] = Some(m);
+                line_proc[i] = open_proc.get(&f).copied();
+            }
+        }
+    }
+    if line_mod.iter().all(Option::is_none) {
+        return text.to_string(); // no module owns any line — exact passthrough
+    }
+
+    // `.globl`/`.global` names stay global no matter where they sit.
+    let mut exported: HashSet<&str> = HashSet::new();
+    for raw in &lines {
+        let t = strip_comment(raw).trim();
+        if let Some(rest) = t.strip_prefix(".globl").or_else(|| t.strip_prefix(".global")) {
+            exported.insert(rest.trim());
+        }
+    }
+
+    // Collect private labels: proc-internal ones into proc_map[proc] (`proc$label`),
+    // module-level ones into name_map[module] (`Module$label`). Capital / `.globl`'d
+    // names are exported and collected by neither.
+    let mut name_map: HashMap<&str, HashMap<String, String>> = HashMap::new();
+    let mut proc_map: HashMap<&str, HashMap<String, String>> = HashMap::new();
+    for i in 0..lines.len() {
+        let Some(m) = line_mod[i] else { continue };
+        let Some(lab) = module_label_def(strip_comment(lines[i]).trim()) else { continue };
+        let cap = lab.chars().next().map_or(false, |c| c.is_ascii_uppercase());
+        if cap || exported.contains(lab) {
+            continue;
+        }
+        match line_proc[i] {
+            Some(p) => {
+                proc_map
+                    .entry(p)
+                    .or_default()
+                    .entry(lab.to_string())
+                    .or_insert_with(|| format!("{p}${lab}"));
+            }
+            None => {
+                name_map
+                    .entry(m)
+                    .or_default()
+                    .entry(lab.to_string())
+                    .or_insert_with(|| format!("{m}${lab}"));
+            }
+        }
+    }
+
+    // A proc's effective rename map = its module's privates + its own (the proc wins on
+    // a name clash, so a proc-internal label shadows a module-level one within it).
+    let mut proc_eff: HashMap<&str, HashMap<String, String>> = HashMap::new();
+    for (&p, pmap) in &proc_map {
+        let m = proc_module.get(p).copied().unwrap_or("");
+        let mut eff = name_map.get(m).cloned().unwrap_or_default();
+        eff.extend(pmap.iter().map(|(k, v)| (k.clone(), v.clone())));
+        proc_eff.insert(p, eff);
+    }
+
+    let mut out = String::with_capacity(text.len() + 32);
+    for (i, raw) in lines.iter().enumerate() {
+        // Inner-most scope first: the proc's map (which already folds in the module's),
+        // else the module's map, else verbatim.
+        let map = line_proc[i]
+            .and_then(|p| proc_eff.get(p))
+            .or_else(|| line_mod[i].and_then(|m| name_map.get(m)));
+        match map {
+            Some(m) if !m.is_empty() => out.push_str(&rename_local_labels(raw, m)),
+            _ => out.push_str(raw),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The label a line DEFINES, if any: a `name:` code label or a `name TYPE …` data
+/// label (no colon). Used to find a module's private symbols.
+fn module_label_def(t: &str) -> Option<&str> {
+    if let Some(l) = leading_label(t) {
+        return Some(l);
+    }
+    if let Some((Some(l), _, _)) = parse_data_line(t) {
+        return Some(l);
+    }
+    None
+}
+
+/// Rename label definitions + references on one code line using `map`, leaving the
+/// mnemonic/directive, any trailing comment, strings and indentation untouched.
+/// Structured like [`rewrite_line`] so a mnemonic is never mistaken for a label.
+fn rename_local_labels(raw: &str, map: &HashMap<String, String>) -> String {
+    if map.is_empty() {
+        return raw.to_string();
+    }
+    // Whole-word-substitute the private label names across the line's CODE (the part
+    // before any comment), skipping string/char literals. This renames a definition
+    // (`bdAlpha:`, `fb BYTE …`) and every reference uniformly — including a label in
+    // the FIRST token, as in a `pObj.Method(label, …)` COM call (which a mnemonic /
+    // operand split would miss). Mnemonics, registers, struct types and constants
+    // never match a private label name in `map`, so they pass through untouched.
+    let code = strip_comment(raw);
+    let comment = &raw[code.len()..];
+    let subs: Vec<(&str, String)> = map.iter().map(|(f, t)| (f.as_str(), t.clone())).collect();
+    format!("{}{}", substitute(code, &subs), comment)
 }
 
 pub fn lower(src: &str, kb: &Kb) -> Result<String> {
@@ -2109,6 +2344,11 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
                     .push((lhs.trim().to_string(), rhs.trim().to_string()));
             }
         } else if t.is_empty() {
+            out.push('\n');
+        } else if strip_keyword(t, "module").is_some() || t == "endmodule" {
+            // Module markers: label scoping is resolved before lowering (see
+            // `scope_module_labels`), so here they are no-ops — emit a blank line to
+            // keep the source-line map aligned.
             out.push('\n');
         } else if let Some((label, ty)) = parse_struct_open(t) {
             pending_struct = Some(StructAccum { label, ty, fields: Vec::new() });
@@ -3182,6 +3422,78 @@ fn is_register(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_scopes_private_by_capitalisation() {
+        // Two module regions in ONE file; same lowercase helper name in each.
+        let text = "module Alpha\nRun:\nagain:\n  jmp again\nendmodule\n\
+                    module Beta\nRun2:\nagain:\n  jmp again\nendmodule\n";
+        let lf = vec![0u32; text.lines().count()];
+        let out = scope_modules(text, &lf);
+        assert!(out.contains("Alpha$again:") && out.contains("Beta$again:"), "{out}");
+        assert!(out.contains("jmp Alpha$again") && out.contains("jmp Beta$again"), "{out}");
+        assert!(out.contains("Run:") && out.contains("Run2:"), "{out}"); // capitals exported
+    }
+
+    #[test]
+    fn include_does_not_absorb_into_includer_module() {
+        // Stream as textual expansion would inline it: file 0 = Brix, with an
+        // `.include`d file 1 that declares its own module Abc, plus a marker-less
+        // file 2 also nested inside Brix's region.
+        let text = "module Brix\nStart:\nhelper:\n\
+                    module Abc\nhelper:\n  ret\nendmodule\n\
+                    glob:\n\
+                    loc:\nendmodule\n";
+        let lf = vec![0, 0, 0, 1, 1, 1, 1, 2, 0, 0];
+        let out = scope_modules(text, &lf);
+        // Brix's and Abc's `helper` are distinct; neither absorbs the other.
+        assert!(out.contains("Brix$helper:") && out.contains("Abc$helper:"), "{out}");
+        // The marker-less included file (id 2) is NOT pulled into Brix.
+        assert!(out.contains("\nglob:") && !out.contains("Brix$glob"), "{out}");
+        // Brix's own later label is still scoped.
+        assert!(out.contains("Brix$loc:"), "{out}");
+    }
+
+    #[test]
+    fn module_spans_files_globl_and_passthrough() {
+        // Same module declared by two files; a private DATA label defined in one
+        // file resolves where referenced in the other (pooled by name).
+        let span = "module Canvas\nbuf BYTE 0\nendmodule\n\
+                    module Canvas\nUse:\n  lea rax, [rip + buf]\nendmodule\n";
+        let lf = vec![0, 0, 0, 1, 1, 1, 1];
+        let so = scope_modules(span, &lf);
+        assert!(so.contains("Canvas$buf BYTE 0"), "{so}");
+        assert!(so.contains("[rip + Canvas$buf]"), "{so}");
+        // `.globl` pins a lowercase name global inside a module.
+        let g = "module M\n.globl shared\nshared:\n  jmp shared\nendmodule\n";
+        let gf = vec![0u32; g.lines().count()];
+        let go = scope_modules(g, &gf);
+        assert!(go.contains("shared:") && !go.contains("M$shared"), "{go}");
+        // No module markers ⇒ byte-for-byte passthrough.
+        let plain = "foo:\n  jmp foo\nBar:\n  ret\n";
+        let pf = vec![0u32; plain.lines().count()];
+        assert_eq!(scope_modules(plain, &pf), plain);
+    }
+
+    #[test]
+    fn proc_internal_labels_are_proc_private() {
+        // Two procs in ONE module, each with a lowercase `done:` jump target.
+        let text = "module M\nproc Aaa\ndone:\n  jmp done\nendproc\n\
+                    proc Bbb\ndone:\n  jmp done\nendproc\nendmodule\n";
+        let lf = vec![0u32; text.lines().count()];
+        let out = scope_modules(text, &lf);
+        assert!(out.contains("Aaa$done:") && out.contains("jmp Aaa$done"), "{out}");
+        assert!(out.contains("Bbb$done:") && out.contains("jmp Bbb$done"), "{out}");
+
+        // A proc sees its module's labels (module-scoped), but its own jump targets are
+        // proc-scoped.
+        let t2 = "module M\nbuf BYTE 0\nproc Aaa\n  lea rax, [rip + buf]\nloop:\n  jmp loop\nendproc\nendmodule\n";
+        let lf2 = vec![0u32; t2.lines().count()];
+        let o2 = scope_modules(t2, &lf2);
+        assert!(o2.contains("M$buf BYTE 0"), "{o2}"); // module level -> M$
+        assert!(o2.contains("[rip + M$buf]"), "{o2}"); // proc references the module label
+        assert!(o2.contains("Aaa$loop:") && o2.contains("jmp Aaa$loop"), "{o2}"); // proc-internal
+    }
 
     #[test]
     fn split_commas_respects_brackets() {

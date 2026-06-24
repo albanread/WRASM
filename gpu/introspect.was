@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/introspect.was — the GPU canvas's self-portrait, mirroring library/introspect.was.
 ;
 ;   .include "../gpu/introspect.was"     ; after canvas
@@ -83,3 +84,4 @@ sn_put:
     pop     rsi
     pop     rbx
     ret
+endmodule

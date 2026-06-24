@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/harness.was — GPU Canvas G5 game machine, RECONCILED to the library API.
 ;
 ; The GPU mirror of library/harness.was, but with the SAME public symbols and the
@@ -262,7 +263,7 @@ hw_timer:
     ; RSP. The bare `call GameFrame` here is therefore safe for ABI reasons unrelated
     ; to alignment — no manual push/sub is needed around it either way.
     call    GameFrame
-    mov     ecx, 7                         ; QUIT action (Esc / stick) -> close
+    mov     ecx, ACT_QUIT                  ; QUIT action (Esc / stick) -> close
     call    ActionHit
     test    eax, eax
     jz      hw_done
@@ -421,3 +422,4 @@ hMsgL       BYTE  48 dup(0)
 hRectL      BYTE  16 dup(0)
 hWinWL      DWORD ?
 hWinHL      DWORD ?
+endmodule

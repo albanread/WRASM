@@ -1,0 +1,421 @@
+; gpu_particles_demo.was — TEXTURED PARTICLE showcase for gpu/particles.was.
+;
+;   was examples\gpu_particles_demo.was -o gpu_particles_demo.exe  &&  gpu_particles_demo.exe
+;     SPACE re-triggers the explosion; Esc / closing the window quits.
+;
+; Brings up the GPU-Canvas stack — G0 (gpu/canvas.was: device/swapchain/palettes),
+; G1 (gpu/blit.was: the alpha blend state), G3 (gpu/sprite.was: the sprite atlas +
+; per-sprite palette LUT) and gpu/particles.was (BOTH the procedural dots AND the new
+; TEXTURED-fragment mode) — then repeatedly EXPLODES a recognisable sprite into its
+; OWN pixels:
+;
+;   * a 16x16 indexed GEM frame (a diamond outline + facets in a few indexed colours),
+;     added with SprAddFrame, coloured through one palette slot via SprSetPalette.
+;   * every ~60 frames it fires PtBurstSprite(centre, gemFrame, 8, 8, speed) — the gem
+;     SHATTERS into an 8x8 = 64 grid of TEXTURED fragments, each carrying its own atlas
+;     sub-cell + the gem's palette slot, flying OUTWARD from the centre under gravity
+;     and fading by life. Each fragment samples the atlas exactly like a sprite (index 0
+;     discarded), so the debris is the gem's OWN palette-correct pixels, not flat dots.
+;   * for contrast it ALSO fires a procedural PtBurst spark (additive glow) at the same
+;     spot, so the BMP shows both modes side by side.
+;   * the re-trigger timer keeps fragments in flight, so a headless capture always
+;     catches a mid-flight fan.
+;
+; Headless gate (IFDEF PTTEST, mirroring brickout_fx's FXTEST): step ~40 frames, dump
+; examples/gpu_particles_demo.bmp via the canvas' GpuSnapshot, ExitProcess 0. The
+; interactive build opens a live 1280x720 window driven by a 16 ms timer.
+;
+; Every .DATA opens with .balign 16 (trap #8); COM register-args staged in memory (#9).
+
+.include "../gpu/canvas.was"      ; G0: idxBuf + palette LUTs + device/swapchain + GpuSnapshot
+.include "../gpu/blit.was"        ; G1: blend states (pBlendOpaque / pBlendAlpha)
+.include "../gpu/sprite.was"      ; G3: sprite atlas + per-sprite palette LUT + sprFrameTab
+.include "../gpu/text.was"        ; gpu/canvas.was references DrawText; include so it resolves
+.include "../gpu/particles.was"   ; procedural dots + the TEXTURED-fragment mode (this demo)
+
+.DATA
+.balign 16
+className   WCHAR  "rasm_gpu_particles", 0
+titleText   WCHAR  "RASM — Textured Particles (sprite shatter)", 0
+wc          BYTE   80 dup(0)
+msg         BYTE   48 dup(0)
+hwndSave    QWORD  ?
+winRect     BYTE   16 dup(0)
+winW        DWORD  ?
+winH        DWORD  ?
+
+fidGem      DWORD  ?              ; the gem frame id
+frameNo     DWORD  0
+snapDone    DWORD  0
+ptSnapWant  DWORD  0              ; >0 = capture the BMP after counting down to 1
+
+demoBmp     WCHAR  "E:/RASM/examples/gpu_particles_demo.bmp", 0
+
+.balign 16
+; the 32x32 indexed gem frame pixels (one byte/pixel; index 0 = transparent). A bigger
+; frame -> 8x8 shatter cells are 4 px each, so each textured fragment is clearly a chunk
+; of the gem (palette-correct) rather than a single dot.
+sprGem      BYTE   1024 dup(0)
+
+.balign 16
+; clear-to-background colour for the back buffer (a deep slate so the bright fragments
+; + the additive spark read clearly), rgba floats.
+bgCol       DWORD  0x3D23D70A, 0x3D8F5C29, 0x3DB851EC, 0x3F800000   ; ~(0.04,0.07,0.09,1)
+
+.balign 16
+; the gem's TOP-LEFT in SCREEN px (the 640x360 logical the particle VS maps). The gem is
+; 16 px; the shatter tiles its 16x16 footprint from this corner, so it sits centred on
+; the 640x360 field at (~312,192). The procedural spark fires at the gem CENTRE (+8,+8).
+fGemTLxC    DWORD  0x43980000     ; 304.0  gem top-left X (centre 320)
+fGemTLyC    DWORD  0x43240000     ; 164.0  gem top-left Y (centre 180)
+fSpeed      DWORD  0x3FC00000     ; 1.5f  textured-fragment outward speed (stays coherent)
+fSparkSpd   DWORD  0x40800000     ; 4.0f  procedural spark speed
+fSparkR     DWORD  0x3F800000     ; 1.0
+fSparkG     DWORD  0x3F4CCCCD     ; 0.8
+fSparkB     DWORD  0x3E000000     ; 0.125 (a warm spark)
+
+.balign 16
+.CODE
+.globl main
+main:
+    invoke  GetModuleHandleW, 0
+    mov     rsi, rax
+    lea     rdi, [rip + wc]
+    mov     dword ptr [rdi + WNDCLASSEXW.cbSize], 80
+    mov     dword ptr [rdi + WNDCLASSEXW.style], 3
+    lea     rax, [rip + WndProc]
+    mov     [rdi + WNDCLASSEXW.lpfnWndProc], rax
+    mov     [rdi + WNDCLASSEXW.hInstance], rsi
+    lea     rax, [rip + className]
+    mov     [rdi + WNDCLASSEXW.lpszClassName], rax
+    invoke  LoadCursorW, 0, 32512
+    lea     rdi, [rip + wc]
+    mov     [rdi + WNDCLASSEXW.hCursor], rax
+    invoke  RegisterClassExW, wc
+
+    lea     rdi, [rip + winRect]
+    mov     dword ptr [rdi + 8], 1280
+    mov     dword ptr [rdi + 12], 720
+    invoke  AdjustWindowRect, winRect, 0x10CF0000, 0
+    lea     rdi, [rip + winRect]
+    mov     eax, [rdi + 8]
+    sub     eax, [rdi]
+    mov     [rip + winW], eax
+    mov     eax, [rdi + 12]
+    sub     eax, [rdi + 4]
+    mov     [rip + winH], eax
+
+    invoke  CreateWindowExW, 0, className, titleText, 0x10CF0000, 0x80000000, 0x80000000, [rip + winW], [rip + winH], 0, 0, rsi, 0
+    mov     [rip + hwndSave], rax
+    test    rax, rax
+    jz      fail_window
+
+    ; ---- build the gem frame BEFORE creating GPU resources ----
+    call    BuildGemFrame
+
+    ; ---- bring up G0 / G1 / G3 / particles ----
+    mov     rcx, [rip + hwndSave]
+    call    GpuInit
+    call    BlitInit
+    call    SprInit
+    call    PtInit                          ; compiles BOTH the procedural + textured shaders
+
+    ; ---- sprite atlas: the one gem frame (32x32), uploaded ----
+    lea     rcx, [rip + sprGem]
+    mov     edx, 32
+    mov     r8d, 32
+    call    SprAddFrame
+    mov     [rip + fidGem], eax
+    call    SprUploadAtlas
+
+    ; ---- the gem's palette: slot 0, a few jewel colours; tell particles to use slot 0 ----
+    call    BuildGemPalette
+    call    SprUploadPalette
+    mov     dword ptr [rip + ptBurstSlot], 0   ; PtBurstSprite fragments resolve via slot 0
+
+    ; hand the sprite atlas + palette SRVs + frame table to the textured particle pass
+    ; (it samples the SRVs for the gem-fragment shatter, exactly like DrawSprites, and
+    ; reads the frame rect from sprFrameTab in PtBurstSprite).
+    mov     rcx, [rip + pSprSRVatlas]
+    mov     rdx, [rip + pSprSRVpal]
+    lea     r8, [rip + sprFrameTab]
+    lea     r9, [rip + sprFrameCount]
+    call    PtSetAtlas
+
+    ; ---- fire the first explosion immediately so frame 0 already has debris ----
+    call    Explode
+
+IFDEF PTTEST
+    mov     ecx, 40
+    call    PtSelfTest                      ; headless: step 40 frames, BMP on the last
+    invoke  ExitProcess, 0
+ENDIF
+
+    call    Frame                           ; first interactive frame
+    invoke  SetTimer, [rip + hwndSave], 1, 16, 0
+msgloop:
+    invoke  GetMessageW, msg, 0, 0, 0
+    test    eax, eax
+    jle     msgdone
+    invoke  TranslateMessage, msg
+    invoke  DispatchMessageW, msg
+    jmp     msgloop
+msgdone:
+    invoke  ExitProcess, 0
+fail_window:
+    invoke  ExitProcess, 1
+
+; ===========================================================================
+; Explode — shatter the gem into 8x8 textured fragments + a procedural spark, both
+; at the gem centre. Called on a timer (every ~60 frames) and by SPACE.
+; ===========================================================================
+Explode:
+    push    rbx
+    sub     rsp, 32
+    ; --- textured shatter: PtBurstSprite(topLeftX, topLeftY, fidGem, 8, 8, speed) ---
+    movss   xmm0, [rip + fGemTLxC]          ; gem top-left X (screen px)
+    movss   xmm1, [rip + fGemTLyC]          ; gem top-left Y
+    mov     ecx, [rip + fidGem]             ; frameId
+    mov     edx, 8                          ; gridX
+    mov     r8d, 8                          ; gridY
+    movss   xmm3, [rip + fSpeed]            ; outward speed
+    call    PtBurstSprite
+
+    ; --- procedural spark for contrast at the gem CENTRE (top-left + 8,8) ---
+    movss   xmm0, [rip + fGemTLxC]
+    addss   xmm0, [rip + fEight]
+    movss   xmm1, [rip + fGemTLyC]
+    addss   xmm1, [rip + fEight]
+    mov     ecx, 40                         ; 40 glow sparks
+    movss   xmm3, [rip + fSparkSpd]
+    movss   xmm4, [rip + fSparkR]
+    movss   xmm5, [rip + fSparkG]
+    movss   xmm6, [rip + fSparkB]
+    call    PtBurst
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; Frame — one frame: clear the back buffer, advance + draw the particles, present.
+; (No idxBuf compositing here — the particles draw straight onto the back buffer over
+; the cleared background, which is all this showcase needs.)
+; ===========================================================================
+.globl Frame
+Frame:
+    push    rbx
+    sub     rsp, 32
+
+    call    PtUpdate                        ; advance + fade + compact BOTH pools
+
+    ; clear the back buffer + set its viewport.
+    pContext.OMSetRenderTargets(1, pRTV, 0)
+    pContext.ClearRenderTargetView([rip + pRTV], bgCol)
+    pContext.RSSetViewports(1, vp)
+
+    ; draw both particle passes (procedural dots additive, textured fragments alpha-over).
+    mov     rcx, [rip + pRTV]
+    call    PtDraw
+
+    ; ---- optional BMP capture (headless gate): snap one frame, then continue. ----
+    mov     eax, [rip + ptSnapWant]
+    test    eax, eax
+    jz      fr_flip
+    dec     dword ptr [rip + ptSnapWant]
+    jnz     fr_flip
+    lea     rax, [rip + demoBmp]
+    mov     [rip + bmpPathPtr], rax
+    call    GpuSnapshot                     ; capture BEFORE Present (DISCARD swap effect)
+fr_flip:
+    pSwap.Present(1, 0)
+
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; PtSelfTest(rcx=frames) — headless: step `frames` frames, capturing the BMP on the
+; LAST frame (ptSnapWant counts down to it). The first Explode already fired in main;
+; this re-triggers mid-run so the gate frame has a fan of fragments MID-FLIGHT.
+; ===========================================================================
+.globl PtSelfTest
+PtSelfTest:
+    push    rbx
+    sub     rsp, 32
+    mov     ebx, ecx                        ; frame count
+    mov     [rip + ptSnapWant], ebx         ; capture on the final frame
+pst_loop:
+    test    ebx, ebx
+    jz      pst_done
+    ; re-trigger ~12 frames before the snapshot so the capture catches a fresh fan
+    ; arcing outward (not yet faded), in addition to the older debris still in flight.
+    cmp     ebx, 12
+    jne     pst_step
+    call    Explode
+pst_step:
+    call    Frame
+    dec     ebx
+    jmp     pst_loop
+pst_done:
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildGemFrame — synthesize a 32x32 indexed GEM: a diamond (rotated square) with a
+; bright top-left facet, a mid body, and a dark bottom-right facet + an outline. Indexed:
+;   1 = outline (white)   2 = bright facet   3 = body   4 = dark facet
+; All on index 0 (transparent). The palette maps 1..4 to jewel colours.
+; ===========================================================================
+BuildGemFrame:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+
+    lea     rdi, [rip + sprGem]
+    xor     r12d, r12d                       ; y 0..31
+bg_y:
+    cmp     r12d, 32
+    jge     bg_done
+    xor     r13d, r13d                       ; x 0..31
+bg_x:
+    cmp     r13d, 32
+    jge     bg_yend
+    ; diamond test: |x-15.5| + |y-15.5| <= 15.5  (Manhattan -> a diamond). Use *2 to
+    ; stay integer: |2x-31| + |2y-31| <= 31.
+    mov     eax, r13d
+    add     eax, eax
+    sub     eax, 31
+    mov     ebx, eax
+    sar     ebx, 31
+    xor     eax, ebx
+    sub     eax, ebx                          ; |2x-31|
+    mov     ecx, r12d
+    add     ecx, ecx
+    sub     ecx, 31
+    mov     ebx, ecx
+    sar     ebx, 31
+    xor     ecx, ebx
+    sub     ecx, ebx                          ; |2y-31|
+    mov     ebx, eax
+    add     ebx, ecx                          ; |2x-31| + |2y-31|
+    cmp     ebx, 31
+    jg      bg_zero                           ; outside the diamond -> transparent
+    cmp     ebx, 27
+    jge     bg_outline                        ; near the rim -> outline (index 1)
+    ; inside: pick a facet. top-left bright, body mid, bottom-right dark by (x + y).
+    mov     eax, r13d
+    add     eax, r12d                          ; x + y
+    cmp     eax, 24
+    jl      bg_bright                          ; upper-left -> bright facet (index 2)
+    cmp     eax, 40
+    jg      bg_dark                            ; lower-right -> dark facet (index 4)
+    mov     byte ptr [rdi], 3                  ; body (index 3)
+    jmp     bg_adv
+bg_bright:
+    mov     byte ptr [rdi], 2
+    jmp     bg_adv
+bg_dark:
+    mov     byte ptr [rdi], 4
+    jmp     bg_adv
+bg_outline:
+    mov     byte ptr [rdi], 1
+    jmp     bg_adv
+bg_zero:
+    mov     byte ptr [rdi], 0
+bg_adv:
+    inc     rdi
+    inc     r13d
+    jmp     bg_x
+bg_yend:
+    inc     r12d
+    jmp     bg_y
+bg_done:
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ===========================================================================
+; BuildGemPalette — slot 0's colours 1..4 = the gem's jewel ramp (a cyan/teal gem):
+;   1 outline white, 2 bright cyan, 3 teal body, 4 dark teal. (0x00RRGGBB.)
+; ===========================================================================
+BuildGemPalette:
+    push    rbx
+    sub     rsp, 32
+    ; colour 1 = white outline.
+    mov     ecx, 0                            ; slot 0
+    mov     edx, 1
+    mov     r8d, 0x00F0F8FF
+    call    SprSetPalette
+    ; colour 2 = bright cyan facet.
+    mov     ecx, 0
+    mov     edx, 2
+    mov     r8d, 0x0080F0FF
+    call    SprSetPalette
+    ; colour 3 = teal body.
+    mov     ecx, 0
+    mov     edx, 3
+    mov     r8d, 0x0020A0C0
+    call    SprSetPalette
+    ; colour 4 = dark teal facet.
+    mov     ecx, 0
+    mov     edx, 4
+    mov     r8d, 0x000C4860
+    call    SprSetPalette
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; WndProc(hwnd=rcx, msg=rdx, wParam=r8, lParam=r9) -> LRESULT in rax
+.globl WndProc
+WndProc:
+    cmp     edx, 2                            ; WM_DESTROY
+    je      wp_destroy
+    cmp     edx, 275                          ; WM_TIMER
+    je      wp_timer
+    cmp     edx, 256                          ; WM_KEYDOWN
+    je      wp_keydn
+    invoke  DefWindowProcW, rcx, rdx, r8, r9
+    ret
+wp_keydn:
+    cmp     r8d, 27                           ; VK_ESCAPE
+    je      wp_quit
+    cmp     r8d, 32                           ; VK_SPACE -> re-trigger
+    jne     wp_kd_done
+    call    Explode
+wp_kd_done:
+    xor     eax, eax
+    ret
+wp_quit:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_destroy:
+    invoke  PostQuitMessage, 0
+    xor     eax, eax
+    ret
+wp_timer:
+    inc     dword ptr [rip + frameNo]
+    ; re-trigger the explosion every 60 frames so debris is always in flight.
+    mov     eax, [rip + frameNo]
+    xor     edx, edx
+    mov     ecx, 60
+    div     ecx
+    test    edx, edx
+    jnz     wp_t_frame
+    call    Explode
+wp_t_frame:
+    call    Frame
+    xor     eax, eax
+    ret
+
+.balign 16
+.DATA
+.balign 16
+fEight   DWORD 0x41800000               ; 16.0f (gem half-size, top-left -> centre)
+.balign 16

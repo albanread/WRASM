@@ -17,6 +17,8 @@ was <input.was> -o <out.exe|out.obj>   assemble (.exe = self-contained PE, else 
 was <input.was> --emit-asm             print the lowered rasm text, then stop
 was <input.was> --check                semantic check only (diagnostics, no output)
 was <input.was> -o x.exe --entry NAME  set the PE entry symbol (default: main)
+was <input.was> --modules              enable module-scoped labels (see Modules)
+was <input.was> --include-graph        print the .include dependency tree, then stop
 was --help                             a condensed version of this page
 ```
 
@@ -55,6 +57,10 @@ endproc
 - The checker (run by `--check`, and live in the IDE) flags: clobbering a non-volatile
   not listed in `uses`, reading an `in` register after it's been overwritten, and frame
   imbalance. It is **GP-register only** — see trap #2.
+
+See [docs/structured.md](docs/structured.md) for the structured-programming view —
+the contract above plus the `.if`/`.while`/`.for` control-flow blocks and a proc's
+private label scope (its internal jump targets can't collide with another proc's).
 
 ## Equates & compile-time conditionals (MASM-style)
 
@@ -122,6 +128,50 @@ runs every time the code does. Rule of thumb: **undotted `IF` chooses *whether c
 exists*; dotted `.if` chooses *what code does at run time*.** An equate folds happily into
 a runtime `.if` condition (`.if eax < LIMIT`).
 
+## Modules — label scoping (on by default; `--nomodules` to disable)
+
+Source-to-exe means there is no linker, so historically **every label was global** —
+two `.include`d files that both use a helper label (`loop`, `done`, `pu_loop`)
+collide. Module scoping narrows that rule and is **on by default**; `--nomodules`
+turns it off (then `module`/`endmodule` are ignored and every label stays global,
+byte-identical to the pre-modules behaviour).
+
+- A **module** is the text between `module NAME` and `endmodule` **in a file**.
+  The region scopes only **that file's own lines** — a file pulled in by `.include`
+  is **not** absorbed (it keeps its own module, or none), even though it sits
+  textually inside the region. A file may hold several module regions; a module may
+  be declared by **many files** (each says `module NAME`), and their private labels
+  pool by name.
+- **A capital first letter ⇒ EXPORTED** (global, unique, callable from any module) —
+  no export list. A **lowercase/`_` ⇒ PRIVATE** to its module, mangled to
+  `NAME$label`. `.globl`/`.global` also pins a name global (the way to export a
+  lowercase data symbol games reference).
+- **A label defined inside `proc … endproc` is private to that PROC** (mangled
+  `proc$label`) — a tier finer than the module, so two procs in one module may reuse
+  a jump-target name (`loop`, `done`) without you tracking every label across the
+  module's files. Lowercase labels at module level (outside any proc) stay
+  module-private. (Nobody jumps into the middle of a proc, so this only ever removes
+  collisions.)
+- Only label *names* change, never bytes (the encoder computes the same offsets), so
+  a `--modules` build is byte-identical to the gate-off build; the mangled names show
+  in `--emit-asm`. `.ASCIISTRING`/`.WIDESTRING` raw blocks are passed through verbatim.
+
+```
+module Canvas              ; this file's lowercase labels are private to Canvas
+.globl fb                  ; …except fb, which games reference (exported)
+Cls:                       ; capital ⇒ exported, callable from any module / a game
+  …
+cls_loop:                  ; lowercase ⇒ Canvas$cls_loop (another module may reuse the name)
+  …
+endmodule
+```
+
+The include graph is **only a view** of how files are wired today (see
+`--include-graph`); it does not define the modules — the markers do. The framework
+library is organised into modules **Canvas** (CPU gfx), **Sound**, **Player**
+(ABC/MIDI) and **Gpu**; a game that uses it gets the scoping automatically
+(`--nomodules` reverts to the all-global build, byte-for-byte).
+
 ## Exceptions & traps — where WRASM bites
 
 These are the dialect's sharp edges. Most were found the hard way; learn them once.
@@ -183,5 +233,7 @@ These are the dialect's sharp edges. Most were found the hard way; learn them on
   contract checker in detail.
 - [docs/language.md](docs/language.md) — registers, addressing modes, size overrides.
 - [docs/instructions.md](docs/instructions.md) — the supported instruction set.
+- [docs/structured.md](docs/structured.md) — structured programming with `proc`: the
+  contract, `.if`/`.while`/`.for`, and proc-private labels.
 - [docs/gamecanvas.md](docs/gamecanvas.md) / [docs/gameaudio.md](docs/gameaudio.md) —
   the 2D-game framework written entirely in WRASM (the largest worked example).

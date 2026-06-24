@@ -74,50 +74,72 @@ mov  qword ptr [rdi], rax
 
 ## Directives
 
-### Section control
+The `was` front-end uses **MASM-style** sections and data directives. (The bare
+`rasm-as` encoder underneath is GAS-flavored; everything below is the `was`
+dialect that `.was` files are written in.)
+
+### Sections
 
 ```asm
-.text              ; code section (read + execute)
-.data              ; initialised data (read + write)
-.bss               ; uninitialised data (zeroed at load)
+.CODE        ; code — read + execute   (aliases: .text / .code)
+.DATA        ; initialised data — read + write   (alias: .data)
 ```
 
-### Symbol declarations
+Directive names are case-insensitive (`.DATA` == `.data`). Export a label with
+`.globl` (alias `.global`); symbols referenced by `invoke` are resolved from the
+knowledge database automatically — no manual `.extern` is needed.
 
 ```asm
-.globl  main         ; export label to linker
-.extern CreateFileW  ; import external symbol
+.globl  main
 ```
 
-### Data emission
+### Data emission (MASM-style)
 
 ```asm
-.byte   0x90              ; 1-byte literal
-.word   0x1234            ; 2-byte little-endian
-.dword  0xDEADBEEF        ; 4-byte little-endian
-.qword  0xCAFEBABEDEAD    ; 8-byte little-endian
-.space  256               ; reserve 256 zero bytes
-.ascii  "hello"           ; raw bytes (no null terminator)
-.asciz  "hello"           ; null-terminated string
+label   BYTE   0x90, 1, 2        ; 1-byte values      (aliases: SBYTE, DB)
+        WORD   0x1234            ; 2-byte LE           (SWORD,  DW)
+        DWORD  0xDEADBEEF        ; 4-byte LE           (SDWORD, DD)
+        QWORD  0xCAFEBABEDEAD    ; 8-byte LE           (SQWORD, DQ)
+msg     WCHAR  "Hello", 0        ; UTF-16 string + terminator
+buf     BYTE   256 dup(0)        ; 256 zero bytes (dup repeats a value)
+slot    DWORD  ?                 ; ? = one zero-filled element
+freq    real8  440.0            ; IEEE-754 f64        (real4 / f32 for 32-bit)
 ```
 
-### Include
+- `"…"` is a string; under `WCHAR` it is encoded UTF-16. `N dup(v)` repeats `v`
+  `N` times — the count folds through equates (see below). `?` reserves a single
+  zeroed element of the directive's width.
+- **`.DATA` is byte-packed — there is no automatic alignment.** An odd-length
+  declaration shifts every following symbol by a byte, which can misalign a
+  structure the OS or an SSE load reads. Put `.balign 16` at the head of a `.DATA`
+  block. Alignment directives are GAS-style, **with the dot** (`.align`,
+  `.balign`, `.p2align`); a bare `align` is parsed as an instruction. See
+  `help.md` trap #8.
+
+### Equates & conditional assembly
+
+`NAME equ <expr>` (or `NAME = <expr>`) defines a compile-time integer that folds
+to a literal; `IF` / `IFDEF` / `IFNDEF` / `ELSEIF` / `ELSE` / `ENDIF` select code
+at assembly time. See **[Macros → Equates](macros.md#equates--compile-time-constants)**
+for the expression grammar and substitution rules.
+
+### Structured control flow
+
+`.if/.elseif/.else/.endif`, `.while/.endw`, `.repeat/.until`,
+`.for reg = a to b/.endfor`, `.forever/.endfor`, and `.break`/`.continue`/`.ret`
+lower to visible `cmp` + `jcc`. A condition is `reg <relop> value` (`<  <=  >  >=
+==  !=`, unsigned by default; `s`-prefix for signed). See
+**[Macros → Structured control flow](macros.md#structured-control-flow-runtime)**.
+
+### Include & ASCII blocks
 
 ```asm
-.include "library/canvas.was"   ; insert another source file here
-```
+.include "library/canvas.was"   ; insert another file (path relative to this one)
 
-### WAS-only: ASCII block
-
-```asm
-.ASCIISTRING
-float4 main(float2 uv : TEXCOORD) : SV_Target {
-    return float4(uv, 0, 1);
-}
+.ASCIISTRING                    ; embed raw text (HLSL, etc.) as bytes
+float4 main(float2 uv : TEXCOORD) : SV_Target { return float4(uv, 0, 1); }
 .ENDASCIISTRING
 ```
-
-Used to embed HLSL or other text blobs as raw byte sequences in the data section.
 
 ## Condition codes
 

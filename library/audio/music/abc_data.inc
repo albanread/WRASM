@@ -1,3 +1,4 @@
+module Player
 ; abc_data.inc — the ABC parser's shared state, constants + key tables.
 ; Included by the abc.was shell inside .DATA. Not standalone.
 
@@ -91,3 +92,4 @@ fChDur    real8 0.0                   ; ParseChord durWholes park (across Advanc
 ; ParseChord pitch scratch: up to 8 simultaneous notes; one onset/offset for all.
 ; .DATA is safe — parsing is single-threaded (same pattern as ftTemp).
 chPitch   DWORD 8 dup(0)              ; the chord's note pitches (cap 8, extras ignored)
+endmodule

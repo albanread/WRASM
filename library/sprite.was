@@ -1,3 +1,4 @@
+module Canvas
 ; ============================================================================
 ; sprite.was — sprites with their own RGB LUT, composited over the background
 ; ============================================================================
@@ -329,3 +330,4 @@ ds_nextrow:
     jmp     ds_row
 ds_done:
 endproc
+endmodule

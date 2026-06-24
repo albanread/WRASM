@@ -1,3 +1,6 @@
+module Gpu
+.globl pSprSRVatlas
+.globl pSprSRVpal
 ; gpu/sprite.was — GPU Canvas G3 "Sprites — brakes off".
 ;
 ; Built ON TOP of gpu/canvas.was (G0: device/swapchain, the comobj/.Method idioms,
@@ -794,3 +797,4 @@ sprBandH   DWORD 0                         ; current band height
 sprRTVTmp  QWORD ?                         ; single-element RTV array for OMSetRenderTargets
 .balign 16
 sprSrvArr  QWORD 0, 0                       ; t0=atlas, t1=palette
+endmodule

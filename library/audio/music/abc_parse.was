@@ -1,3 +1,4 @@
+module Player
 ; abc_parse.was — ParseTune: the single-pass header/body char state machine.
 ; Part of the abc.was shell (.CODE).
 ; ----------------------------------------------------------------------------
@@ -504,3 +505,4 @@ pt_end:
     call    FinalizeTune
 endproc
 
+endmodule

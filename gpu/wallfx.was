@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/wallfx.was — GPU Canvas "brick-wall fx BACKGROUND" + index-0-transparent LUT.
 ;
 ; The deluxe brickout (examples/brickout_fx.was) renders a PROCEDURAL brick-wall
@@ -388,3 +389,4 @@ WallComposite:
 .DATA
 .balign 16
 wallfxPad QWORD 0                         ; tail padding (keeps the .DATA 16-aligned)
+endmodule

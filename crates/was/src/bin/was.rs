@@ -20,7 +20,9 @@ USAGE
   was <input.was> -o <out.exe|out.obj>   assemble (.exe = self-contained PE, else COFF)
   was <input.was> --emit-asm             print the lowered rasm text, then stop
   was <input.was> --check                semantic check only (diagnostics, no output)
+  was <input.was> --include-graph        print the .include dependency tree, then stop
   was <input.was> -o x.exe --entry NAME  set the PE entry symbol (default: main)
+  was <input.was> --nomodules            disable module-scoped labels (ON by default)
   was -h | --help                        this help
 
 The knowledge DB ($WINKB_DB, else E:\\windows_api\\windows_api.db) resolves `invoke`
@@ -42,6 +44,19 @@ EQUATES + COMPILE-TIME CONDITIONALS (MASM-style, fold before lowering)
   equate. Undotted COMPILE-TIME conditionals select source text before assembly:
     IF <expr> / IFDEF NAME / IFNDEF NAME / ELSEIF <expr> / ELSE / ENDIF  (nestable)
   These are DISTINCT from the runtime `.if` (which lowers to a compare + branch).
+
+MODULES (ON by default; --nomodules to disable; a narrowing of \"every label is global\")
+  A module is `module NAME … endmodule` markers in a file; the region scopes only
+  THAT file's own lines -- a file pulled in by `.include` is NOT absorbed (it keeps
+  its own module, or none). A module may span many files (each declares `module
+  NAME`), and a file may hold several module regions. A label whose name starts with
+  a CAPITAL is EXPORTED (global, unique, callable from any module); a lowercase/_
+  name is PRIVATE -- mangled `NAME$label`, so two modules may reuse a helper name
+  (`loop`, `pu_loop`) without colliding. A label inside a `proc … endproc` is finer
+  still -- private to that PROC (`proc$label`), so two procs in one module may reuse a
+  jump-target name (`loop`, `done`). `.globl` also pins a name global. With
+  --nomodules, `module`/`endmodule` are ignored and every label stays global
+  (byte-identical to the pre-modules behaviour). `--include-graph` shows the structure.
 
   Exceptions that bite (the full reference is help.md):
     * `invoke` uses rax/eax as scratch to stage stack args -- never pass an `invoke`
@@ -73,6 +88,8 @@ fn run() -> anyhow::Result<()> {
     let mut entry = "main".to_string();
     let mut emit_asm = false;
     let mut check = false;
+    let mut modules = true; // module-scoped labels are ON by default; --nomodules opts out
+    let mut include_graph = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -94,6 +111,18 @@ fn run() -> anyhow::Result<()> {
                 check = true;
                 i += 1;
             }
+            "--modules" => {
+                modules = true; // explicit; this is the default
+                i += 1;
+            }
+            "--nomodules" => {
+                modules = false;
+                i += 1;
+            }
+            "--include-graph" => {
+                include_graph = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 print!("{HELP}");
                 return Ok(());
@@ -113,8 +142,17 @@ fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|_| r"E:\windows_api\windows_api.db".to_string());
     let kb = Kb::open(&db)?;
 
-    let src = std::fs::read_to_string(&input)?;
-    let src = was::expand_includes(&src, std::path::Path::new(&input))?;
+    let raw = std::fs::read_to_string(&input)?;
+    let exp = was::expand_includes_graph(&raw, std::path::Path::new(&input))?;
+
+    if include_graph {
+        print_include_graph(&exp);
+        return Ok(());
+    }
+
+    // The module overlay (opt-in) needs the per-line file attribution, so it runs
+    // here on the expanded text; otherwise we take the expanded text as-is.
+    let src = if modules { was::scope_modules_by_file(&exp) } else { exp.text };
 
     if check {
         let diags = was::check(&src, &kb);
@@ -174,4 +212,32 @@ fn run() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Print the `.include` dependency tree (DFS, in include order) with per-file line
+/// counts and the parent line each include sits on — the flattened graph `was` now
+/// records, so the shell-of-includes structure is visible at a glance.
+fn print_include_graph(g: &was::Expansion) {
+    let mut lines = vec![0usize; g.files.len()];
+    for &f in &g.line_file {
+        lines[f as usize] += 1;
+    }
+    fn walk(g: &was::Expansion, lines: &[usize], file: u32, depth: usize, via: Option<u32>) {
+        let indent = "  ".repeat(depth);
+        let name = g.files[file as usize].display();
+        match via {
+            Some(ln) => {
+                println!("{indent}{name}  [{} lines, .include at parent:{ln}]", lines[file as usize])
+            }
+            None => println!("{indent}{name}  [{} lines]", lines[file as usize]),
+        }
+        for &(p, c, ln) in &g.edges {
+            if p == file {
+                walk(g, lines, c, depth + 1, Some(ln));
+            }
+        }
+    }
+    walk(g, &lines, 0, 0, None);
+    let total: usize = lines.iter().sum();
+    println!("\n{} files, {} expanded lines", g.files.len(), total);
 }

@@ -1,3 +1,4 @@
+module Player
 ; ============================================================================
 ; abc_play.was — Sprint 5: the midiOut scheduler thread.
 ; Part of the abc.was shell.  Opens its own .DATA for the player state, then
@@ -39,12 +40,14 @@
 .DATA
 .balign 16                       ; data-alignment guard: caller .DATA parity could misalign structs/buffers below (see help.md)
 
+.globl hmo                                ; exported: brickout_fx sends raw midiOut msgs
 hmo          QWORD  0                     ; HMIDIOUT from midiOutOpen
 gMusicQuit   DWORD  0                     ; scheduler loop stop flag (0 = run)
 hMusicThread QWORD  0                     ; scheduler thread handle (for the join)
 gMusicTid    DWORD  0                     ; thread id sink for CreateThread
 mStartMs     DWORD  0                     ; wall-clock base (GetTickCount at start)
 mMsg         DWORD  0                     ; staged dwMsg (invoke clobbers eax — trap #1)
+.globl gMusicLoop                         ; exported: games set gMusicLoop=1 to loop
 gMusicLoop   DWORD  0                     ; 1 = replay the tune from the top when it ends
 
 .CODE
@@ -186,3 +189,4 @@ proc MusicShutdown frame
     mov     dword ptr [rip + gMusicQuit], 0
     mov     dword ptr [rip + gMusicLoop], 0
 endproc
+endmodule

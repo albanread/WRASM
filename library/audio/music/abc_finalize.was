@@ -1,3 +1,4 @@
+module Player
 ; abc_finalize.was — FinalizeTune (stable sort by time,priority) + WriteTune dump.
 ; Part of the abc.was shell (.CODE).
 ; ----------------------------------------------------------------------------
@@ -116,3 +117,4 @@ proc WriteTune uses rbx frame in rcx
     invoke  WriteFile, rbx, tuneEv, [rip + twBytes], twWrote, 0
     invoke  CloseHandle, rbx
 endproc
+endmodule

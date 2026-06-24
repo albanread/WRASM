@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/text.was — GPU Canvas G4 "Text — font atlas + text layer".
 ;
 ; Built ON TOP of gpu/canvas.was (G0) and gpu/blit.was (G1: pBlendAlpha, the
@@ -695,3 +696,4 @@ TxtFlush:
 txtF255   DWORD 0x437F0000                ; 255.0f
 txtSrvArr QWORD 0                          ; single-element SRV array (t0 = font)
 txtCBArr  QWORD 0                          ; single-element CB array (b0 = txf), trap #9
+endmodule

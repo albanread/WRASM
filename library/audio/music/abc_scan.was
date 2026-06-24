@@ -1,3 +1,4 @@
+module Player
 ; abc_scan.was — lexing helpers + key/accidental/duration/timing procs.
 ; Part of the abc.was shell (.CODE). Shares state via abc_data.inc.
 
@@ -413,3 +414,4 @@ proc AdvanceCurMs frame
     movsd   [rip + curMs], xmm1
 endproc
 
+endmodule

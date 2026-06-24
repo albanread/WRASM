@@ -1,0 +1,47 @@
+; ============================================================================
+; gc_const.was — named constants for the GamesCanvas CPU library
+; ============================================================================
+; Auto-included at the top of canvas.was, so every CPU game that includes
+; canvas.was (the first library include) gets these names with ZERO extra
+; include lines. Define-before-use: canvas.was includes this before its own
+; .DATA, and every other module (input/harness/blit/sprite/tile/introspect) is
+; included AFTER canvas, so the names are in scope everywhere.
+;
+; These are `equ` equates: the definition emits nothing, and each use folds to
+; the same literal you'd have hand-typed (verify with `was … --emit-asm`). They
+; document intent without changing a single emitted byte.
+;
+; The 8 action IDs and the logical canvas size are PUBLIC — games pass them to
+; Action()/ActionHit()/SimAction() and read them instead of bare integers. The
+; GPU backend's gpu/gc_const.was MUST keep the same values (parity).
+; ============================================================================
+
+; ---- canvas geometry (logical = physical on the CPU backend) ----------------
+CANVAS_W         equ 320                       ; framebuffer width  (pixels)
+CANVAS_H         equ 200                       ; framebuffer height (pixels)
+CANVAS_PIXELS    equ CANVAS_W * CANVAS_H       ; 64000  — fb / pbuf element count
+PBUF_BYTES       equ CANVAS_PIXELS * 4         ; 256000 — BGRX present buffer bytes
+UPSCALE          equ 3                         ; nearest-neighbour present factor
+WIN_W            equ CANVAS_W * UPSCALE        ; 960  — client area width
+WIN_H            equ CANVAS_H * UPSCALE        ; 600  — client area height
+
+; ---- palette / colour LUTs --------------------------------------------------
+PAL_SIZE         equ 256                       ; entries in the global palette
+PAL_LINE_LEN     equ 16                        ; per-line LUT entries (indices 0..15)
+PAL_GLOBAL_BASE  equ 16                        ; indices 16..255 use the global palette
+PAL_GLOBAL_COUNT equ PAL_SIZE - PAL_LINE_LEN   ; 240  — "the regular 240"
+LINE_PAL_ROWS    equ 400                       ; tallest display the per-line LUT covers
+LINE_PAL_CELLS   equ LINE_PAL_ROWS * PAL_LINE_LEN   ; 6400 — linePal element count
+BLIT_KEY         equ 255                       ; default transparent index for BlitKey
+
+; ---- input: the 8 device-independent game actions (public API) --------------
+ACT_LEFT         equ 0
+ACT_RIGHT        equ 1
+ACT_UP           equ 2
+ACT_DOWN         equ 3
+ACT_FIRE         equ 4
+ACT_PAUSE        equ 5
+ACT_RESTART      equ 6
+ACT_QUIT         equ 7
+ACT_COUNT        equ 8                         ; number of actions (table size / bound)
+KEY_COUNT        equ 256                       ; raw key-state table size (VK 0..255)

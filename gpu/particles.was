@@ -1,3 +1,4 @@
+module Gpu
 ; gpu/particles.was — a REUSABLE GPU PARTICLE SYSTEM (debris / sparks / explosions).
 ;
 ; -------------------------------------------------------------------- TEXTURED MODE
@@ -1410,3 +1411,4 @@ pbsCx0   DWORD ?                        ; (gridX-1)/2 as float
 pbsCy0   DWORD ?                        ; (gridY-1)/2 as float
 .balign 16
 ptTailPad QWORD 0                       ; tail padding (keeps the .DATA 16-aligned)
+endmodule
