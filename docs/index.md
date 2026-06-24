@@ -44,6 +44,7 @@ flowchart LR
 | [Game Audio Design](gameaudio.md) | SFX synthesis and ABC/audio design |
 | [Studio TCL scripting](studio-tcl.md) | Drive the IDE headlessly (UI tests, screenshots) with the embedded TCL interpreter |
 | [nano-TCL (design)](nano-tcl.md) | In-app register-machine REPL to script a game's global procs for dev automation + testing |
+| [nano-TCL (build plan)](nano-tcl-sprints.md) | The sprint-by-sprint build order: CLI-first, studio-last, with a Sprint-0 de-risk |
 
 ## At a glance
 
