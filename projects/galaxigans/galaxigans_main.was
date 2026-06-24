@@ -40,8 +40,10 @@ GameStep:
     sub     rsp, 40
     call    PlayerStep
     call    BulletsStep
+    call    BombsStep
     call    FormationStep
     call    CheckPlayerHit                   ; divers reaching the ship
+    call    CheckBombHit                     ; bombs reaching the ship
     call    Collide
     call    PtUpdate                         ; advance explosion debris
     call    FormatScore                      ; refresh the HUD digits from `score`

@@ -105,4 +105,46 @@ cph_next:
 cph_done:
 endproc
 
+; ---- CheckBombHit: a falling bomb (3x5) overlapping the ship (8x8) kills the player ----
+proc CheckBombHit uses rbx rdi frame
+    cmp     dword ptr [rip + pAlive], 0
+    je      cbh_done
+    mov     r8d, [rip + playerX]
+    lea     rdi, [rip + bombs]
+    mov     ebx, BOMB_MAX
+cbh_b:
+    cmp     dword ptr [rdi + 8], 0
+    je      cbh_next
+    mov     eax, [rdi + 0]                   ; bomb x (w=3): bx < px+8 && bx+3 > px
+    mov     ecx, r8d
+    add     ecx, 8
+    cmp     eax, ecx
+    jge     cbh_next
+    mov     ecx, eax
+    add     ecx, 3
+    cmp     ecx, r8d
+    jle     cbh_next
+    mov     eax, [rdi + 4]                   ; bomb y (h=5): by < PLAYER_Y+8 && by+5 > PLAYER_Y
+    cmp     eax, PLAYER_Y + 8
+    jge     cbh_next
+    mov     ecx, eax
+    add     ecx, 5
+    cmp     ecx, PLAYER_Y
+    jle     cbh_next
+    ; hit — bomb gone, player dies
+    mov     dword ptr [rdi + 8], 0
+    mov     ecx, [rip + playerX]
+    mov     edx, PLAYER_Y
+    call    BurstAt
+    mov     dword ptr [rip + pAlive], 0
+    mov     dword ptr [rip + pDeathT], RESPAWN_FRAMES
+    dec     dword ptr [rip + lives]
+    jmp     cbh_done                         ; one death per frame
+cbh_next:
+    add     rdi, BOMB_STRIDE
+    dec     ebx
+    jnz     cbh_b
+cbh_done:
+endproc
+
 endmodule

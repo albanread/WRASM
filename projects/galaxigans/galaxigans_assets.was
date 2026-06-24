@@ -36,6 +36,16 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fBullet], eax
 
+    lea     rcx, [rip + bombArt]             ; bomb 3x5
+    mov     edx, 3
+    mov     r8d, 5
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 3
+    mov     r8d, 5
+    call    SprAddFrame
+    mov     [rip + fBomb], eax
+
     call    SprUploadAtlas
     call    SetupSprPalettes
     call    SprUploadPalette
@@ -78,6 +88,10 @@ proc SetupSprPalettes
     mov     ecx, PAL_SLOT
     mov     edx, IDX_BULLET
     mov     r8d, 0x00FFF030
+    call    SprSetPalette
+    mov     ecx, PAL_SLOT
+    mov     edx, IDX_BOMB
+    mov     r8d, 0x00FF40FF
     call    SprSetPalette
 endproc
 

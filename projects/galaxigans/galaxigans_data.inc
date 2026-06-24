@@ -38,11 +38,18 @@ BULLET_DY      equ 7                         ; pixels/frame up
 FIRE_COOLDOWN  equ 8                         ; frames between shots
 RESPAWN_FRAMES equ 90                        ; death pause before the ship comes back
 
+; ---- enemy bombs (divers drop them straight down) ----
+BOMB_MAX       equ 6
+BOMB_STRIDE    equ 12                        ; { x:i32, y:i32, active:i32 }
+BOMB_DY        equ 4                         ; pixels/frame down
+BOMB_PERIOD    equ 22                        ; frames between drops (the lowest diver drops)
+
 ; ---- sprite palette slot + colour indices (one shared 16-colour bank) ----
 PAL_SLOT       equ 0
 IDX_PLAYER     equ 1                         ; -> white
 IDX_ENEMY      equ 2                         ; -> red
 IDX_BULLET     equ 3                         ; -> yellow
+IDX_BOMB       equ 4                         ; -> magenta
 
 .balign 16
 .DATA
@@ -66,15 +73,18 @@ formX      DWORD 0                           ; horizontal sway offset
 formDir    DWORD 1                           ; +1 / -1
 diveTimer  DWORD 60                           ; countdown to the next dive launch
 diveScan   DWORD 0                            ; rotating start index for picking a diver
+bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
 enemies    BYTE  1024 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (32*32)
 bullets    BYTE  48  dup(0)                   ; BULLET_MAX * BULLET_STRIDE
+bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
 
 ; sprite frame ids (set by BuildSprAssets)
 fPlayer    DWORD ?
 fEnemy     DWORD ?
 fBullet    DWORD ?
+fBomb      DWORD ?
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
@@ -101,6 +111,11 @@ bulletArt  BYTE "33"
            BYTE "33"
            BYTE "33"
            BYTE "33"
+bombArt    BYTE ".4."
+           BYTE "444"
+           BYTE "444"
+           BYTE "444"
+           BYTE ".4."
 
 ; scratch buffer for decoding a sprite frame (max 32x32 indexed pixels)
 .balign 16

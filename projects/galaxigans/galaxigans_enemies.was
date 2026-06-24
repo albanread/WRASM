@@ -21,6 +21,7 @@ proc ResetGame uses rbx rsi rdi frame
     mov     dword ptr [rip + formDir], 1
     mov     dword ptr [rip + diveTimer], DIVE_PERIOD
     mov     dword ptr [rip + diveScan], 0
+    mov     dword ptr [rip + bombTimer], BOMB_PERIOD
 
     lea     rdi, [rip + bullets]             ; all bullets inactive
     mov     ecx, BULLET_MAX
@@ -29,6 +30,14 @@ rg_bz:
     add     rdi, BULLET_STRIDE
     dec     ecx
     jnz     rg_bz
+
+    lea     rdi, [rip + bombs]               ; all bombs inactive
+    mov     ecx, BOMB_MAX
+rg_bombz:
+    mov     dword ptr [rdi + 8], 0
+    add     rdi, BOMB_STRIDE
+    dec     ecx
+    jnz     rg_bombz
 
     lea     rdi, [rip + enemies]
     xor     esi, esi                         ; row
@@ -74,9 +83,14 @@ fs_lo:
     mov     dword ptr [rip + formDir], 1
 fs_sway:
     dec     dword ptr [rip + diveTimer]      ; time to launch a dive?
-    jg      fs_walk
+    jg      fs_bombchk
     mov     dword ptr [rip + diveTimer], DIVE_PERIOD
     call    TriggerDive
+fs_bombchk:
+    dec     dword ptr [rip + bombTimer]      ; time to drop a bomb?
+    jg      fs_walk
+    mov     dword ptr [rip + bombTimer], BOMB_PERIOD
+    call    TriggerBomb
 
 fs_walk:
     lea     rdi, [rip + enemies]
@@ -169,6 +183,63 @@ td_next:
     jnz     td_loop
     mov     [rip + diveScan], esi
 td_done:
+endproc
+
+; ---- TriggerBomb: the first diving enemy drops a bomb from its belly ----
+proc TriggerBomb uses rbx rdi frame
+    lea     rdi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+tb_e:
+    cmp     dword ptr [rdi + EN_ALIVE], 0
+    je      tb_next
+    cmp     dword ptr [rdi + EN_STATE], ST_DIVE
+    jne     tb_next
+    mov     ecx, [rdi + EN_X]                ; ~centre/bottom of the 8x8 diver
+    add     ecx, 3
+    mov     edx, [rdi + EN_Y]
+    add     edx, 8
+    call    DropBomb
+    jmp     tb_done                          ; one drop per tick
+tb_next:
+    add     rdi, ENEMY_STRIDE
+    dec     ebx
+    jnz     tb_e
+tb_done:
+endproc
+
+; ---- DropBomb(ecx=x, edx=y): spawn a bomb in the first free slot ----
+proc DropBomb uses rbx rdi frame in rcx rdx
+    lea     rdi, [rip + bombs]
+    mov     ebx, BOMB_MAX
+db_find:
+    cmp     dword ptr [rdi + 8], 0
+    je      db_spawn
+    add     rdi, BOMB_STRIDE
+    dec     ebx
+    jnz     db_find
+    jmp     db_done                          ; pool full — skip
+db_spawn:
+    mov     [rdi + 0], ecx
+    mov     [rdi + 4], edx
+    mov     dword ptr [rdi + 8], 1
+db_done:
+endproc
+
+; ---- BombsStep: fall each active bomb; despawn off the bottom ----
+proc BombsStep uses rbx rdi frame
+    lea     rdi, [rip + bombs]
+    mov     ebx, BOMB_MAX
+bm_loop:
+    cmp     dword ptr [rdi + 8], 0
+    je      bm_next
+    add     dword ptr [rdi + 4], BOMB_DY
+    cmp     dword ptr [rdi + 4], FIELD_H
+    jl      bm_next
+    mov     dword ptr [rdi + 8], 0
+bm_next:
+    add     rdi, BOMB_STRIDE
+    dec     ebx
+    jnz     bm_loop
 endproc
 
 endmodule

@@ -63,6 +63,22 @@ dsc_bnext:
     add     rsi, BULLET_STRIDE
     dec     ebx
     jnz     dsc_b
+
+    lea     rsi, [rip + bombs]
+    mov     ebx, BOMB_MAX
+dsc_bo:
+    cmp     dword ptr [rsi + 8], 0
+    je      dsc_bonext
+    mov     ecx, [rip + fBomb]
+    cvtsi2ss xmm1, dword ptr [rsi + 0]
+    cvtsi2ss xmm2, dword ptr [rsi + 4]
+    mov     r8d, PAL_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+dsc_bonext:
+    add     rsi, BOMB_STRIDE
+    dec     ebx
+    jnz     dsc_bo
 endproc
 
 ; ---- BurstAt(ecx=x, edx=y): an orange explosion at a 640x360 screen point ----
