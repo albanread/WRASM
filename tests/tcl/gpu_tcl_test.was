@@ -1,0 +1,26 @@
+; gpu_tcl_test.was — ASSEMBLE-only proof that the GPU verb set resolves.
+; Defines NANOTCL_GPU so stdverbs.was selects stdverbs_gpu.was, then references
+; TclStdVerbs (which leas every GPU verb). If `was` resolves all 28 GPU procs
+; against the gpu/ backend, the GPU conditional-import path is sound. It is not
+; meant to run (no GpuInit/window) — assembly is what validates the verb wiring.
+
+NANOTCL_GPU equ 1
+
+.DATA
+.balign 16
+
+.CODE
+.globl main
+main:
+    call    TclInit
+    call    TclStdVerbs
+    invoke  ExitProcess, 0
+
+.include "../../gpu/canvas.was"
+.include "../../gpu/blit.was"
+.include "../../gpu/sprite.was"
+.include "../../gpu/input.was"
+.include "../../gpu/introspect.was"
+.include "../../gpu/text.was"
+.include "../../library/tcl/tcl.was"
+.include "../../library/tcl/stdverbs.was"
