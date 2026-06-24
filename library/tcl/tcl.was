@@ -1,5 +1,5 @@
 ; ============================================================================
-; library/nanotcl/exec.was — the nano-TCL Tier-1 executor.
+; library/tcl/tcl.was — the nano-TCL Tier-1 executor (module Tcl).
 ;
 ; A shadow register file + a clobber-free `nanoCall` trampoline + a bare-line
 ; parser that dispatches  `Verb reg=val, reg=val, …`  to the *library's own*
@@ -7,15 +7,19 @@
 ; The whole point: script the canvas live with no per-verb code — the verb table
 ; maps a name to an existing exported proc address.
 ;
-; Include AFTER the library (canvas/sprite/…) so those procs exist. The host:
-;     call NanoTclInit              ; once, builds the verb table
+; Reuse:  .include "../library/tcl/tcl.was"   (path relative to YOUR file, AFTER
+;         the canvas/sprite/… library so the verb procs exist)
+;     call TclInit                  ; once, builds the verb table
 ;     RunTcl(rcx = asciiz script)   ; run one or more `\n`-separated statements
 ;
 ; nanoCall addresses the shadow file RIP-relative (no base register) — an earlier
 ; version used rbp as the base and corrupted the frame epilogue on return.
+;
+; A single cohesive module today; splits into tcl_call/tcl_dispatch/tcl_parse
+; fragments under this shell once the live channel + `step` land.
 ; ============================================================================
 
-module Nanotcl
+module Tcl
 
 .DATA
 .balign 16
@@ -37,8 +41,8 @@ vn_DrawSprite BYTE "DrawSprite", 0
 
 .CODE
 
-; ---- NanoTclInit: build the verb table (name -> library proc) at runtime ----
-proc NanoTclInit uses rbx frame
+; ---- TclInit: build the verb table (name -> library proc) at runtime ----
+proc TclInit uses rbx frame
     lea     rbx, [rip + verbTbl]
     lea     rax, [rip + vn_Pset]
     mov     [rbx + 0], rax
@@ -195,7 +199,6 @@ po_sp:
     inc     rsi
     jmp     po_sp
 po_sp_done:
-    ; read verb name -> nameBuf
     lea     rdi, [rip + nameBuf]
 po_nm:
     movzx   eax, byte ptr [rsi]

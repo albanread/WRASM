@@ -62,7 +62,7 @@ GameInit:
     call    set_sky                    ; deep-blue gradient sky into the per-line palette
     mov     cl, 1                      ; fill fb with the sky field (index 1, resolved per line)
     call    Cls
-    call    NanoTclInit                ; build the nano-TCL verb table (name -> library proc)
+    call    TclInit                    ; build the nano-TCL verb table (name -> library proc)
     lea     rcx, [rip + nanoScript]    ; …then let TCL draw the moon + stars into fb
     call    RunTcl
     ret
@@ -146,4 +146,4 @@ endproc
 .include "../../library/input.was"
 .include "../../library/harness.was"
 .include "../../library/introspect.was"
-.include "../../library/nanotcl/exec.was"
+.include "../../library/tcl/tcl.was"
