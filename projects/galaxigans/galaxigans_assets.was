@@ -36,6 +36,26 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fEnemyFlap], eax
 
+    lea     rcx, [rip + butterflyArt]        ; Butterfly 16x16 (slot 2)
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fButterfly], eax
+
+    lea     rcx, [rip + bossArt]             ; Boss 16x16 (slot 3)
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fBoss], eax
+
     lea     rcx, [rip + bulletArt]           ; bullet 2x6
     mov     edx, 2
     mov     r8d, 6
@@ -112,6 +132,92 @@ proc SetupSprPalettes
     mov     r8d, 0x00FF40FF
     call    SprSetPalette
     call    SetupBeePalette
+    call    SetupButterflyPalette
+    call    SetupBossPalette
+endproc
+
+; ---- SetupButterflyPalette: slot 2 — magenta wings (2-5), white body (6-8), cyan eyes (9) ----
+proc SetupButterflyPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 1
+    mov     r8d, 0x00200818
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 2
+    mov     r8d, 0x006A1854
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 3
+    mov     r8d, 0x00A6308A
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 4
+    mov     r8d, 0x00D24CC0
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 5
+    mov     r8d, 0x00F27CE6
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 6
+    mov     r8d, 0x00808890
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 7
+    mov     r8d, 0x00C0C8D0
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 8
+    mov     r8d, 0x00FFFFFF
+    call    SprSetPalette
+    mov     ecx, BUT_SLOT
+    mov     edx, 9
+    mov     r8d, 0x0020E0FF
+    call    SprSetPalette
+endproc
+
+; ---- SetupBossPalette: slot 3 — green hull (2-5), purple horns (6-8), pink core (9), eyes (A) ----
+proc SetupBossPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 1
+    mov     r8d, 0x00041206
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 2
+    mov     r8d, 0x00115A18
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 3
+    mov     r8d, 0x001E8C28
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 4
+    mov     r8d, 0x0030C03C
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 5
+    mov     r8d, 0x0060E86C
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 6
+    mov     r8d, 0x00702898
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 7
+    mov     r8d, 0x00A048D0
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 8
+    mov     r8d, 0x00C880F0
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 9
+    mov     r8d, 0x00FF50FF
+    call    SprSetPalette
+    mov     ecx, BOSS_SLOT
+    mov     edx, 10
+    mov     r8d, 0x00FFFFFF
+    call    SprSetPalette
 endproc
 
 ; ---- SetupBeePalette: slot 1 — blue body ramp (2-5), amber wing ramp (6-9), red eyes (A),

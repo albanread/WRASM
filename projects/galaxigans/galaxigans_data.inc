@@ -12,7 +12,7 @@ PLAYER_Y       equ 330                       ; ship sits near the bottom
 ENEMY_COLS     equ 8
 ENEMY_ROWS     equ 4
 ENEMY_MAX      equ 32                        ; COLS*ROWS
-ENEMY_STRIDE   equ 36                        ; 9 i32 fields (see EN_* below)
+ENEMY_STRIDE   equ 40                        ; 10 i32 fields (see EN_* below)
 EN_X           equ 0                         ; live SCREEN x (sway already folded in)
 EN_Y           equ 4                         ; live SCREEN y
 EN_ALIVE       equ 8
@@ -22,6 +22,7 @@ EN_HY          equ 20                        ; home slot y
 EN_VX          equ 24                        ; peel velocity during the early dive
 EN_DT          equ 28                        ; dive step counter
 EN_ANIM        equ 32                        ; wing-flap phase counter
+EN_TYPE        equ 36                        ; TYPE_BEE / TYPE_BUTTERFLY / TYPE_BOSS
 ST_FORM        equ 0
 ST_DIVE        equ 1
 ENEMY_W        equ 16                        ; the new 16x16 shaded aliens (was 8x8)
@@ -54,6 +55,11 @@ IDX_ENEMY      equ 2                         ; -> red
 IDX_BULLET     equ 3                         ; -> yellow
 IDX_BOMB       equ 4                         ; -> magenta
 BEE_SLOT       equ 1                         ; the Bee's own 16-colour shaded palette (slot 1)
+BUT_SLOT       equ 2                         ; Butterfly palette (slot 2)
+BOSS_SLOT      equ 3                         ; Boss palette (slot 3)
+TYPE_BEE       equ 0
+TYPE_BUTTERFLY equ 1
+TYPE_BOSS      equ 2
 
 .balign 16
 .DATA
@@ -80,14 +86,16 @@ diveScan   DWORD 0                            ; rotating start index for picking
 bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
-enemies    BYTE  1152 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (32*36)
+enemies    BYTE  1280 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (32*40)
 bullets    BYTE  48  dup(0)                   ; BULLET_MAX * BULLET_STRIDE
 bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
 
 ; sprite frame ids (set by BuildSprAssets)
 fPlayer    DWORD ?
-fEnemy     DWORD ?
+fEnemy     DWORD ?                            ; Bee wings-up
 fEnemyFlap DWORD ?                            ; Bee wings-down frame
+fButterfly DWORD ?                            ; Butterfly (single frame)
+fBoss      DWORD ?                            ; Boss (single frame)
 fBullet    DWORD ?
 fBomb      DWORD ?
 
@@ -144,6 +152,42 @@ beeArt2    BYTE "................"
            BYTE ".....122221....."
            BYTE "......1221......"
            BYTE "......1221......"
+           BYTE "................"
+           BYTE "................"
+; BUTTERFLY (Goei) 16x16, slot 2: magenta wings (2-5), white body (6-8), cyan eyes (9).
+.balign 16
+butterflyArt BYTE "................"
+           BYTE "......1661......"
+           BYTE ".....169961....."
+           BYTE "...2.16661.2...."
+           BYTE "..23.16661.32..."
+           BYTE ".234.16661.432.."
+           BYTE "2345.16661.5432."
+           BYTE "2345.16661.5432."
+           BYTE ".234.16661.432.."
+           BYTE "..23.16661.32..."
+           BYTE "...2.16661.2...."
+           BYTE "......1661......"
+           BYTE "......1661......"
+           BYTE "................"
+           BYTE "................"
+           BYTE "................"
+; BOSS (flagship) 16x16, slot 3: green hull (2-5), purple horns (6-8), pink core (9), eyes (A).
+.balign 16
+bossArt    BYTE "................"
+           BYTE ".7............7."
+           BYTE ".78..........87."
+           BYTE ".78.23444432.87."
+           BYTE "78..23455432..87"
+           BYTE "8...23499432...8"
+           BYTE "....234A9A432..."
+           BYTE "....23499432...."
+           BYTE "....23444432...."
+           BYTE "....23444432...."
+           BYTE ".....234432....."
+           BYTE ".....2.22.2....."
+           BYTE "................"
+           BYTE "................"
            BYTE "................"
            BYTE "................"
 bulletArt  BYTE "33"

@@ -64,6 +64,18 @@ rg_col:
     imul    ecx, ecx, 5
     add     eax, ecx
     mov     [rdi + EN_ANIM], eax
+    ; type by row: row 0 = Boss, last row = Bee, middle = Butterfly
+    mov     eax, TYPE_BUTTERFLY
+    test    esi, esi
+    jnz     rg_t1
+    mov     eax, TYPE_BOSS
+    jmp     rg_tset
+rg_t1:
+    cmp     esi, ENEMY_ROWS - 1
+    jne     rg_tset
+    mov     eax, TYPE_BEE
+rg_tset:
+    mov     [rdi + EN_TYPE], eax
     add     rdi, ENEMY_STRIDE
     inc     ebx
     cmp     ebx, ENEMY_COLS

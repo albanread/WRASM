@@ -37,16 +37,30 @@ dsc_fleet:
 dsc_e:
     cmp     dword ptr [rsi + EN_ALIVE], 0
     je      dsc_enext
-    mov     ecx, [rip + fEnemy]              ; wings-up by default
-    mov     eax, [rsi + EN_ANIM]             ; flap: toggle frame every 16 ticks
-    shr     eax, 4
-    test    eax, 1
-    jz      dsc_efr
-    mov     ecx, [rip + fEnemyFlap]          ; wings-down
-dsc_efr:
+    mov     eax, [rsi + EN_TYPE]             ; pick frame + palette slot by type
+    cmp     eax, TYPE_BEE
+    jne     dsc_e_nb
+    mov     ecx, [rip + fEnemy]              ; Bee: flap fEnemy/fEnemyFlap every 16 ticks
+    mov     edx, [rsi + EN_ANIM]
+    shr     edx, 4
+    test    edx, 1
+    jz      dsc_e_beeslot
+    mov     ecx, [rip + fEnemyFlap]
+dsc_e_beeslot:
+    mov     r8d, BEE_SLOT
+    jmp     dsc_e_draw
+dsc_e_nb:
+    cmp     eax, TYPE_BUTTERFLY
+    jne     dsc_e_boss
+    mov     ecx, [rip + fButterfly]
+    mov     r8d, BUT_SLOT
+    jmp     dsc_e_draw
+dsc_e_boss:
+    mov     ecx, [rip + fBoss]
+    mov     r8d, BOSS_SLOT
+dsc_e_draw:
     cvtsi2ss xmm1, dword ptr [rsi + EN_X]    ; live screen pos (sway/dive already folded in)
     cvtsi2ss xmm2, dword ptr [rsi + EN_Y]
-    mov     r8d, BEE_SLOT
     movss   xmm3, [rip + fOne]
     call    SprPush
 dsc_enext:
