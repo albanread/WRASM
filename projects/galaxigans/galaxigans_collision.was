@@ -19,8 +19,7 @@ col_b:
 col_e:
     cmp     dword ptr [rdi + 8], 0
     je      col_enext
-    mov     eax, [rdi + 0]                   ; enemy screen x = x + formX (8x8)
-    add     eax, [rip + formX]
+    mov     eax, [rdi + EN_X]                ; enemy live screen x (sway/dive already folded in)
     ; reject if no overlap on x: bx >= ex+8  ||  bx+2 <= ex  (bullet w=2)
     mov     ecx, eax
     add     ecx, 8

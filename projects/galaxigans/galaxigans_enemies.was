@@ -1,16 +1,23 @@
-; galaxigans_enemies.was — the formation (.CODE). v1: lay out the grid + sway it.
-; The dive/return AI (the heart of Galaga) lands next — a per-step path LUT.
+; galaxigans_enemies.was — the formation + the dive/return AI (.CODE). The heart of
+; Galaga: enemies sit in a swaying grid, then peel off one at a time, swoop down homing
+; on the player, and rejoin their slot when they exit the bottom.
+;
+; Each enemy's EN_X/EN_Y is its LIVE SCREEN position — for a formation enemy we fold the
+; sway into it every frame, for a diver the dive updates it. So collision + draw just read
+; EN_X/EN_Y; nobody else needs to know about formX or dive state.
 
 module Galaxigans
 .CODE
 
-; ---- ResetGame: reset player/score + lay out the 8x4 formation, all alive ----
+; ---- ResetGame: reset player/score + lay out the 8x4 formation (home + live), all alive ----
 proc ResetGame uses rbx rsi rdi frame
     mov     dword ptr [rip + playerX], 312
     mov     dword ptr [rip + fireCool], 0
     mov     dword ptr [rip + score], 0
     mov     dword ptr [rip + formX], 0
     mov     dword ptr [rip + formDir], 1
+    mov     dword ptr [rip + diveTimer], DIVE_PERIOD
+    mov     dword ptr [rip + diveScan], 0
 
     lea     rdi, [rip + bullets]             ; all bullets inactive
     mov     ecx, BULLET_MAX
@@ -25,15 +32,20 @@ rg_bz:
 rg_row:
     xor     ebx, ebx                         ; col
 rg_col:
-    mov     eax, ebx                         ; x = GRID_X0 + col*COL_GAP
+    mov     eax, ebx                         ; homeX = GRID_X0 + col*COL_GAP
     imul    eax, eax, COL_GAP
     add     eax, GRID_X0
-    mov     [rdi + 0], eax
-    mov     eax, esi                         ; y = GRID_Y0 + row*ROW_GAP
+    mov     [rdi + EN_HX], eax
+    mov     [rdi + EN_X], eax                ; live x = home (formX is 0 at reset)
+    mov     eax, esi                         ; homeY = GRID_Y0 + row*ROW_GAP
     imul    eax, eax, ROW_GAP
     add     eax, GRID_Y0
-    mov     [rdi + 4], eax
-    mov     dword ptr [rdi + 8], 1           ; alive
+    mov     [rdi + EN_HY], eax
+    mov     [rdi + EN_Y], eax
+    mov     dword ptr [rdi + EN_ALIVE], 1
+    mov     dword ptr [rdi + EN_STATE], ST_FORM
+    mov     dword ptr [rdi + EN_VX], 0
+    mov     dword ptr [rdi + EN_DT], 0
     add     rdi, ENEMY_STRIDE
     inc     ebx
     cmp     ebx, ENEMY_COLS
@@ -43,21 +55,117 @@ rg_col:
     jl      rg_row
 endproc
 
-; ---- FormationStep: sway formX in [-16,+16], flip at the edges. DrawScene adds
-;      formX to each enemy's x, so the whole grid slides together. ----
-proc FormationStep
-    mov     eax, [rip + formX]
+; ---- FormationStep: sway the grid, maybe launch a diver, then advance every enemy:
+;      formation enemies track home+sway, divers run the swoop inline. ----
+proc FormationStep uses rbx rdi frame
+    mov     eax, [rip + formX]               ; sway formX in [-16,+16]
     add     eax, [rip + formDir]
     mov     [rip + formX], eax
     cmp     eax, 16
     jl      fs_lo
     mov     dword ptr [rip + formDir], -1
-    jmp     fs_end
+    jmp     fs_sway
 fs_lo:
     cmp     eax, -16
-    jg      fs_end
+    jg      fs_sway
     mov     dword ptr [rip + formDir], 1
-fs_end:
+fs_sway:
+    dec     dword ptr [rip + diveTimer]      ; time to launch a dive?
+    jg      fs_walk
+    mov     dword ptr [rip + diveTimer], DIVE_PERIOD
+    call    TriggerDive
+
+fs_walk:
+    lea     rdi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+fs_e:
+    cmp     dword ptr [rdi + EN_ALIVE], 0
+    je      fs_enext
+    cmp     dword ptr [rdi + EN_STATE], ST_DIVE
+    je      fs_dive
+    ; --- formation: live pos = home + sway ---
+    mov     eax, [rdi + EN_HX]
+    add     eax, [rip + formX]
+    mov     [rdi + EN_X], eax
+    mov     eax, [rdi + EN_HY]
+    mov     [rdi + EN_Y], eax
+    jmp     fs_enext
+fs_dive:
+    ; --- diver: vy = 2 + dt/4 (cap 8) downward; vx peels out, then homes on player ---
+    inc     dword ptr [rdi + EN_DT]
+    mov     ecx, [rdi + EN_DT]
+    shr     ecx, 2
+    add     ecx, 2
+    cmp     ecx, 8
+    jle     fs_vy
+    mov     ecx, 8
+fs_vy:
+    add     [rdi + EN_Y], ecx                ; y += vy
+    mov     eax, [rdi + EN_DT]
+    cmp     eax, DIVE_PEEL
+    jl      fs_peel
+    mov     ecx, [rip + playerX]             ; home toward the player's x
+    cmp     [rdi + EN_X], ecx
+    jge     fs_homeL
+    add     dword ptr [rdi + EN_X], DIVE_VX
+    jmp     fs_offcheck
+fs_homeL:
+    sub     dword ptr [rdi + EN_X], DIVE_VX
+    jmp     fs_offcheck
+fs_peel:
+    mov     ecx, [rdi + EN_VX]               ; early outward peel
+    add     [rdi + EN_X], ecx
+fs_offcheck:
+    cmp     dword ptr [rdi + EN_Y], FIELD_H + 8   ; exited the bottom -> rejoin slot
+    jl      fs_enext
+    mov     dword ptr [rdi + EN_STATE], ST_FORM
+    mov     dword ptr [rdi + EN_DT], 0
+    mov     eax, [rdi + EN_HX]
+    add     eax, [rip + formX]
+    mov     [rdi + EN_X], eax
+    mov     eax, [rdi + EN_HY]
+    mov     [rdi + EN_Y], eax
+fs_enext:
+    add     rdi, ENEMY_STRIDE
+    dec     ebx
+    jnz     fs_e
+endproc
+
+; ---- TriggerDive: from a rotating start index, find the next alive formation enemy and
+;      launch it. Peel direction is outward from centre so divers fan out. ----
+proc TriggerDive uses rbx rsi rdi frame
+    mov     esi, [rip + diveScan]
+    mov     ebx, ENEMY_MAX                   ; bounded scan
+td_loop:
+    mov     eax, esi
+    and     eax, 31                          ; wrap to 0..ENEMY_MAX-1
+    imul    ecx, eax, ENEMY_STRIDE
+    lea     rdi, [rip + enemies]
+    add     rdi, rcx
+    cmp     dword ptr [rdi + EN_ALIVE], 0
+    je      td_next
+    cmp     dword ptr [rdi + EN_STATE], ST_FORM
+    jne     td_next
+    ; launch this one
+    mov     dword ptr [rdi + EN_STATE], ST_DIVE
+    mov     dword ptr [rdi + EN_DT], 0
+    mov     eax, [rdi + EN_HX]               ; peel left on the left half, else right
+    cmp     eax, 320
+    jl      td_peelL
+    mov     dword ptr [rdi + EN_VX], DIVE_VX
+    jmp     td_set
+td_peelL:
+    mov     dword ptr [rdi + EN_VX], -DIVE_VX
+td_set:
+    inc     esi
+    mov     [rip + diveScan], esi
+    jmp     td_done
+td_next:
+    inc     esi
+    dec     ebx
+    jnz     td_loop
+    mov     [rip + diveScan], esi
+td_done:
 endproc
 
 endmodule

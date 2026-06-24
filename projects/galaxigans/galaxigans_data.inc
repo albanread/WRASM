@@ -12,7 +12,20 @@ PLAYER_Y       equ 330                       ; ship sits near the bottom
 ENEMY_COLS     equ 8
 ENEMY_ROWS     equ 4
 ENEMY_MAX      equ 32                        ; COLS*ROWS
-ENEMY_STRIDE   equ 16                        ; { x:i32, y:i32, alive:i32, pad }
+ENEMY_STRIDE   equ 32                        ; 8 i32 fields (see EN_* below)
+EN_X           equ 0                         ; live SCREEN x (sway already folded in)
+EN_Y           equ 4                         ; live SCREEN y
+EN_ALIVE       equ 8
+EN_STATE       equ 12                        ; ST_FORM / ST_DIVE
+EN_HX          equ 16                        ; home slot x (pre-sway)
+EN_HY          equ 20                        ; home slot y
+EN_VX          equ 24                        ; peel velocity during the early dive
+EN_DT          equ 28                        ; dive step counter
+ST_FORM        equ 0
+ST_DIVE        equ 1
+DIVE_PERIOD    equ 60                        ; frames between dive launches
+DIVE_VX        equ 3                         ; homing x-speed once a diver commits
+DIVE_PEEL      equ 12                        ; steps of outward peel before homing
 COL_GAP        equ 56
 ROW_GAP        equ 34
 GRID_X0        equ 96                        ; top-left of the formation
@@ -43,12 +56,14 @@ fireCool   DWORD 0                           ; frames until next shot allowed
 score      DWORD 0
 scoreStr   BYTE  "SCORE 000000", 0
 
-; formation sway
+; formation sway + dive scheduling
 formX      DWORD 0                           ; horizontal sway offset
 formDir    DWORD 1                           ; +1 / -1
+diveTimer  DWORD 60                           ; countdown to the next dive launch
+diveScan   DWORD 0                            ; rotating start index for picking a diver
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
-enemies    BYTE  512 dup(0)                   ; ENEMY_MAX * ENEMY_STRIDE
+enemies    BYTE  1024 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (32*32)
 bullets    BYTE  48  dup(0)                   ; BULLET_MAX * BULLET_STRIDE
 
 ; sprite frame ids (set by BuildSprAssets)

@@ -29,13 +29,11 @@ proc DrawScene uses rbx rsi frame
     lea     rsi, [rip + enemies]
     mov     ebx, ENEMY_MAX
 dsc_e:
-    cmp     dword ptr [rsi + 8], 0
+    cmp     dword ptr [rsi + EN_ALIVE], 0
     je      dsc_enext
     mov     ecx, [rip + fEnemy]
-    mov     eax, [rsi + 0]
-    add     eax, [rip + formX]
-    cvtsi2ss xmm1, eax
-    cvtsi2ss xmm2, dword ptr [rsi + 4]
+    cvtsi2ss xmm1, dword ptr [rsi + EN_X]    ; live screen pos (sway/dive already folded in)
+    cvtsi2ss xmm2, dword ptr [rsi + EN_Y]
     mov     r8d, PAL_SLOT
     movss   xmm3, [rip + fOne]
     call    SprPush

@@ -17,8 +17,8 @@ IFDEF FXTEST
     mov     ecx, ACT_FIRE                    ; simulate a held shot so the filmstrip shows a bullet
     mov     edx, 1
     call    SimAction
-    mov     ecx, 120                         ; headless gate: film 120 frames (sample some), then quit
-    mov     edx, 20
+    mov     ecx, 150                         ; headless gate: film 150 frames (catch the first dive ~f60)
+    mov     edx, 25
     call    GameSelfTest
     invoke  ExitProcess, 0
 ENDIF
