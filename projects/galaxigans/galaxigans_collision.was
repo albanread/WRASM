@@ -63,7 +63,8 @@ endproc
 proc CheckPlayerHit uses rbx rdi frame
     cmp     dword ptr [rip + pAlive], 0
     je      cph_done
-    mov     r8d, [rip + playerX]             ; player x (kept across the loop; BurstAt exits after a hit)
+    mov     r8d, [rip + playerX]
+    add     r8d, 8                            ; centre the 8px hitbox on the 24-wide ship             ; player x (kept across the loop; BurstAt exits after a hit)
     lea     rdi, [rip + enemies]
     mov     ebx, ENEMY_MAX
 cph_e:
@@ -112,6 +113,7 @@ proc CheckBombHit uses rbx rdi frame
     cmp     dword ptr [rip + pAlive], 0
     je      cbh_done
     mov     r8d, [rip + playerX]
+    add     r8d, 8                            ; centre the 8px hitbox on the 24-wide ship
     lea     rdi, [rip + bombs]
     mov     ebx, BOMB_MAX
 cbh_b:

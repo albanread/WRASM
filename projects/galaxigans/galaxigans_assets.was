@@ -6,33 +6,33 @@ module Galaxigans
 
 ; ---- BuildSprAssets: decode the 3 art bitmaps into atlas frames + the palette ----
 proc BuildSprAssets uses rbx frame
-    lea     rcx, [rip + shipArtC]            ; hero ship: level
-    mov     edx, 16
-    mov     r8d, 16
+    lea     rcx, [rip + shipArtC]            ; hero ship: level (24x24)
+    mov     edx, 24
+    mov     r8d, 24
     call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 16
-    mov     r8d, 16
+    mov     edx, 24
+    mov     r8d, 24
     call    SprAddFrame
     mov     [rip + fPlayerC], eax
 
     lea     rcx, [rip + shipArtL]            ; hero ship: left-bank
-    mov     edx, 16
-    mov     r8d, 16
+    mov     edx, 24
+    mov     r8d, 24
     call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 16
-    mov     r8d, 16
+    mov     edx, 24
+    mov     r8d, 24
     call    SprAddFrame
     mov     [rip + fPlayerL], eax
 
     lea     rcx, [rip + shipArtR]            ; hero ship: right-bank
-    mov     edx, 16
-    mov     r8d, 16
+    mov     edx, 24
+    mov     r8d, 24
     call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 16
-    mov     r8d, 16
+    mov     edx, 24
+    mov     r8d, 24
     call    SprAddFrame
     mov     [rip + fPlayerR], eax
 

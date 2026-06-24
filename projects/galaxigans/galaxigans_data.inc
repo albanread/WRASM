@@ -44,7 +44,7 @@ BUL_DX         equ 12                        ; dx field offset (horizontal drift
 BULLET_DY      equ 7                         ; pixels/frame up
 BULLET_LEAN    equ 3                         ; bullet dx when the ship is banking L/R
 FIRE_COOLDOWN  equ 8                         ; frames between shots
-PLAYER_W       equ 16                        ; the 16x16 hero ship
+PLAYER_W       equ 24                        ; the 24x24 hero ship
 SHIP_SLOT      equ 6                          ; the ship's own 16-colour palette
 RESPAWN_FRAMES equ 90                        ; death pause before the ship comes back
 
@@ -147,9 +147,9 @@ rowType    DWORD TYPE_BOSS, TYPE_BUTTERFLY, TYPE_WASP, TYPE_DRONE, TYPE_BEE
 
 ; ship palette (slot 6 indices 1..15) — steel-blue hull, cyan cockpit, orange engine glow
 .balign 16
-shipPal    DWORD 0x00101826, 0x002B5C8A, 0x00407FB5, 0x005CA8DA, 0x0091D2F2, 0x00FFFFFF
-           DWORD 0x000E3A66, 0x0033C9FF, 0x00BFF2FF, 0x00FF7A18, 0x00FFC23D, 0x00FFF38A
-           DWORD 0x00A8C4D8, 0x001C8FD6, 0x00E8F6FF
+shipPal    DWORD 0x00182840, 0x003A5070, 0x00567088, 0x007890A8, 0x00A8C0D8, 0x00FFFFFF
+           DWORD 0x00184868, 0x0030C0FF, 0x00B0F0FF, 0x00FF6010, 0x00FFA020, 0x00FFE040
+           DWORD 0x00A8C0D8, 0x0030C0FF, 0x00FFFFFF
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----

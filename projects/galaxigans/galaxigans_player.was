@@ -78,7 +78,7 @@ sb_find:
     jmp     sb_done                          ; pool full — drop the shot
 sb_spawn:
     mov     eax, [rip + playerX]
-    add     eax, 7                           ; ~centre of the 16-wide ship (the nose)
+    add     eax, 12                          ; ~centre of the 24-wide ship (the nose)
     mov     [rdi + 0], eax
     mov     dword ptr [rdi + 4], PLAYER_Y - 2
     mov     dword ptr [rdi + 8], 1
