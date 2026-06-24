@@ -15,13 +15,52 @@ proc ResetGame uses rbx rsi rdi frame
     mov     dword ptr [rip + fireCool], 0
     mov     dword ptr [rip + pAlive], 1
     mov     dword ptr [rip + pDeathT], 0
-    mov     dword ptr [rip + lives], 3
-    mov     dword ptr [rip + score], 0
     mov     dword ptr [rip + formX], 0
     mov     dword ptr [rip + formDir], 1
-    mov     dword ptr [rip + diveTimer], DIVE_PERIOD
     mov     dword ptr [rip + diveScan], 0
-    mov     dword ptr [rip + bombTimer], BOMB_PERIOD
+    ; --- per-stage difficulty ramp (clamped); score/lives carry across stages ---
+    mov     eax, [rip + stage]
+    dec     eax                              ; s = stage-1
+    mov     ecx, eax                         ; gDivePeriod = max(24, 60 - s*6)
+    imul    ecx, ecx, 6
+    mov     edx, DIVE_PERIOD
+    sub     edx, ecx
+    cmp     edx, 24
+    jge     rg_dp
+    mov     edx, 24
+rg_dp:
+    mov     [rip + gDivePeriod], edx
+    mov     [rip + diveTimer], edx
+    mov     ecx, eax                         ; gBombPeriod = max(10, 22 - s*2)
+    add     ecx, ecx
+    mov     edx, BOMB_PERIOD
+    sub     edx, ecx
+    cmp     edx, 10
+    jge     rg_bp
+    mov     edx, 10
+rg_bp:
+    mov     [rip + gBombPeriod], edx
+    mov     [rip + bombTimer], edx
+    mov     edx, DIVE_VX                     ; gDiveVX = min(6, 3 + s)
+    add     edx, eax
+    cmp     edx, 6
+    jle     rg_vx
+    mov     edx, 6
+rg_vx:
+    mov     [rip + gDiveVX], edx
+    mov     ecx, eax                         ; gSaucerGap = max(14, 28 - s*2)
+    add     ecx, ecx
+    mov     edx, SAUCER_BOMB_GAP
+    sub     edx, ecx
+    cmp     edx, 14
+    jge     rg_sg
+    mov     edx, 14
+rg_sg:
+    mov     [rip + gSaucerGap], edx
+    xor     edx, edx                         ; gStageOff = (stage-1) mod 5
+    mov     ecx, 5
+    div     ecx
+    mov     [rip + gStageOff], edx
 
     lea     rdi, [rip + bullets]             ; all bullets inactive
     mov     ecx, BULLET_MAX
@@ -64,8 +103,14 @@ rg_col:
     imul    ecx, ecx, 5
     add     eax, ecx
     mov     [rdi + EN_ANIM], eax
-    lea     rdx, [rip + rowType]              ; one species per row: rowType[row]
-    mov     eax, [rdx + rsi*4]
+    mov     eax, esi                          ; species rotates per stage: rowType[(row+off) mod 5]
+    add     eax, [rip + gStageOff]
+    cmp     eax, 5
+    jl      rg_rt
+    sub     eax, 5
+rg_rt:
+    lea     rdx, [rip + rowType]
+    mov     eax, [rdx + rax*4]
     mov     [rdi + EN_TYPE], eax
     add     rdi, ENEMY_STRIDE
     inc     ebx
@@ -74,6 +119,15 @@ rg_col:
     inc     esi
     cmp     esi, ENEMY_ROWS
     jl      rg_row
+endproc
+
+; ---- NewGame: a brand-new game — stage 1, score 0, 3 lives — then build the formation.
+;      (Clearing a stage bumps `stage` and calls ResetGame directly, keeping score/lives.) ----
+proc NewGame frame
+    mov     dword ptr [rip + stage], 1
+    mov     dword ptr [rip + score], 0
+    mov     dword ptr [rip + lives], 3
+    call    ResetGame
 endproc
 
 ; ---- FormationStep: sway the grid, maybe launch a diver, then advance every enemy:
@@ -93,12 +147,14 @@ fs_lo:
 fs_sway:
     dec     dword ptr [rip + diveTimer]      ; time to launch a dive?
     jg      fs_bombchk
-    mov     dword ptr [rip + diveTimer], DIVE_PERIOD
+    mov     eax, [rip + gDivePeriod]
+    mov     [rip + diveTimer], eax
     call    TriggerDive
 fs_bombchk:
     dec     dword ptr [rip + bombTimer]      ; time to drop a bomb?
     jg      fs_walk
-    mov     dword ptr [rip + bombTimer], BOMB_PERIOD
+    mov     eax, [rip + gBombPeriod]
+    mov     [rip + bombTimer], eax
     call    TriggerBomb
 
 fs_walk:
@@ -151,11 +207,13 @@ fs_vy:
     mov     ecx, [rip + playerX]             ; home toward the player's x
     cmp     [rdi + EN_X], ecx
     jge     fs_homeL
-    add     dword ptr [rdi + EN_X], DIVE_VX
+    mov     ecx, [rip + gDiveVX]
+    add     [rdi + EN_X], ecx
     mov     dword ptr [rdi + EN_BANK], 1     ; banking right toward the player
     jmp     fs_offcheck
 fs_homeL:
-    sub     dword ptr [rdi + EN_X], DIVE_VX
+    mov     ecx, [rip + gDiveVX]
+    sub     [rdi + EN_X], ecx
     mov     dword ptr [rdi + EN_BANK], -1    ; banking left
     jmp     fs_offcheck
 fs_peel:
@@ -203,10 +261,13 @@ td_loop:
     mov     eax, [rdi + EN_HX]               ; peel left on the left half, else right
     cmp     eax, 320
     jl      td_peelL
-    mov     dword ptr [rdi + EN_VX], DIVE_VX
+    mov     eax, [rip + gDiveVX]
+    mov     [rdi + EN_VX], eax
     jmp     td_set
 td_peelL:
-    mov     dword ptr [rdi + EN_VX], -DIVE_VX
+    mov     eax, [rip + gDiveVX]
+    neg     eax
+    mov     [rdi + EN_VX], eax
 td_set:
     inc     esi
     mov     [rip + diveScan], esi

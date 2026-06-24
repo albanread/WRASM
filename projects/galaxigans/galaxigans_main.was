@@ -32,7 +32,7 @@ GameInit:
     call    StarInit                         ; compile the layer-0 starfield shader
     call    BuildSprAssets
     call    AudioBoot                        ; mixer + SFX bake + title music
-    call    ResetGame
+    call    NewGame
     mov     dword ptr [rip + gameState], STATE_INTRO   ; boot to the title screen
     add     rsp, 40
     ret
@@ -109,7 +109,7 @@ gs_intro:
     call    ActionHit
     test    eax, eax
     jz      gs_intro_hud
-    call    ResetGame
+    call    NewGame                          ; fresh game from the title (stage 1, score 0)
     mov     dword ptr [rip + gameState], STATE_PLAYING
     call    MusicGameplay
 gs_intro_hud:

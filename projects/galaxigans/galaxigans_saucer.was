@@ -12,7 +12,8 @@ proc SaucerStep uses rbx frame
     jg      ss_done
     mov     dword ptr [rip + saucerActive], 1
     mov     dword ptr [rip + saucerSpawn], SAUCER_PERIOD
-    mov     dword ptr [rip + saucerBombT], SAUCER_BOMB_GAP
+    mov     eax, [rip + gSaucerGap]
+    mov     [rip + saucerBombT], eax
     mov     dword ptr [rip + saucerAnim], 0
     mov     eax, [rip + saucerDir]            ; flip side each spawn
     neg     eax
@@ -41,7 +42,8 @@ ss_bombs:
     jg      ss_exitchk
     dec     dword ptr [rip + saucerBombT]
     jg      ss_exitchk
-    mov     dword ptr [rip + saucerBombT], SAUCER_BOMB_GAP
+    mov     ecx, [rip + gSaucerGap]
+    mov     [rip + saucerBombT], ecx
     mov     ecx, eax
     add     ecx, 16                            ; drop from the belly centre
     mov     edx, SAUCER_Y + 12

@@ -133,6 +133,13 @@ diveTimer  DWORD 60                           ; countdown to the next dive launc
 diveScan   DWORD 0                            ; rotating start index for picking a diver
 bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
+; per-stage difficulty (set by ResetGame from `stage`) — speed + bombs ramp each level
+gDivePeriod  DWORD 60                          ; dive cadence (smaller = more dives)
+gBombPeriod  DWORD 22                          ; formation bomb cadence
+gDiveVX      DWORD 3                            ; diver homing/peel speed
+gSaucerGap   DWORD 28                           ; saucer bomb cadence
+gStageOff    DWORD 0                            ; (stage-1) mod 5 — rotates the per-row species
+
 ; bonus saucer state
 saucerActive DWORD 0
 saucerX      DWORD 0
