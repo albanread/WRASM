@@ -42,6 +42,8 @@ GameStep:
     call    BulletsStep
     call    FormationStep
     call    Collide
+    call    PtUpdate                         ; advance explosion debris
+    call    FormatScore                      ; refresh the HUD digits from `score`
     call    DrawBackground
     mov     ecx, 0x00FFFFFF                  ; HUD: white score, top-left — GPU text layer,
     call    TxtSetColour                     ;   640x360 px (same space as the sprites)
@@ -61,6 +63,8 @@ GameSprites:
     pContext.RSSetViewports(1, vp)
     mov     rcx, [rip + pRTV]
     call    DrawSprites                      ; one DrawInstanced over the back buffer
+    mov     rcx, [rip + pRTV]
+    call    PtDraw                           ; additive explosion debris on top
     add     rsp, 40
     ret
 

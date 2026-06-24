@@ -40,7 +40,10 @@ col_e:
     cmp     ecx, eax
     jle     col_enext
     ; hit
-    mov     dword ptr [rdi + 8], 0           ; enemy dead
+    mov     ecx, [rdi + EN_X]                ; explosion at the enemy (callee-saved rsi/rdi survive)
+    mov     edx, [rdi + EN_Y]
+    call    BurstAt
+    mov     dword ptr [rdi + EN_ALIVE], 0    ; enemy dead
     mov     dword ptr [rsi + 8], 0           ; bullet spent
     add     dword ptr [rip + score], 10
     jmp     col_bnext                        ; one kill per bullet

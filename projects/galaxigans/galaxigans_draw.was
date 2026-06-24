@@ -6,6 +6,10 @@ module Galaxigans
 .balign 16
 .DATA
 fOne       real4 1.0                          ; SprPush alpha
+fBurstSpd  real4 4.0                          ; explosion particle speed
+fBurstR    real4 1.0                          ; explosion colour (orange)
+fBurstG    real4 0.55
+fBurstB    real4 0.15
 .balign 16
 .CODE
 
@@ -57,6 +61,34 @@ dsc_bnext:
     add     rsi, BULLET_STRIDE
     dec     ebx
     jnz     dsc_b
+endproc
+
+; ---- BurstAt(ecx=x, edx=y): an orange explosion at a 640x360 screen point ----
+proc BurstAt uses rbx frame in rcx rdx
+    cvtsi2ss xmm0, ecx
+    cvtsi2ss xmm1, edx
+    mov     ecx, 16                           ; particle count
+    movss   xmm3, [rip + fBurstSpd]
+    movss   xmm4, [rip + fBurstR]
+    movss   xmm5, [rip + fBurstG]
+    movss   xmm6, [rip + fBurstB]
+    call    PtBurst
+endproc
+
+; ---- FormatScore: render `score` as 6 zero-padded decimals into scoreStr+6 ----
+proc FormatScore uses rbx rsi frame
+    mov     eax, [rip + score]
+    lea     rsi, [rip + scoreStr + 11]        ; least-significant digit
+    mov     ebx, 6
+fmt_lp:
+    xor     edx, edx
+    mov     ecx, 10
+    div     ecx                               ; eax/=10, edx=digit
+    add     dl, '0'
+    mov     [rsi], dl
+    dec     rsi
+    dec     ebx
+    jnz     fmt_lp
 endproc
 
 endmodule
