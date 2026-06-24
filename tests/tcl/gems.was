@@ -20,7 +20,11 @@ orbitX  DWORD 14336                ; 56 << 8  (fixed-point orbit offset, starts 
 orbitY  DWORD 0
 gemX    DWORD 40, 110, 180, 250, 90, 220
 gemY    DWORD 60, 60, 60, 60, 130, 130
-vnStar  BYTE  "Star", 0                              ; the app's OWN verb name
+vnStar  BYTE  "Star", 0                              ; the app's OWN verbs
+vnStep  BYTE  "step", 0
+vnPause BYTE  "pause", 0
+vnRun   BYTE  "run", 0
+running DWORD 1                                       ; 1 = auto-advance; pause/step/run toggle it
 ; a baked nano-TCL script: every line dispatches to a real proc — Disc/Circle/Pset
 ; from the library, and Star which THIS app registered via TclAddVerb
 nanoScript:
@@ -42,9 +46,7 @@ main:
     lea     r8,  [rip + GameStep]
     lea     r9,  [rip + GameSprites]
     call    GameStart                  ; window + init (the library owns the rest)
-    mov     ecx, 48                    ; headless self-test: film 48 frames…
-    mov     edx, 8                     ; …snapshot every 8 -> 6 BMPs (gems spin, ship orbits)
-    call    GameSelfTest
+    call    GameLoop                   ; run live — the nano-TCL channel drives it
     invoke  ExitProcess, 0
 
 ; ---- init: gem sprite (3 spin frames) + ship sprite, the sky, the nano-TCL scene ----
@@ -67,15 +69,34 @@ GameInit:
     mov     cl, 1                      ; fill fb with the sky field (index 1, resolved per line)
     call    Cls
     call    TclInit                    ; the library's standard verbs (Pset, Disc, …)
-    lea     rcx, [rip + vnStar]        ; the app hooks in its OWN verb: Star
+    lea     rcx, [rip + vnStar]        ; the app hooks in its OWN verbs
     lea     rdx, [rip + Star]
     call    TclAddVerb
-    lea     rcx, [rip + nanoScript]    ; …then let TCL draw the scene (incl. our Star)
+    lea     rcx, [rip + vnStep]
+    lea     rdx, [rip + StepVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnPause]
+    lea     rdx, [rip + PauseVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnRun]
+    lea     rdx, [rip + RunVerb]
+    call    TclAddVerb
+    call    TclChannelInit             ; open \\.\pipe\nanotcl + the reader thread
+    lea     rcx, [rip + nanoScript]    ; …then let TCL draw the initial scene
     call    RunTcl
     ret
 
 ; ---- step: advance the spin clock; orbit the ship (Minsky circle, 2 shifts) ----
 GameStep:
+    call    TclPoll                    ; drain a live command (may pause/step/run/draw)
+    cmp     dword ptr [rip + running], 0
+    je      gs_step_done               ; paused -> hold this frame's logic
+    call    advance_one
+gs_step_done:
+    ret
+
+; ---- one frame of game logic: spin clock + Minsky-circle ship orbit ----
+proc advance_one
     inc     dword ptr [rip + tick]
     mov     eax, [rip + orbitY]
     sar     eax, 5
@@ -83,7 +104,18 @@ GameStep:
     mov     eax, [rip + orbitX]
     sar     eax, 5
     add     [rip + orbitY], eax        ; orbitY += orbitX >> 5
-    ret
+endproc
+
+; ---- app control verbs (registered via TclAddVerb): pause / run / step ----
+proc PauseVerb
+    mov     dword ptr [rip + running], 0
+endproc
+proc RunVerb
+    mov     dword ptr [rip + running], 1
+endproc
+proc StepVerb frame
+    call    advance_one                ; advance exactly one frame of logic, even when paused
+endproc
 
 ; ---- sprites: the 6 spinning gems, then the orbiting ship ----
 GameSprites:

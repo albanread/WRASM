@@ -37,6 +37,7 @@ vn_Line       BYTE "Line", 0
 vn_FillRect   BYTE "FillRect", 0
 vn_Text       BYTE "Text", 0
 vn_DrawSprite BYTE "DrawSprite", 0
+vn_Snapshot   BYTE "Snapshot", 0
 .balign 16
 
 .CODE
@@ -85,6 +86,9 @@ proc TclInit frame
     call    TclAddVerb
     lea     rcx, [rip + vn_DrawSprite]
     lea     rdx, [rip + DrawSprite]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_Snapshot]
+    lea     rdx, [rip + Snapshot]
     call    TclAddVerb
 endproc
 
@@ -325,6 +329,68 @@ rt_adv:
     inc     rsi
     jmp     rt_loop
 rt_done:
+endproc
+
+; ============================================================================
+; Live channel — a named pipe drained by TclPoll from the game's GameStep, so an
+; external client can send TCL into the running app without touching harness.was.
+; A reader thread does the blocking pipe I/O and hands one command at a time to
+; the frame thread via a flag: the reader writes cmdBuf then sets cmdReady=1; the
+; game runs cmdBuf then clears cmdReady. (SPSC; x86 store/load ordering keeps the
+; handshake honest.) Dev-only — a real build should gate this behind a flag.
+; ============================================================================
+.DATA
+.balign 16
+; \\.\pipe\nanotcl — explicit bytes (was escapes backslashes inside "string" literals)
+pipeName    BYTE 92, 92, 46, 92, 112, 105, 112, 101, 92, 110, 97, 110, 111, 116, 99, 108, 0
+hPipe       QWORD 0
+gTid        QWORD 0
+cmdReady    DWORD 0
+nRead       DWORD 0
+cmdBuf      BYTE  2048 dup(0)
+.balign 16
+
+.CODE
+
+; ---- TclChannelInit: create the pipe + start the reader thread ----
+proc TclChannelInit frame
+    invoke  CreateNamedPipeA, pipeName, 3, 0, 1, 4096, 4096, 0, 0   ; DUPLEX, byte mode
+    mov     [rip + hPipe], rax
+    invoke  CreateThread, 0, 0, TclReader, 0, 0, gTid
+endproc
+
+; ---- TclReader(rcx = param): the reader thread — blocking pipe I/O ----
+proc TclReader uses rbx rsi rdi frame in rcx
+tr_accept:
+    invoke  ConnectNamedPipe, [rip + hPipe], 0     ; blocks until a client connects
+tr_read:
+    invoke  ReadFile, [rip + hPipe], cmdBuf, 2047, nRead, 0
+    test    eax, eax
+    jz      tr_disc                                ; read failed -> client gone
+    mov     ecx, [rip + nRead]
+    test    ecx, ecx
+    jz      tr_disc                                ; 0 bytes -> EOF
+    lea     r10, [rip + cmdBuf]
+    mov     byte ptr [r10 + rcx], 0                ; NUL-terminate the command
+    mov     dword ptr [rip + cmdReady], 1          ; publish to the frame thread
+tr_wait:
+    cmp     dword ptr [rip + cmdReady], 0
+    je      tr_read                                ; consumed -> read the next command
+    invoke  Sleep, 1
+    jmp     tr_wait
+tr_disc:
+    invoke  DisconnectNamedPipe, [rip + hPipe]
+    jmp     tr_accept
+endproc
+
+; ---- TclPoll: run one pending command (call from GameStep) ----
+proc TclPoll frame
+    cmp     dword ptr [rip + cmdReady], 1
+    jne     tp_done
+    lea     rcx, [rip + cmdBuf]
+    call    RunTcl
+    mov     dword ptr [rip + cmdReady], 0          ; release for the next command
+tp_done:
 endproc
 
 endmodule
