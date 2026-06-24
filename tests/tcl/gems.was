@@ -96,7 +96,7 @@ gs_step_done:
     ret
 
 ; ---- one frame of game logic: spin clock + Minsky-circle ship orbit ----
-proc advance_one
+proc advance_one frame
     inc     dword ptr [rip + tick]
     mov     eax, [rip + orbitY]
     sar     eax, 5
@@ -104,6 +104,16 @@ proc advance_one
     mov     eax, [rip + orbitX]
     sar     eax, 5
     add     [rip + orbitY], eax        ; orbitY += orbitX >> 5
+    ; expose state for the introspector's per-frame ping (rax=tick, rcx=orbitX, rdx=orbitY)
+    xor     ecx, ecx
+    mov     edx, [rip + tick]
+    call    TclReg
+    mov     ecx, 1
+    mov     edx, [rip + orbitX]
+    call    TclReg
+    mov     ecx, 2
+    mov     edx, [rip + orbitY]
+    call    TclReg
 endproc
 
 ; ---- app control verbs (registered via TclAddVerb): pause / run / step ----

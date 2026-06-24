@@ -38,6 +38,9 @@ vn_FillRect   BYTE "FillRect", 0
 vn_Text       BYTE "Text", 0
 vn_DrawSprite BYTE "DrawSprite", 0
 vn_Snapshot   BYTE "Snapshot", 0
+vn_intro      BYTE "intro", 0
+vn_free       BYTE "free", 0
+vn_cont       BYTE "cont", 0
 .balign 16
 
 .CODE
@@ -89,6 +92,15 @@ proc TclInit frame
     call    TclAddVerb
     lea     rcx, [rip + vn_Snapshot]
     lea     rdx, [rip + Snapshot]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_intro]
+    lea     rdx, [rip + IntroOn]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_free]
+    lea     rdx, [rip + IntroFree]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_cont]
+    lea     rdx, [rip + IntroCont]
     call    TclAddVerb
 endproc
 
@@ -347,7 +359,14 @@ hPipe       QWORD 0
 gTid        QWORD 0
 cmdReady    DWORD 0
 nRead       DWORD 0
+nWrote      DWORD 0
+introMode   DWORD 0          ; 0 = free (async drain); 1 = frame-sync (ping + wait for cont)
+introEvery  DWORD 1          ; sample/ping every N frames — negotiated by the script
+introTick   DWORD 0          ; frames since the last sample
+gotCont     DWORD 0          ; the `cont` verb sets this to release a held frame
 cmdBuf      BYTE  2048 dup(0)
+pingHdr     BYTE  "frame ", 0
+pingBuf     BYTE  512 dup(0)
 .balign 16
 
 .CODE
@@ -363,7 +382,9 @@ endproc
 proc TclReader uses rbx rsi rdi frame in rcx
 tr_accept:
     invoke  ConnectNamedPipe, [rip + hPipe], 0     ; blocks until a client connects
-tr_read:
+tr_loop:
+    cmp     dword ptr [rip + introMode], 1         ; frame-sync: the GAME thread owns the
+    je      tr_park                                ;   pipe (write ping + read reply) — park
     invoke  ReadFile, [rip + hPipe], cmdBuf, 2047, nRead, 0
     test    eax, eax
     jz      tr_disc                                ; read failed -> client gone
@@ -375,22 +396,136 @@ tr_read:
     mov     dword ptr [rip + cmdReady], 1          ; publish to the frame thread
 tr_wait:
     cmp     dword ptr [rip + cmdReady], 0
-    je      tr_read                                ; consumed -> read the next command
+    je      tr_loop                                ; consumed -> re-check mode, read next
     invoke  Sleep, 1
     jmp     tr_wait
+tr_park:
+    invoke  Sleep, 2                               ; idle while the game thread frame-syncs
+    cmp     dword ptr [rip + introMode], 0
+    jne     tr_park
+    jmp     tr_loop                                ; back to free-mode reading
 tr_disc:
+    mov     dword ptr [rip + introMode], 0     ; client gone -> back to free-running
+    mov     dword ptr [rip + gotCont], 1       ; release any frame held in TclFrameSync
     invoke  DisconnectNamedPipe, [rip + hPipe]
     jmp     tr_accept
 endproc
 
-; ---- TclPoll: run one pending command (call from GameStep) ----
+; ---- TclPoll: call from GameStep at the frame boundary ----
+; Free mode: drain one queued command, non-blocking. Frame-sync mode: every
+; `introEvery` frames, ping the register state and BLOCK until the introspector
+; sends `cont` (a safe-state pause — the last frame is complete, nothing half-done).
 proc TclPoll frame
+    cmp     dword ptr [rip + introMode], 0
+    jne     tp_sync
+    ; --- free mode: non-blocking drain ---
     cmp     dword ptr [rip + cmdReady], 1
     jne     tp_done
     lea     rcx, [rip + cmdBuf]
     call    RunTcl
-    mov     dword ptr [rip + cmdReady], 0          ; release for the next command
+    mov     dword ptr [rip + cmdReady], 0
+    jmp     tp_done
+tp_sync:
+    ; --- frame-sync: sample every introEvery frames ---
+    mov     eax, [rip + introTick]
+    inc     eax
+    mov     [rip + introTick], eax
+    cmp     eax, [rip + introEvery]
+    jl      tp_done                                ; not a sample frame yet
+    mov     dword ptr [rip + introTick], 0
+    call    TclFrameSync                           ; ping state + wait for cont
 tp_done:
+endproc
+
+; ---- TclReg(rcx = slot 0..15, rdx = value): expose app state into a shadow ----
+; register, so the introspector's per-frame ping shows it (rax=slot0, rcx=1, …).
+proc TclReg in rcx rdx
+    lea     r10, [rip + shadowGP]
+    mov     [r10 + rcx*8], rdx
+endproc
+
+; ---- TclFrameSync: ping the 16 shadow registers (hex), then block for cont ----
+; Called only at the frame boundary (safe state): the last frame is complete.
+proc TclFrameSync uses rbx rsi rdi r12 frame
+    lea     rdi, [rip + pingBuf]
+    lea     rsi, [rip + pingHdr]               ; "frame "
+fsh:
+    mov     al, [rsi]
+    test    al, al
+    jz      fsh_done
+    mov     [rdi], al
+    inc     rsi
+    inc     rdi
+    jmp     fsh
+fsh_done:
+    lea     rbx, [rip + shadowGP]
+    xor     r12, r12                           ; register index 0..15
+fs_reg:
+    mov     r11, [rbx + r12*8]
+    mov     ecx, 16                            ; 16 hex nibbles, high first
+fs_nib:
+    rol     r11, 4
+    mov     eax, r11d
+    and     eax, 0xF
+    cmp     al, 10
+    jb      fs_dig
+    add     al, 55                             ; 'A'..'F'
+    jmp     fs_put
+fs_dig:
+    add     al, 48                             ; '0'..'9'
+fs_put:
+    mov     [rdi], al
+    inc     rdi
+    dec     ecx
+    jnz     fs_nib
+    mov     byte ptr [rdi], 32                 ; space between registers
+    inc     rdi
+    inc     r12
+    cmp     r12, 16
+    jl      fs_reg
+    mov     byte ptr [rdi], 10                 ; newline terminates the ping
+    inc     rdi
+    lea     rax, [rip + pingBuf]
+    sub     rdi, rax                           ; rdi = byte length
+    invoke  WriteFile, [rip + hPipe], pingBuf, edi, nWrote, 0
+    ; --- block here (safe state): the GAME thread reads the reply directly (the reader
+    ;     thread is parked while introMode==1, so nothing collides on the pipe handle) ---
+fs_wait:
+    invoke  ReadFile, [rip + hPipe], cmdBuf, 2047, nRead, 0
+    test    eax, eax
+    jz      fs_drop                            ; client gone -> resume free-running
+    mov     ecx, [rip + nRead]
+    test    ecx, ecx
+    jz      fs_drop
+    lea     r10, [rip + cmdBuf]
+    mov     byte ptr [r10 + rcx], 0
+    lea     rcx, [rip + cmdBuf]
+    call    RunTcl                             ; cont / draw / set / free
+    cmp     dword ptr [rip + gotCont], 1
+    jne     fs_wait                            ; not cont yet -> read more (e.g. draw then cont)
+    mov     dword ptr [rip + gotCont], 0
+    jmp     fs_done
+fs_drop:
+    mov     dword ptr [rip + introMode], 0     ; introspector gone -> reader resumes, free-run
+fs_done:
+endproc
+
+; ---- introspection control verbs ----
+proc IntroOn in rcx                            ; `intro rcx=N` — frame-sync, sample every N
+    mov     dword ptr [rip + introMode], 1
+    mov     dword ptr [rip + introTick], 0
+    test    ecx, ecx
+    jnz     ion_set
+    mov     ecx, 1                             ; default: every frame
+ion_set:
+    mov     [rip + introEvery], ecx
+endproc
+proc IntroFree                                 ; `free` — resume free-running
+    mov     dword ptr [rip + introMode], 0
+    mov     dword ptr [rip + gotCont], 1
+endproc
+proc IntroCont                                 ; `cont` — release the held frame
+    mov     dword ptr [rip + gotCont], 1
 endproc
 
 endmodule
