@@ -30,10 +30,12 @@
 ; ---- the game (each fragment opens `module Galaxigans`; data first) ----
 .include "galaxigans_data.inc"        ; .DATA: pools, player, formation, sprite frame-ids
 .include "galaxigans_assets.was"      ; BuildSprAssets: synth sprite frames + palettes
+.include "galaxigans_starfield.was"   ; the animated layer-0 nebula+starfield shader
 .include "galaxigans_enemies.was"     ; ResetGame + formation sway + dive AI + bombs
 .include "galaxigans_player.was"      ; input -> move/fire + player bullets
 .include "galaxigans_collision.was"   ; bullet x enemy + diver/bomb x player + scoring
 .include "galaxigans_audio.was"       ; SFX bake/playback + the ABC soundtrack
 .include "galaxigans_draw.was"        ; background + queue the fleet
+.include "galaxigans_harness.was"     ; OUR window/loop/present (layer-0 sky -> board -> fleet)
 .include "galaxigans_main.was"        ; main + the GameInit/GameStep/GameSprites callbacks
 ; TODO: the bonus saucer, dive-arc tuning, a 2nd enemy tier.

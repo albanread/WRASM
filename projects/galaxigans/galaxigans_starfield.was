@@ -1,0 +1,159 @@
+; galaxigans_starfield.was — the animated LAYER-0 shader background (a clone of gpu/fx.was).
+;
+; A full-screen procedural pixel shader: a deep blue/purple nebula haze + three parallax
+; layers of stars scrolling DOWN (Galaga's sky moves toward the player). Drawn FIRST into
+; the back buffer (opaque), so it is the bottom of the layer stack — the indexed board is
+; unused by galaxigans (HUD = GPU text, fleet = sprites), so nothing composites over it.
+;
+; Reuses canvas.was/blit.was .globl symbols: vsTarget/psTarget, pErrBlob, pDevice,
+; pContext, pRast, pBlendOpaque, blendFactor. StarInit after GpuInit + BlitInit.
+; Every .DATA opens with .balign 16 (trap #8); COM register-args staged in memory cells.
+; NOTE: this file is `module Gpu` (not Galaxigans) so it can see canvas/blit privates
+; (pErrBlob, vsTarget, psTarget, pRast); the Star* entry points are .globl regardless.
+
+module Gpu
+.DATA
+.balign 16
+; ---- the starfield/nebula shader. VS = the fullscreen triangle (verbatim from fx.was);
+;      PS = nebula + 3 parallax star layers animated by tparm.x (time). ----
+starSrc:
+.ASCIISTRING
+cbuffer SCB:register(b0){float4 tparm;};
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO SVS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float4 SPS(VO v):SV_Target{
+float t=tparm.x;
+float px=v.uv.x*640.0;
+float py=v.uv.y*360.0;
+float n=sin(px*0.011+t*0.30)+sin(py*0.014-t*0.20)+sin((px+py)*0.007+t*0.15)+sin((px-py)*0.009-t*0.10);
+float neb=(n+4.0)*0.125;
+float3 col=float3(0.015+neb*0.05, 0.010+neb*0.03, 0.055+neb*0.20);
+for(int L=0;L<3;L++){
+float sp=16.0+L*30.0;
+float cell=13.0+L*6.0;
+float2 cp=float2(px, py+t*sp)/cell;
+float2 gi=floor(cp);
+float h=frac(sin(dot(gi,float2(127.1,311.7)))*43758.5453);
+if(h>0.90){
+float2 sub=frac(cp)-0.5;
+float d=dot(sub,sub);
+float tw=0.55+0.45*sin(t*3.0+h*50.0);
+float star=saturate(1.0-d*55.0)*tw;
+col+=star*(0.45+0.5*float(L));}}
+return float4(col,1.0);}
+.ENDASCIISTRING
+starEnd:
+    BYTE 0
+
+starVsEnt  BYTE "SVS", 0
+starPsEnt  BYTE "SPS", 0
+starShName  BYTE "gpustar", 0
+
+.balign 16
+comobj pStarVSBlob : ID3DBlob
+comobj pStarPSBlob : ID3DBlob
+
+pStarVS   QWORD ?
+pStarPS   QWORD ?
+pStarCB   QWORD ?
+starSrcLen QWORD ?
+starTmpPtr QWORD ?
+starTmpSize QWORD ?
+
+.balign 16
+starCB    DWORD 0, 0, 0, 0                 ; float4 { time, 0, 0, 0 }
+starTime  DWORD 0                          ; running float (starts 0.0)
+starStep  DWORD 0x3DCCCCCD                 ; 0.1f per frame
+.balign 16
+starCBArr QWORD 0
+
+starCBDesc struct D3D11_BUFFER_DESC
+    ByteWidth = 16
+    Usage     = 0
+    BindFlags = 4
+ends
+
+.balign 16
+.CODE
+
+; ---- StarInit — compile the VS/PS, create the time CB. After GpuInit + BlitInit. ----
+.globl StarInit
+StarInit:
+    push    rbx
+    sub     rsp, 40
+    lea     rax, [rip + starEnd]
+    lea     rcx, [rip + starSrc]
+    sub     rax, rcx
+    mov     [rip + starSrcLen], rax
+    invoke  D3DCompile, starSrc, [rip + starSrcLen], starShName, 0, 0, starVsEnt, vsTarget, 0, 0, pStarVSBlob, pErrBlob
+    test    eax, eax
+    js      star_fc
+    invoke  D3DCompile, starSrc, [rip + starSrcLen], starShName, 0, 0, starPsEnt, psTarget, 0, 0, pStarPSBlob, pErrBlob
+    test    eax, eax
+    js      star_fc
+    pStarVSBlob.GetBufferPointer()
+    mov     [rip + starTmpPtr], rax
+    pStarVSBlob.GetBufferSize()
+    mov     [rip + starTmpSize], rax
+    pDevice.CreateVertexShader([rip + starTmpPtr], [rip + starTmpSize], 0, pStarVS)
+    test    eax, eax
+    js      star_fd
+    pStarPSBlob.GetBufferPointer()
+    mov     [rip + starTmpPtr], rax
+    pStarPSBlob.GetBufferSize()
+    mov     [rip + starTmpSize], rax
+    pDevice.CreatePixelShader([rip + starTmpPtr], [rip + starTmpSize], 0, pStarPS)
+    test    eax, eax
+    js      star_fd
+    pDevice.CreateBuffer(starCBDesc, 0, pStarCB)
+    test    eax, eax
+    js      star_fd
+    xor     eax, eax
+    add     rsp, 40
+    pop     rbx
+    ret
+star_fc:
+    invoke  ExitProcess, 45
+star_fd:
+    invoke  ExitProcess, 43
+
+; ---- StarSetTime — advance the animation time by starStep. Call once per frame. ----
+.globl StarSetTime
+StarSetTime:
+    movss   xmm0, [rip + starTime]
+    addss   xmm0, [rip + starStep]
+    movss   [rip + starTime], xmm0
+    movss   [rip + starCB + 0], xmm0
+    ret
+
+; ---- StarRender(rcx=dstRTV) — draw the starfield full-screen into dstRTV, FIRST/opaque. ----
+.globl StarRender
+StarRender:
+    push    rbx
+    push    rsi
+    push    rdi
+    sub     rsp, 32
+    mov     rdi, rcx
+    mov     [rip + starRTVTmp], rdi
+    pContext.OMSetRenderTargets(1, starRTVTmp, 0)
+    pContext.UpdateSubresource([rip + pStarCB], 0, 0, starCB, 0, 0)
+    mov     rax, [rip + pStarCB]
+    mov     [rip + starCBArr], rax
+    pContext.PSSetConstantBuffers(0, 1, starCBArr)
+    pContext.VSSetShader([rip + pStarVS], 0, 0)
+    pContext.PSSetShader([rip + pStarPS], 0, 0)
+    pContext.RSSetState([rip + pRast])
+    pContext.OMSetBlendState(0, 0, 0xFFFFFFFF)   ; NULL = default opaque (full-screen bg)
+    pContext.IASetPrimitiveTopology(4)
+    pContext.Draw(3, 0)
+    add     rsp, 32
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+.balign 16
+.DATA
+.balign 16
+starRTVTmp QWORD ?
+endmodule

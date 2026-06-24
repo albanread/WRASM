@@ -9,29 +9,27 @@ module Galaxigans
 main:
     sub     rsp, 40                          ; shadow space + 16-align for the calls
     lea     rcx, [rip + titleW]
-    lea     rdx, [rip + GameInit]
-    lea     r8,  [rip + GameStep]
-    lea     r9,  [rip + GameSprites]
-    call    GameStart                        ; window + GpuInit/BlitInit/TxtInit + GameInit()
+    call    GxBoot                           ; OUR window + GpuInit/BlitInit/TxtInit + GameInit()
 IFDEF FXTEST
     mov     ecx, ACT_FIRE                    ; simulate a held shot so the filmstrip shows a bullet
     mov     edx, 1
     call    SimAction
     mov     ecx, 150                         ; headless gate: film 150 frames (catch the first dive ~f60)
     mov     edx, 25
-    call    GameSelfTest
+    call    GxSelfTest
     call    AudioStop
     invoke  ExitProcess, 0
 ENDIF
-    call    GameLoop                         ; interactive: fixed-step timer pump (Esc quits)
+    call    GxLoop                           ; interactive: fixed-step timer pump (Esc quits)
     call    AudioStop                        ; stop the mixer + soundtrack threads
     invoke  ExitProcess, 0
 
-; ---- GameInit (callback): harness did Gpu/Blit/Txt; bring up sprites/particles + game ----
+; ---- GameInit: GxBoot did Gpu/Blit/Txt; bring up sprites/particles/starfield + game ----
 GameInit:
     sub     rsp, 40
     call    SprInit
     call    PtInit
+    call    StarInit                         ; compile the layer-0 starfield shader
     call    BuildSprAssets
     call    AudioBoot                        ; mixer + SFX bake + looping soundtrack
     call    ResetGame
@@ -50,7 +48,6 @@ GameStep:
     call    Collide
     call    PtUpdate                         ; advance explosion debris
     call    FormatScore                      ; refresh the HUD digits from `score`
-    call    DrawBackground
     mov     ecx, 0x00FFFFFF                  ; HUD: white score, top-left — GPU text layer,
     call    TxtSetColour                     ;   640x360 px (same space as the sprites)
     mov     ecx, 8
