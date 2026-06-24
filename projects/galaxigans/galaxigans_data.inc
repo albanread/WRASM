@@ -87,6 +87,8 @@ BS_DESCEND      equ 3
 BS_CHARGE       equ 4
 BS_BEAM         equ 5
 BS_RETURN       equ 6
+BS_CAPTURE      equ 7                          ; tractoring the ship up the beam
+CAPTURE_HALFW   equ 18                         ; ship within this of the beam centre -> caught
 BOSS_STATION_Y  equ 18                        ; hovers here, top-centre
 BOSS_CAP_Y      equ 140                       ; descends to here to fire the beam
 BOSS_FIRST      equ 40                        ; frames before the first appearance
@@ -193,6 +195,8 @@ bossY      DWORD -36
 bossAnim   DWORD 0
 bossTimer  DWORD 40
 bossBeamT  DWORD 0
+captureHeld  DWORD 0                           ; a captured ship is docked above the boss
+captureShipY DWORD 0                           ; the tractored ship's y during the lift
 saucerSndT   DWORD 0                            ; countdown to re-trigger the looping wah-wah
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.

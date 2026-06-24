@@ -20,6 +20,8 @@ proc BossStep uses rbx frame
     je      bs_beam
     cmp     eax, BS_RETURN
     je      bs_return
+    cmp     eax, BS_CAPTURE
+    je      bs_capture
     ; BS_IDLE: count down to the next appearance
     dec     dword ptr [rip + bossTimer]
     jg      bs_done
@@ -41,6 +43,8 @@ bs_enterdone:
     jmp     bs_done
 bs_station:
     inc     dword ptr [rip + bossAnim]
+    cmp     dword ptr [rip + captureHeld], 0  ; already holding a prisoner -> just hover
+    jne     bs_done
     dec     dword ptr [rip + bossTimer]
     jg      bs_done
     mov     dword ptr [rip + bossState], BS_DESCEND
@@ -91,14 +95,53 @@ bs_chcap:
 bs_beam:
     inc     dword ptr [rip + bossAnim]
     inc     dword ptr [rip + bossBeamT]
-    mov     ecx, [rip + bossX]                ; full-length beam (Phase 2 will test capture here)
+    mov     ecx, [rip + bossX]
     add     ecx, 16
     mov     edx, [rip + bossY]
     add     edx, 24
     mov     r8d, 350
     call    BeamSet
+    ; --- capture: ship alive + centre within CAPTURE_HALFW of the beam centre -> tractor it ---
+    cmp     dword ptr [rip + pAlive], 0
+    je      bs_beamhold
+    mov     eax, [rip + playerX]
+    add     eax, 12                           ; ship centre
+    mov     ecx, [rip + bossX]
+    add     ecx, 16                           ; beam centre
+    sub     eax, ecx
+    cmp     eax, 0 - CAPTURE_HALFW
+    jl      bs_beamhold
+    cmp     eax, CAPTURE_HALFW
+    jg      bs_beamhold
+    mov     dword ptr [rip + bossState], BS_CAPTURE   ; CAUGHT — lose the ship, start the lift
+    mov     eax, PLAYER_Y
+    mov     [rip + captureShipY], eax
+    mov     dword ptr [rip + pAlive], 0
+    mov     dword ptr [rip + pDeathT], RESPAWN_FRAMES
+    dec     dword ptr [rip + lives]
+    jmp     bs_done
+bs_beamhold:
     cmp     dword ptr [rip + bossBeamT], BEAM_HOLD
     jl      bs_done
+    call    BeamOff
+    mov     dword ptr [rip + bossState], BS_RETURN
+    jmp     bs_done
+bs_capture:
+    inc     dword ptr [rip + bossAnim]
+    mov     ecx, [rip + bossX]                ; hold the beam while the ship rises up it
+    add     ecx, 16
+    mov     edx, [rip + bossY]
+    add     edx, 24
+    mov     r8d, 350
+    call    BeamSet
+    mov     eax, [rip + captureShipY]
+    sub     eax, 4
+    mov     [rip + captureShipY], eax
+    mov     ecx, [rip + bossY]
+    add     ecx, 22
+    cmp     eax, ecx
+    jg      bs_done                            ; still rising
+    mov     dword ptr [rip + captureHeld], 1   ; docked above the boss
     call    BeamOff
     mov     dword ptr [rip + bossState], BS_RETURN
     jmp     bs_done
@@ -146,6 +189,32 @@ db_push:
     movss   xmm3, [rip + fOne]
     call    SprPush
 db_done:
+endproc
+
+; ---- DrawPrisoner: the captured ship — rising up the beam (BS_CAPTURE) or docked above the
+;      boss (captureHeld). Uses the player ship sprite. ----
+proc DrawPrisoner uses rbx frame
+    mov     eax, [rip + bossState]
+    cmp     eax, BS_CAPTURE
+    je      dp_lift
+    cmp     dword ptr [rip + captureHeld], 0
+    je      dp_done
+    mov     ecx, [rip + bossX]                ; docked: centre the ship above the boss
+    add     ecx, 4
+    mov     edx, [rip + bossY]
+    sub     edx, 18
+    jmp     dp_draw
+dp_lift:
+    mov     ecx, [rip + playerX]              ; rising up the beam
+    mov     edx, [rip + captureShipY]
+dp_draw:
+    cvtsi2ss xmm1, ecx
+    cvtsi2ss xmm2, edx
+    mov     ecx, [rip + fPlayerC]
+    mov     r8d, SHIP_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+dp_done:
 endproc
 
 endmodule

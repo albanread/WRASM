@@ -119,10 +119,11 @@ rg_minez:
     dec     ecx
     jnz     rg_minez
 
-    mov     dword ptr [rip + bossState], BS_IDLE   ; capture boss: idle, beam off
+    mov     dword ptr [rip + bossState], BS_IDLE   ; capture boss: idle, beam off, no prisoner
     mov     dword ptr [rip + bossTimer], BOSS_FIRST
     mov     dword ptr [rip + bossX], 304
     mov     dword ptr [rip + bossY], -36
+    mov     dword ptr [rip + captureHeld], 0
     call    BeamOff
 
     lea     rdi, [rip + enemies]
