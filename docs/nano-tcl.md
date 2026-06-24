@@ -316,8 +316,9 @@ When you want `puts` text back **inline**, run a dedicated reader thread (the sa
 `sound_play.was`) — **not** the deprecated `PIPE_NOWAIT` polled in the frame:
 
 - **Reader thread:** `CreateNamedPipeA("\\.\pipe\nanotcl", PIPE_ACCESS_DUPLEX,
-  PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE, 1, 4096, 4096, 0, 0)` (**blocking, message
-  mode** so one `WriteFile` = one frame, §14), then a loop of `ConnectNamedPipe` (blocks
+  PIPE_TYPE_BYTE | PIPE_READMODE_BYTE, 1, 4096, 4096, 0, 0)` (**blocking, byte mode**;
+  frames are `[u32-LE length][payload]`, §14 — Sprint-0 proven), then a loop of
+  `ConnectNamedPipe` (blocks
   until a client) → `ReadFile` (blocks for a command) → push the command into a small
   **spinlock-guarded queue** → repeat. The blocking I/O lives on this thread, so the frame
   loop never stalls and there's no `PIPE_NOWAIT`/per-frame `ConnectNamedPipe` state machine.
@@ -368,13 +369,17 @@ half-finished frame.
 - **`txtPtr` is shared, single-cursor state.** Re-entrancy via `step` is handled by the
   `tclBusy` guard (§7); without it, a nested drain corrupts the running script — this is
   the #1 thing to get right.
-- **No SEH in the first proof.** A bad call (wrong reg, null pointer) faults the *whole
-  process* — there's no try/catch around `call [gVerbPtr]` yet. Because you poke procs with
-  *arbitrary* args, faults are **expected**, so the dev build should install a vectored
-  exception handler (`AddVectoredExceptionHandler`) that captures the `EXCEPTION_RECORD` +
-  `CONTEXT`, ships a fault dump down the channel as an **`exc` EVENT** (Part 2 §14), and
-  returns `ERR` for that call so the session survives. That turns "the probe crashed the
-  game" into "the probe reported a crash" — see Part 2 §15 (the exception channel).
+- **Faults are caught and resumed (Sprint-0 proven).** A bad call (wrong reg, null pointer)
+  would fault the *whole process*, but you poke procs with *arbitrary* args so faults are
+  **expected**. The dev build installs a vectored exception handler
+  (`AddVectoredExceptionHandler`) that captures the `EXCEPTION_RECORD` + `CONTEXT`, ships a
+  fault dump down the channel as an **`exc` EVENT** (Part 2 §14), and **resumes** by
+  overwriting `CONTEXT.Rip/Rsp/Rbp` to a recovery label (a manual longjmp) + returning
+  `EXCEPTION_CONTINUE_EXECUTION`, returning `ERR` for that call so the session survives — it
+  re-arms and survives repeated faults. Sprint 0 confirmed this in a CRT-free `was` PE with
+  **no `.pdata`/unwind tables**. *Dialect trap:* a bare absolute `mov eax,[0]` encodes
+  RIP-relative (never faults) — to deliberately fault, deref through a register
+  (`xor rax,rax; mov eax,[rax]`). See Part 2 §15 (the exception channel).
 - **Dev-only channel** — see §6 security; build-flag it out of release.
 - **No type checking on the call** (§4) — `Pset xmm0=1.4` loads `xmm0` and calls `Pset`,
   which ignores it. The interpreter trusts the author's ABI knowledge — the point, and the
@@ -552,10 +557,13 @@ EVENT   (app → tool)   * out: note count = 5            (a puts)
 | **reg lines** | only in answer to `REG <name>`/`REG *`; the app formats the requested slot(s) from the still-current shadow file. |
 | **events** | unsolicited, any time: `out:` (a `puts`), `frame` (streamed dashboard state), `exc:` (an exception dump, §15). The demux fans these to the display/log, never to a waiter. |
 
-**Framing.** One message = one `WriteFile`, read whole — so the pipe is **message mode**
-(`PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE`, §6) and one `ReadFile` returns exactly one
-frame; or length-prefix each frame. (A "blank-line terminator" over a byte stream is
-fragile — `out:` text can itself contain a blank line.)
+**Framing.** Each message is **length-prefixed** — `[u32 little-endian length][payload]` —
+over a **byte-mode** pipe, reassembled by a read-exact loop (read 4 bytes, then `ReadFile`
+until `length` bytes are in). Sprint 0 proved this stitches fragmented and over-buffer
+frames byte-exact and stays transport-agnostic (a socket works the same), unlike
+`PIPE_TYPE_MESSAGE` (pipe-specific, caps a message to the buffer). Cap the decoded length on
+the read side to bound allocation against a hostile prefix. (A "blank-line terminator" would
+be fragile — `out:` text can contain a blank line.)
 
 **The leaner reply.** A `CALL` reply is **status + `eax` only**, never a 32-register dump:
 `eax` is the one register a call almost always wants, and formatting 30 others every call
@@ -574,8 +582,10 @@ events**, and the **Rust tool formats and renders everything**.
 **The 60 fps dashboard.** Because the tool is itself a 60 fps loop, the display thread can
 render the game's live state every frame from the event stream: a **register watch** (the
 shadow file), an **output log** (`out:` events), and — if the game emits a `frame` event
-carrying its `Snapshot`/framebuffer — a **live remote viewport** of the running game beside
-the TCL prompt. studio *is* this dashboard already (it renders at display rate and owns an
+carrying the **indexed framebuffer `fb`** (64 000 bytes, 1 B/pixel) plus `palette`/`linePal`
+— a **live remote viewport** of the running game beside the TCL prompt, the tool resolving
+indices→RGB (¼ the bandwidth of the resolved BGRX `pbuf`, and reachable today: `fb`/
+`palette`/`linePal` are already `.globl`, `pbuf` is private — Sprint-0 R-snap). studio *is* this dashboard already (it renders at display rate and owns an
 output pane); the standalone CLI is the headless, frame-paced driver of the same protocol.
 None of §5's Win32 numeric/print machinery runs on this path — it all becomes one-line Rust
 formatting (int→string, double→string, hex, tables).
@@ -584,8 +594,11 @@ formatting (int→string, double→string, hex, tables).
 not exceptional. Rather than let a bad call kill the process (§8), the dev build installs a
 **vectored exception handler** (`AddVectoredExceptionHandler`): on a fault it captures the
 `EXCEPTION_RECORD` + `CONTEXT`, formats a dump (fault code, faulting address, the captured
-registers), writes it down the *same* channel as an **`exc:` EVENT**, and returns `ERR` for
-the in-flight `CALL` so the session survives. The probe then *shows* the crash — fault,
+registers), writes it down the *same* channel as an **`exc:` EVENT**, then **resumes** by
+overwriting `CONTEXT.Rip/Rsp/Rbp` to a recovery label and returning
+`EXCEPTION_CONTINUE_EXECUTION`, so the in-flight `CALL` returns `ERR` and the session
+survives (re-arming for the next fault). **Sprint 0 proved this works in a CRT-free `was` PE
+with no `.pdata` unwind tables.** The probe then *shows* the crash — fault,
 address, register state — live in the dashboard, and you keep scripting. That is what makes
 nano-TCL a **probe** rather than a remote control: it drives, inspects, watches, *and*
 reports faults, all on one wire.
@@ -692,9 +705,9 @@ All small, all on the asm side (Part 1), all already implied above — they live
 - **`REG` / `REG *` / `ERR`** — format an arbitrary slot (or all non-zero slots) from the
   shadow file on demand; emit `ERR <msg>` on a bad verb name / parse error.
 - **events** — write `out:` (the redirected `puts`, §5/§6), and optionally `frame` (stream
-  the `Snapshot`) and `exc:` (the VEH dump, §15).
-- **message-mode pipe** — `PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE` so one write = one
-  frame (§14).
+  the indexed `fb` + `palette`/`linePal`, already `.globl`) and `exc:` (the VEH dump, §15).
+- **length-prefixed framing** — write `[u32-LE length][payload]` on a byte-mode pipe; the
+  reader reassembles by length (§14).
 
 ## 20. Tier-2 limits & risks
 

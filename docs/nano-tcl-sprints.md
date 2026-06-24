@@ -84,7 +84,7 @@ resolution; **7b can ship before 7a**.
 
 ## Status
 
-- ⬜ **Sprint 0** — spikes (R1 / R3 / R4 / R-snap)
+- ✅ **Sprint 0** — spikes all **PASS** (findings below): R1 resume works · R3 length-prefix · R4 persistence · R-snap `fb` reachable.
 - ⬜ Sprint 1 — walking skeleton
 - ⬜ Sprint 2 — pipe + baked scripts + persistence + dev-gate
 - ⬜ Sprint 3 — full async round-trip *(→ CLI CI-capable)*
@@ -93,6 +93,26 @@ resolution; **7b can ship before 7a**.
 - ⬜ Sprint 5 — discovery + bare-verb sugar
 - ⬜ Sprint 6 — dashboard
 - ⬜ Sprint 7a — exception channel · ⬜ Sprint 7b — studio graft
+
+### Sprint 0 — findings (all PASS, locked decisions)
+
+- **R1 — VEH catch-and-resume: PASS, resume works.** A vectored handler catches a hardware
+  #AV inside a real `frame` proc and resumes via a `CONTEXT.Rip/Rsp/Rbp` rewrite +
+  `EXCEPTION_CONTINUE_EXECUTION`; it re-arms and survives repeated faults, **with no
+  `.pdata`/unwind tables**. → **Sprint 7a builds the live exception channel; report-then-
+  respawn is dropped.** *Trap baked into the build:* a bare `[0]` encodes RIP-relative (never
+  faults) — null-deref through a register. CONTEXT offsets: `Rsp 0x98`, `Rbp 0xA0`, `Rip 0xF8`.
+- **R3 — framing: PASS.** `[u32-LE length][payload]` on a **byte-mode** pipe + a read-exact
+  reassembly loop stitched a fragmented 8 315-byte frame (6 reads) byte-exact. → Use it over
+  `PIPE_TYPE_MESSAGE` (also socket-portable); cap the decoded length against a hostile prefix.
+- **R4 — REPL persistence: PASS, with a caveat.** Accumulate-and-re-eval persists vars/procs,
+  but **re-running the buffer double-fires side-effecting wire verbs**. → script mode is a
+  single `eval` (no issue); the interactive REPL gets a small **persistent-`Vm`** entry in
+  `rust-tcl` (we own the crate) rather than replay-with-exclusion.
+- **R-snap — reachability: PASS.** Stream the **indexed `fb`** (64 000 B, `.globl` already)
+  + `palette`/`linePal` and resolve RGB tool-side (¼ the BGRX bandwidth, no library change).
+  The resolved `pbuf` is private (`Canvas$pbuf`); add `.globl pbuf` only if post-resolve
+  pixels are ever wanted.
 
 Key targets: asm under `library/nanotcl/` (`shadow.was`, `call.was`, `lexreg.was`,
 `lexval.was`, `verbs.was`, `repl.was`, `inject.was`, `num.was`, shell `nanotcl.was`);
