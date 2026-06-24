@@ -191,8 +191,10 @@ rowTypes   DWORD TYPE_BOSS,  TYPE_BUTTERFLY, TYPE_WASP,   TYPE_DRONE,  TYPE_BEE 
 rowTypePtr QWORD 0                            ; -> the selected theme's 5 entries (set by ResetGame)
 
 ; per-type frame tables, indexed by EN_TYPE (0..7): upright + left/right bank (for divers)
+; fUp2 = the optional 2nd "flap" frame (0 = none); alternated in formation by EN_ANIM.
 .balign 16
 fUp        DWORD 8 dup(0)
+fUp2       DWORD 8 dup(0)
 fBankL     DWORD 8 dup(0)
 fBankR     DWORD 8 dup(0)
 

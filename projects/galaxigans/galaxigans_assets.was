@@ -119,6 +119,8 @@ proc BuildSprAssets uses rbx frame
     ; --- per-type frame tables: upright (fUp) + the rotated bank frames (fBankL/R) ---
     mov     eax, [rip + fEnemy]
     mov     [rip + fUp + 0], eax
+    mov     eax, [rip + fEnemyFlap]          ; the Bee's flap = its 2nd frame
+    mov     [rip + fUp2 + 0], eax
     mov     eax, [rip + fButterfly]
     mov     [rip + fUp + 4], eax
     mov     eax, [rip + fBoss]
@@ -167,6 +169,15 @@ proc BuildSprAssets uses rbx frame
     lea     rcx, [rip + stingrayArt]
     call    DecAdd16
     mov     [rip + fUp + 28], eax
+    lea     rcx, [rip + jellyfishArt2]       ; 2nd frames -> the formation flap
+    call    DecAdd16
+    mov     [rip + fUp2 + 20], eax
+    lea     rcx, [rip + beetleArt2]
+    call    DecAdd16
+    mov     [rip + fUp2 + 24], eax
+    lea     rcx, [rip + stingrayArt2]
+    call    DecAdd16
+    mov     [rip + fUp2 + 28], eax
     lea     rcx, [rip + fJellyBankLArt]
     call    DecAdd16
     mov     [rip + fBankL + 20], eax

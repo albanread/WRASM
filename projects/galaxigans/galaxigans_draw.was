@@ -63,13 +63,15 @@ dsc_e_bankL:
 dsc_e_upright:
     lea     rdx, [rip + fUp]                 ; upright frame for this type
     mov     ecx, [rdx + rax*4]
-    cmp     eax, TYPE_BEE                     ; the Bee flaps while upright
-    jne     dsc_e_draw
-    mov     edx, [rsi + EN_ANIM]
-    shr     edx, 4
-    test    edx, 1
+    lea     rdx, [rip + fUp2]                ; 2nd "flap" frame (0 if this type has none)
+    mov     edx, [rdx + rax*4]
+    test    edx, edx
     jz      dsc_e_draw
-    mov     ecx, [rip + fEnemyFlap]
+    mov     r9d, [rsi + EN_ANIM]             ; alternate frames every 16 ticks
+    shr     r9d, 4
+    test    r9d, 1
+    jz      dsc_e_draw
+    mov     ecx, edx                          ; show the flap frame
 dsc_e_draw:
     cvtsi2ss xmm1, dword ptr [rsi + EN_X]    ; live screen pos (sway/dive already folded in)
     cvtsi2ss xmm2, dword ptr [rsi + EN_Y]
