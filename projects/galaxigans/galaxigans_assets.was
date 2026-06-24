@@ -16,13 +16,13 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fPlayer], eax
 
-    lea     rcx, [rip + enemyArt]            ; enemy 8x8
-    mov     edx, 8
-    mov     r8d, 8
+    lea     rcx, [rip + beeArt]              ; Bee 16x16 (shaded, palette slot 1)
+    mov     edx, 16
+    mov     r8d, 16
     call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 8
-    mov     r8d, 8
+    mov     edx, 16
+    mov     r8d, 16
     call    SprAddFrame
     mov     [rip + fEnemy], eax
 
@@ -61,11 +61,19 @@ proc DecodeSprite uses rbx rdi in rcx rdx r8
 dsd_loop:
     test    ebx, ebx
     jz      dsd_done
-    movzx   eax, byte ptr [r9]
+    movzx   eax, byte ptr [r9]                ; the source char
     inc     r9
+    mov     ecx, eax                          ; stash original
     sub     al, '0'
-    cmp     al, 9                             ; unsigned: keep 0..9, else -> 0
+    cmp     al, 9                             ; '0'..'9' -> 0..9
     jbe     dsd_store
+    mov     eax, ecx                          ; not a digit: try hex 'A'..'F'
+    sub     al, 'A'
+    cmp     al, 5
+    ja      dsd_zero                          ; '.', space, junk -> transparent
+    add     al, 10                            ; 'A'..'F' -> 10..15
+    jmp     dsd_store
+dsd_zero:
     xor     al, al
 dsd_store:
     mov     [rdi], al
@@ -92,6 +100,56 @@ proc SetupSprPalettes
     mov     ecx, PAL_SLOT
     mov     edx, IDX_BOMB
     mov     r8d, 0x00FF40FF
+    call    SprSetPalette
+    call    SetupBeePalette
+endproc
+
+; ---- SetupBeePalette: slot 1 — blue body ramp (2-5), amber wing ramp (6-9), red eyes (A),
+;      white glint (B). Shades-of-a-hue so the bug reads as sculpted, not flat. ----
+proc SetupBeePalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 1
+    mov     r8d, 0x00101830                  ; outline / shadow
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 2
+    mov     r8d, 0x002A4C8C                  ; body blue, dark
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 3
+    mov     r8d, 0x003E6CC8                  ; body blue, mid
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 4
+    mov     r8d, 0x005A90F0                  ; body blue, light
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 5
+    mov     r8d, 0x008FBEFF                  ; body blue, specular
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 6
+    mov     r8d, 0x00806000                  ; wing amber, dark
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 7
+    mov     r8d, 0x00C09010                  ; wing amber, mid
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 8
+    mov     r8d, 0x00FFD030                  ; wing amber, bright
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 9
+    mov     r8d, 0x00FFF6A0                  ; wing amber, hot tip
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 10                          ; 'A' = eye red
+    mov     r8d, 0x00FF3040
+    call    SprSetPalette
+    mov     ecx, BEE_SLOT
+    mov     edx, 11                          ; 'B' = glint white
+    mov     r8d, 0x00FFFFFF
     call    SprSetPalette
 endproc
 

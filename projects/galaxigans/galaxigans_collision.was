@@ -20,19 +20,19 @@ col_e:
     cmp     dword ptr [rdi + 8], 0
     je      col_enext
     mov     eax, [rdi + EN_X]                ; enemy live screen x (sway/dive already folded in)
-    ; reject if no overlap on x: bx >= ex+8  ||  bx+2 <= ex  (bullet w=2)
+    ; reject if no overlap on x: bx >= ex+ENEMY_W  ||  bx+2 <= ex  (bullet w=2)
     mov     ecx, eax
-    add     ecx, 8
+    add     ecx, ENEMY_W
     cmp     r8d, ecx
     jge     col_enext
     mov     ecx, r8d
     add     ecx, 2
     cmp     ecx, eax
     jle     col_enext
-    ; reject if no overlap on y: by >= ey+8  ||  by+6 <= ey  (bullet h=6)
+    ; reject if no overlap on y: by >= ey+ENEMY_H  ||  by+6 <= ey  (bullet h=6)
     mov     eax, [rdi + 4]                   ; enemy y
     mov     ecx, eax
-    add     ecx, 8
+    add     ecx, ENEMY_H
     cmp     r9d, ecx
     jge     col_enext
     mov     ecx, r9d
@@ -77,14 +77,14 @@ cph_e:
     cmp     eax, ecx
     jge     cph_next
     mov     ecx, eax
-    add     ecx, 8
+    add     ecx, ENEMY_W
     cmp     ecx, r8d
     jle     cph_next
     mov     eax, [rdi + EN_Y]                ; y overlap: ey < PLAYER_Y+8 && ey+8 > PLAYER_Y
     cmp     eax, PLAYER_Y + 8
     jge     cph_next
     mov     ecx, eax
-    add     ecx, 8
+    add     ecx, ENEMY_H
     cmp     ecx, PLAYER_Y
     jle     cph_next
     ; collision — both explode

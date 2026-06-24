@@ -23,6 +23,8 @@ EN_VX          equ 24                        ; peel velocity during the early di
 EN_DT          equ 28                        ; dive step counter
 ST_FORM        equ 0
 ST_DIVE        equ 1
+ENEMY_W        equ 16                        ; the new 16x16 shaded aliens (was 8x8)
+ENEMY_H        equ 16
 DIVE_PERIOD    equ 60                        ; frames between dive launches
 DIVE_VX        equ 3                         ; homing x-speed once a diver commits
 DIVE_PEEL      equ 12                        ; steps of outward peel before homing
@@ -50,6 +52,7 @@ IDX_PLAYER     equ 1                         ; -> white
 IDX_ENEMY      equ 2                         ; -> red
 IDX_BULLET     equ 3                         ; -> yellow
 IDX_BOMB       equ 4                         ; -> magenta
+BEE_SLOT       equ 1                         ; the Bee's own 16-colour shaded palette (slot 1)
 
 .balign 16
 .DATA
@@ -105,6 +108,25 @@ enemyArt   BYTE "2......2"
            BYTE ".222222."
            BYTE ".2.22.2."
            BYTE "2.2..2.2"
+; ---- BEE (Zako) 16x16, slot 1: blue body ramp (2-5), amber wing ramp (6-9), red eyes (A).
+;      Every row is EXACTLY 16 chars (rows pack contiguously). ----
+.balign 16
+beeArt     BYTE "................"
+           BYTE "......1221......"
+           BYTE ".....12AA21....."
+           BYTE ".....1AAAA1....."
+           BYTE "98..12333321..89"
+           BYTE "798.12344321.897"
+           BYTE ".98.12355321.89."
+           BYTE "..9.12344321.9.."
+           BYTE "....12344321...."
+           BYTE "....12333321...."
+           BYTE ".....123321....."
+           BYTE ".....122221....."
+           BYTE "......1221......"
+           BYTE "......1221......"
+           BYTE "................"
+           BYTE "................"
 bulletArt  BYTE "33"
            BYTE "33"
            BYTE "33"
