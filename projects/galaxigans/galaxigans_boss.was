@@ -246,11 +246,15 @@ proc DrawPilots uses rbx rsi rdi frame
 dpl_cnt:
     test    ebx, ebx
     jle     dpl_done
+    mov     edi, ebx                          ; centred under the beam: x0 = 320 - count*(GAP/2)
+    imul    edi, edi, 8
+    neg     edi
+    add     edi, 320
     xor     esi, esi
 dpl_loop:
     mov     eax, esi
     imul    eax, eax, PILOT_GAP
-    add     eax, PILOT_X0                     ; bottom-left row
+    add     eax, edi
     cvtsi2ss xmm1, eax
     mov     eax, PILOT_ROW_Y
     cvtsi2ss xmm2, eax

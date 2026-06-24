@@ -6,7 +6,7 @@
 ; ---- field / layout (640x360 GPU logical space; read CanvasW/CanvasH for real bounds) ----
 FIELD_W        equ 640
 FIELD_H        equ 360
-PLAYER_Y       equ 330                       ; ship sits near the bottom
+PLAYER_Y       equ 310                       ; ship patrols above the pilots' row
 
 ; ---- enemy formation: an 8x4 grid (32 slots) ----
 ENEMY_COLS     equ 8
@@ -100,7 +100,7 @@ BOSS_RESPAWN    equ 360                       ; frames before it returns after a
 PILOT_SLOT      equ 11                        ; the pilot life-token palette
 PILOT_GAP       equ 16                        ; spacing of the pilots row
 PILOT_X0        equ 14                        ; the lives row sits bottom-left, clear of the ship
-PILOT_ROW_Y     equ 340                       ; the pilots stand here (bottom)
+PILOT_ROW_Y     equ 344                       ; the pilots stand on the floor, below the ship
 
 ; ---- game lifecycle states + the triumphal spiral dance ----
 STATE_PLAYING  equ 0
