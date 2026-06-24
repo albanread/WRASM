@@ -158,6 +158,25 @@ proc BuildSprAssets uses rbx frame
     call    DecAdd16
     mov     [rip + fBankR + 16], eax
 
+    lea     rcx, [rip + saucerArt]           ; bonus saucer 32x16 (slot 7)
+    mov     edx, 32
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 32
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fSaucer], eax
+    lea     rcx, [rip + saucerArt2]
+    mov     edx, 32
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 32
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fSaucer2], eax
+
     call    SprUploadAtlas
     call    SetupSprPalettes
     call    SprUploadPalette
@@ -230,6 +249,22 @@ proc SetupSprPalettes
     call    SetupWaspPalette
     call    SetupDronePalette
     call    SetupShipPalette
+    call    SetupSaucerPalette
+endproc
+
+; ---- SetupSaucerPalette: slot 7 (silver hull / cyan dome / rim lights) ----
+proc SetupSaucerPalette uses rbx rsi frame
+    lea     rsi, [rip + saucerPal]
+    mov     ebx, 1
+susp_loop:
+    mov     ecx, SAUCER_SLOT
+    mov     edx, ebx
+    mov     r8d, [rsi]
+    call    SprSetPalette
+    add     rsi, 4
+    inc     ebx
+    cmp     ebx, 16
+    jl      susp_loop
 endproc
 
 ; ---- SetupShipPalette: slot 6 — steel-blue hull (2-5), white (6), cyan cockpit (7-9),

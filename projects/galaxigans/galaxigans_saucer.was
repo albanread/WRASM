@@ -1,0 +1,118 @@
+; galaxigans_saucer.was — the bonus SAUCER (UFO): appears from time to time, drifts across
+; the top dropping bombs, exits the far side; shootable for a bonus. (.CODE)
+
+module Galaxigans
+.CODE
+
+; ---- SaucerStep: idle -> spawn (alternating side) -> drift + drop bombs -> exit ----
+proc SaucerStep uses rbx frame
+    cmp     dword ptr [rip + saucerActive], 0
+    jne     ss_move
+    dec     dword ptr [rip + saucerSpawn]     ; idle: count down to the next appearance
+    jg      ss_done
+    mov     dword ptr [rip + saucerActive], 1
+    mov     dword ptr [rip + saucerSpawn], SAUCER_PERIOD
+    mov     dword ptr [rip + saucerBombT], SAUCER_BOMB_GAP
+    mov     dword ptr [rip + saucerAnim], 0
+    mov     eax, [rip + saucerDir]            ; flip side each spawn
+    neg     eax
+    mov     [rip + saucerDir], eax
+    test    eax, eax
+    jl      ss_fromright                       ; dir<0 -> enter from the right
+    mov     dword ptr [rip + saucerX], -32     ; dir>0 -> enter from the left
+    jmp     ss_done
+ss_fromright:
+    mov     dword ptr [rip + saucerX], FIELD_W
+    jmp     ss_done
+ss_move:
+    inc     dword ptr [rip + saucerAnim]
+    mov     eax, [rip + saucerDir]
+    test    eax, eax
+    jl      ss_left
+    add     dword ptr [rip + saucerX], SAUCER_VX
+    jmp     ss_bombs
+ss_left:
+    sub     dword ptr [rip + saucerX], SAUCER_VX
+ss_bombs:
+    mov     eax, [rip + saucerX]              ; only drop while on-screen
+    cmp     eax, 0
+    jl      ss_exitchk
+    cmp     eax, FIELD_W - 16
+    jg      ss_exitchk
+    dec     dword ptr [rip + saucerBombT]
+    jg      ss_exitchk
+    mov     dword ptr [rip + saucerBombT], SAUCER_BOMB_GAP
+    mov     ecx, eax
+    add     ecx, 16                            ; drop from the belly centre
+    mov     edx, SAUCER_Y + 12
+    call    DropBomb
+ss_exitchk:
+    mov     eax, [rip + saucerX]              ; off the far side -> despawn
+    cmp     eax, -40
+    jl      ss_deact
+    cmp     eax, FIELD_W + 8
+    jl      ss_done
+ss_deact:
+    mov     dword ptr [rip + saucerActive], 0
+ss_done:
+endproc
+
+; ---- DrawSaucer: queue the saucer sprite (2-frame light cycle) while active ----
+proc DrawSaucer uses rbx frame
+    cmp     dword ptr [rip + saucerActive], 0
+    je      ds_done
+    mov     ecx, [rip + fSaucer]
+    mov     eax, [rip + saucerAnim]
+    shr     eax, 3
+    test    eax, 1
+    jz      ds_fr
+    mov     ecx, [rip + fSaucer2]
+ds_fr:
+    cvtsi2ss xmm1, dword ptr [rip + saucerX]
+    mov     eax, SAUCER_Y
+    cvtsi2ss xmm2, eax
+    mov     r8d, SAUCER_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+ds_done:
+endproc
+
+; ---- CheckSaucerHit: a player bullet hitting the saucer -> bonus + explosion ----
+proc CheckSaucerHit uses rbx rdi frame
+    cmp     dword ptr [rip + saucerActive], 0
+    je      cs_done
+    lea     rdi, [rip + bullets]
+    mov     ebx, BULLET_MAX
+cs_b:
+    cmp     dword ptr [rdi + 8], 0
+    je      cs_next
+    mov     eax, [rdi + 0]                     ; bullet x in [saucerX, +W] ?
+    mov     ecx, [rip + saucerX]
+    cmp     eax, ecx
+    jl      cs_next
+    add     ecx, SAUCER_W
+    cmp     eax, ecx
+    jge     cs_next
+    mov     eax, [rdi + 4]                     ; bullet y in [SAUCER_Y, +H] ?
+    cmp     eax, SAUCER_Y
+    jl      cs_next
+    cmp     eax, SAUCER_Y + SAUCER_H
+    jge     cs_next
+    ; hit
+    mov     dword ptr [rdi + 8], 0             ; bullet spent
+    mov     dword ptr [rip + saucerActive], 0
+    mov     ecx, [rip + saucerX]
+    add     ecx, 16
+    mov     edx, SAUCER_Y + 8
+    call    BurstAt
+    call    PlayBoom
+    add     dword ptr [rip + score], SAUCER_SCORE
+    jmp     cs_done
+cs_next:
+    add     rdi, BULLET_STRIDE
+    dec     ebx
+    jnz     cs_b
+cs_done:
+endproc
+
+endmodule

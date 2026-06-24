@@ -54,6 +54,8 @@ GameStep:
     call    CheckPlayerHit                   ; divers reaching the ship
     call    CheckBombHit                     ; bombs reaching the ship
     call    Collide
+    call    SaucerStep                       ; the bonus saucer flyby (drops bombs)
+    call    CheckSaucerHit
     call    PtUpdate                         ; advance explosion debris
     call    CountAlive                       ; stage cleared when none remain
     test    eax, eax

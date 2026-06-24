@@ -41,6 +41,7 @@ dsc_pship:
     movss   xmm3, [rip + fOne]
     call    SprPush
 dsc_fleet:
+    call    DrawSaucer                       ; the bonus saucer (if active)
     lea     rsi, [rip + enemies]
     mov     ebx, ENEMY_MAX
 dsc_e:

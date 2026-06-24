@@ -34,11 +34,13 @@
 .include "galaxigans_aliens2.was"     ; the alien-art library (Grunt + 9 more for later levels)
 .include "galaxigans_alienbanks.was"  ; per-type rotated bank frames (divers bank as they swoop)
 .include "galaxigans_ship.was"        ; the hero fighter: level / left-bank / right-bank frames
+.include "galaxigans_saucerart.was"   ; the bonus saucer (UFO) sprite, 2-frame
 .include "galaxigans_starfield.was"   ; the animated layer-0 nebula+starfield shader
 .include "galaxigans_enemies.was"     ; ResetGame + formation sway + dive AI + bombs
 .include "galaxigans_dance.was"       ; the triumphal spiral dance (game-over celebration)
 .include "galaxigans_player.was"      ; input -> move/fire + player bullets
 .include "galaxigans_collision.was"   ; bullet x enemy + diver/bomb x player + scoring
+.include "galaxigans_saucer.was"      ; the bonus saucer: appear/move/drop-bombs/exit + hit
 .include "galaxigans_audio.was"       ; SFX bake/playback + the ABC soundtrack
 .include "galaxigans_draw.was"        ; background + queue the fleet
 .include "galaxigans_harness.was"     ; OUR window/loop/present (layer-0 sky -> board -> fleet)

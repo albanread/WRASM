@@ -55,6 +55,16 @@ BOMB_STRIDE    equ 12                        ; { x:i32, y:i32, active:i32 }
 BOMB_DY        equ 4                         ; pixels/frame down
 BOMB_PERIOD    equ 22                        ; frames between drops (the lowest diver drops)
 
+; ---- bonus saucer (UFO flyby that drops bombs) ----
+SAUCER_Y        equ 20                       ; drifts across the top band
+SAUCER_W        equ 32
+SAUCER_H        equ 16
+SAUCER_VX       equ 2                         ; drift speed
+SAUCER_PERIOD   equ 420                       ; frames between appearances
+SAUCER_BOMB_GAP equ 28                        ; frames between its bomb drops
+SAUCER_SLOT     equ 7                         ; the saucer's own palette
+SAUCER_SCORE    equ 200
+
 ; ---- game lifecycle states + the triumphal spiral dance ----
 STATE_PLAYING  equ 0
 STATE_GAMEOVER equ 1
@@ -123,6 +133,14 @@ diveTimer  DWORD 60                           ; countdown to the next dive launc
 diveScan   DWORD 0                            ; rotating start index for picking a diver
 bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
+; bonus saucer state
+saucerActive DWORD 0
+saucerX      DWORD 0
+saucerDir    DWORD -1                          ; flips each spawn (enter L<->R)
+saucerAnim   DWORD 0
+saucerSpawn  DWORD 120                         ; countdown to the first appearance
+saucerBombT  DWORD 0
+
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
 enemies    BYTE  1760 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*44)
 bullets    BYTE  64  dup(0)                   ; BULLET_MAX * BULLET_STRIDE (4*16)
@@ -138,7 +156,9 @@ fEnemyFlap DWORD ?                            ; Bee wings-down frame
 fButterfly DWORD ?                            ; Butterfly (single frame)
 fBoss      DWORD ?                            ; Boss (single frame)
 fWasp      DWORD ?                            ; Wasp (single frame)
-fDrone     DWORD ?                            ; Drone (single frame)
+fDrone     DWORD ?                            ; Drone/Grunt (single frame)
+fSaucer    DWORD ?                            ; bonus saucer (2-frame)
+fSaucer2   DWORD ?
 fBullet    DWORD ?
 fBomb      DWORD ?
 
@@ -157,6 +177,12 @@ fBankR     DWORD 5 dup(0)
 shipPal    DWORD 0x00182840, 0x003A5070, 0x00567088, 0x007890A8, 0x00A8C0D8, 0x00FFFFFF
            DWORD 0x00184868, 0x0030C0FF, 0x00B0F0FF, 0x00FF6010, 0x00FFA020, 0x00FFE040
            DWORD 0x00A8C0D8, 0x0030C0FF, 0x00FFFFFF
+
+; saucer palette (slot 7): silver hull (2-5), white (6), cyan dome (7-9), rim lights (A-C)
+.balign 16
+saucerPal  DWORD 0x00303840, 0x00505860, 0x00707880, 0x00909AA4, 0x00C0C8D0, 0x00FFFFFF
+           DWORD 0x002080B0, 0x0040C8FF, 0x00C0F0FF, 0x00682018, 0x00FFE040, 0x00FF7818
+           DWORD 0x00C0C8D0, 0x0040C8FF, 0x00FFFFFF
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
