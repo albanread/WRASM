@@ -24,11 +24,20 @@ endproc
 proc DrawScene uses rbx rsi frame
     cmp     dword ptr [rip + pAlive], 0
     je      dsc_fleet                        ; dead -> hide the ship (it's exploding)
-    mov     ecx, [rip + fPlayer]
+    mov     ecx, [rip + fPlayerC]            ; pick the bank frame from the lean
+    mov     eax, [rip + playerLean]
+    test    eax, eax
+    jz      dsc_pship
+    js      dsc_pleft
+    mov     ecx, [rip + fPlayerR]
+    jmp     dsc_pship
+dsc_pleft:
+    mov     ecx, [rip + fPlayerL]
+dsc_pship:
     cvtsi2ss xmm1, dword ptr [rip + playerX]
     mov     eax, PLAYER_Y
     cvtsi2ss xmm2, eax
-    mov     r8d, PAL_SLOT
+    mov     r8d, SHIP_SLOT
     movss   xmm3, [rip + fOne]
     call    SprPush
 dsc_fleet:
@@ -57,9 +66,15 @@ dsc_e_nb:
     jmp     dsc_e_draw
 dsc_e_nw:
     cmp     eax, TYPE_WASP
-    jne     dsc_e_boss
+    jne     dsc_e_nd
     mov     ecx, [rip + fWasp]
     mov     r8d, WASP_SLOT
+    jmp     dsc_e_draw
+dsc_e_nd:
+    cmp     eax, TYPE_DRONE
+    jne     dsc_e_boss
+    mov     ecx, [rip + fDrone]
+    mov     r8d, DRONE_SLOT
     jmp     dsc_e_draw
 dsc_e_boss:
     mov     ecx, [rip + fBoss]

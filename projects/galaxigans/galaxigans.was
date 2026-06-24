@@ -32,6 +32,7 @@
 .include "galaxigans_data.inc"        ; .DATA: pools, player, formation, sprite frame-ids
 .include "galaxigans_assets.was"      ; BuildSprAssets: synth sprite frames + palettes
 .include "galaxigans_aliens2.was"     ; the alien-art library (Grunt + 9 more for later levels)
+.include "galaxigans_ship.was"        ; the hero fighter: level / left-bank / right-bank frames
 .include "galaxigans_starfield.was"   ; the animated layer-0 nebula+starfield shader
 .include "galaxigans_enemies.was"     ; ResetGame + formation sway + dive AI + bombs
 .include "galaxigans_dance.was"       ; the triumphal spiral dance (game-over celebration)

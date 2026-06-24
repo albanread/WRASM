@@ -23,26 +23,29 @@ ps_respawn:
     mov     dword ptr [rip + fireCool], 0
     jmp     ps_done
 ps_alive:
+    mov     dword ptr [rip + playerLean], 0   ; level unless moving
     mov     ecx, ACT_LEFT
     call    Action
     test    eax, eax
     jz      ps_right
     sub     dword ptr [rip + playerX], 4
+    mov     dword ptr [rip + playerLean], -1  ; banking left
 ps_right:
     mov     ecx, ACT_RIGHT
     call    Action
     test    eax, eax
     jz      ps_clamp
     add     dword ptr [rip + playerX], 4
+    mov     dword ptr [rip + playerLean], 1   ; banking right
 ps_clamp:
     mov     eax, [rip + playerX]
     test    eax, eax
     jns     ps_hi
     xor     eax, eax
 ps_hi:
-    cmp     eax, FIELD_W - 8
+    cmp     eax, FIELD_W - PLAYER_W
     jle     ps_store
-    mov     eax, FIELD_W - 8
+    mov     eax, FIELD_W - PLAYER_W
 ps_store:
     mov     [rip + playerX], eax
 
@@ -75,10 +78,13 @@ sb_find:
     jmp     sb_done                          ; pool full — drop the shot
 sb_spawn:
     mov     eax, [rip + playerX]
-    add     eax, 3                           ; ~centre of the 8-wide ship
+    add     eax, 7                           ; ~centre of the 16-wide ship (the nose)
     mov     [rdi + 0], eax
-    mov     dword ptr [rdi + 4], PLAYER_Y - 6
+    mov     dword ptr [rdi + 4], PLAYER_Y - 2
     mov     dword ptr [rdi + 8], 1
+    mov     eax, [rip + playerLean]          ; angle the shot: lean left -> drift left, etc.
+    imul    eax, eax, BULLET_LEAN
+    mov     [rdi + BUL_DX], eax
 sb_done:
 endproc
 
@@ -89,9 +95,17 @@ proc BulletsStep uses rbx rdi frame
 bs_loop:
     cmp     dword ptr [rdi + 8], 0
     je      bs_next
-    sub     dword ptr [rdi + 4], BULLET_DY
-    cmp     dword ptr [rdi + 4], 0
-    jg      bs_next
+    sub     dword ptr [rdi + 4], BULLET_DY    ; y up
+    mov     edx, [rdi + BUL_DX]               ; x += dx (the lean drift)
+    add     [rdi + 0], edx
+    cmp     dword ptr [rdi + 4], 0            ; off the top?
+    jle     bs_kill
+    mov     eax, [rdi + 0]                    ; off the sides?
+    cmp     eax, 0
+    jl      bs_kill
+    cmp     eax, FIELD_W
+    jl      bs_next
+bs_kill:
     mov     dword ptr [rdi + 8], 0
 bs_next:
     add     rdi, BULLET_STRIDE

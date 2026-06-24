@@ -11,7 +11,10 @@ main:
     lea     rcx, [rip + titleW]
     call    GxBoot                           ; OUR window + GpuInit/BlitInit/TxtInit + GameInit()
 IFDEF FXTEST
-    mov     ecx, 240                         ; headless gate: film 240 frames (dives + returns)
+    mov     ecx, ACT_FIRE                    ; a centred test shot
+    mov     edx, 1
+    call    SimAction
+    mov     ecx, 240                         ; headless gate: film 240 frames
     mov     edx, 20
     call    GxSelfTest
     call    AudioStop

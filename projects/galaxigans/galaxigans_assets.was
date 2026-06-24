@@ -6,15 +6,35 @@ module Galaxigans
 
 ; ---- BuildSprAssets: decode the 3 art bitmaps into atlas frames + the palette ----
 proc BuildSprAssets uses rbx frame
-    lea     rcx, [rip + playerArt]           ; player 8x8
-    mov     edx, 8
-    mov     r8d, 8
+    lea     rcx, [rip + shipArtC]            ; hero ship: level
+    mov     edx, 16
+    mov     r8d, 16
     call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 8
-    mov     r8d, 8
+    mov     edx, 16
+    mov     r8d, 16
     call    SprAddFrame
-    mov     [rip + fPlayer], eax
+    mov     [rip + fPlayerC], eax
+
+    lea     rcx, [rip + shipArtL]            ; hero ship: left-bank
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fPlayerL], eax
+
+    lea     rcx, [rip + shipArtR]            ; hero ship: right-bank
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fPlayerR], eax
 
     lea     rcx, [rip + beeArt]              ; Bee 16x16 (shaded, palette slot 1)
     mov     edx, 16
@@ -156,6 +176,23 @@ proc SetupSprPalettes
     call    SetupBossPalette
     call    SetupWaspPalette
     call    SetupDronePalette
+    call    SetupShipPalette
+endproc
+
+; ---- SetupShipPalette: slot 6 — steel-blue hull (2-5), white (6), cyan cockpit (7-9),
+;      engine glow orange->yellow (A-C), trim (D), intake (E), sparkle (F) ----
+proc SetupShipPalette uses rbx rsi rdi frame
+    lea     rsi, [rip + shipPal]
+    mov     ebx, 1                            ; index 1..15
+sp_loop:
+    mov     ecx, SHIP_SLOT
+    mov     edx, ebx
+    mov     r8d, [rsi]
+    call    SprSetPalette
+    add     rsi, 4
+    inc     ebx
+    cmp     ebx, 16
+    jl      sp_loop
 endproc
 
 ; ---- SetupDronePalette: slot 5 — GALAXIAN GRUNT: red carapace (2-5), amber wings (6-8),

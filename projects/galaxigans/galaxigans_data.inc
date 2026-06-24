@@ -39,9 +39,13 @@ GRID_Y0        equ 56
 
 ; ---- player bullet pool (4 in flight, Galaga-style) ----
 BULLET_MAX     equ 4
-BULLET_STRIDE  equ 12                        ; { x:i32, y:i32, active:i32 }
+BULLET_STRIDE  equ 16                        ; { x:i32, y:i32, active:i32, dx:i32 }
+BUL_DX         equ 12                        ; dx field offset (horizontal drift from the lean)
 BULLET_DY      equ 7                         ; pixels/frame up
+BULLET_LEAN    equ 3                         ; bullet dx when the ship is banking L/R
 FIRE_COOLDOWN  equ 8                         ; frames between shots
+PLAYER_W       equ 16                        ; the 16x16 hero ship
+SHIP_SLOT      equ 6                          ; the ship's own 16-colour palette
 RESPAWN_FRAMES equ 90                        ; death pause before the ship comes back
 
 ; ---- enemy bombs (divers drop them straight down) ----
@@ -87,6 +91,7 @@ titleW     WCHAR "RASM — Galaxigans", 0
 
 ; player
 playerX    DWORD 312                         ; ship x (top-left), centred-ish
+playerLean DWORD 0                            ; -1 banking left / 0 level / +1 right
 fireCool   DWORD 0                           ; frames until next shot allowed
 pAlive     DWORD 1                           ; 0 while exploding/respawning
 pDeathT    DWORD 0                           ; respawn countdown while dead
@@ -110,11 +115,14 @@ bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
 enemies    BYTE  1600 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*40)
-bullets    BYTE  48  dup(0)                   ; BULLET_MAX * BULLET_STRIDE
+bullets    BYTE  64  dup(0)                   ; BULLET_MAX * BULLET_STRIDE (4*16)
 bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
 
 ; sprite frame ids (set by BuildSprAssets)
-fPlayer    DWORD ?
+fPlayer    DWORD ?                            ; (legacy 8x8 placeholder, unused)
+fPlayerC   DWORD ?                            ; hero ship: level / left-bank / right-bank
+fPlayerL   DWORD ?
+fPlayerR   DWORD ?
 fEnemy     DWORD ?                            ; Bee wings-up
 fEnemyFlap DWORD ?                            ; Bee wings-down frame
 fButterfly DWORD ?                            ; Butterfly (single frame)
@@ -127,6 +135,12 @@ fBomb      DWORD ?
 ; formation row -> alien type (one species per row)
 .balign 16
 rowType    DWORD TYPE_BOSS, TYPE_BUTTERFLY, TYPE_WASP, TYPE_DRONE, TYPE_BEE
+
+; ship palette (slot 6 indices 1..15) — steel-blue hull, cyan cockpit, orange engine glow
+.balign 16
+shipPal    DWORD 0x00101826, 0x002B5C8A, 0x00407FB5, 0x005CA8DA, 0x0091D2F2, 0x00FFFFFF
+           DWORD 0x000E3A66, 0x0033C9FF, 0x00BFF2FF, 0x00FF7A18, 0x00FFC23D, 0x00FFF38A
+           DWORD 0x00A8C4D8, 0x001C8FD6, 0x00E8F6FF
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
