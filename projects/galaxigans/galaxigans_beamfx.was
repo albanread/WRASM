@@ -1,0 +1,239 @@
+; galaxigans_beamfx.was — the capture boss's tractor beam, drawn in the INDEXED layer 1
+; (idxBuf, transparent above the layer-0 shader, below the sprites) and animated by CASCADING
+; the per-line palette — the energy flows with zero per-frame redraw of the shape's colour.
+;
+; The stock GpuComposite clears + resolves opaque (for indexed-primary games). We need a
+; transparent overlay, so this file carries its own composite shader that DISCARDS index 0 and
+; resolves the rest through the per-line palette (palLine), drawn over pRTV with no clear.
+;
+; module Gpu (the borrow trick): so it can see canvas privates — idxBuf SRV (pSRVidx), the
+; per-line palette (palLineData / pSRVline / pTexIdx), vp, pRast, vsTarget/psTarget/pErrBlob.
+
+module Gpu
+.DATA
+.balign 16
+beamSrc:
+.ASCIISTRING
+Texture2D<uint> bidx:register(t0);
+Texture2D<float4> bpal:register(t1);
+struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+VO BVS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
+float4 BPS(VO v):SV_Target{
+int px=clamp((int)(v.uv.x*640.0),0,639);int py=clamp((int)(v.uv.y*360.0),0,359);
+uint c=bidx.Load(int3(px,py,0));
+if(c==0u)discard;
+float4 col=bpal.Load(int3((int)c,py,0));
+return float4(col.rgb,1.0);}
+.ENDASCIISTRING
+beamEnd:
+    BYTE 0
+
+beamVsEnt  BYTE "BVS", 0
+beamPsEnt  BYTE "BPS", 0
+beamShName BYTE "gpubeam", 0
+
+.balign 16
+comobj pBeamVSBlob : ID3DBlob
+comobj pBeamPSBlob : ID3DBlob
+pBeamVS    QWORD ?
+pBeamPS    QWORD ?
+beamSrcLen QWORD ?
+beamTmpPtr QWORD ?
+beamTmpSz  QWORD ?
+.balign 16
+beamSrvArr QWORD 0, 0
+beamRTVtmp QWORD ?
+
+; --- beam state (set by the boss via BeamSet / BeamOff) ---
+beamActive DWORD 0
+beamCx     DWORD 320
+beamTop    DWORD 40
+beamBot    DWORD 340
+beamPhase  DWORD 0
+
+; cyan energy ramp (0xAARRGGBB; one band per step, pulsing dim->white->dim so it reads as flow)
+.balign 16
+beamRamp   DWORD 0xFF103040, 0xFF1C6078, 0xFF3098B8, 0xFF58C8E8
+           DWORD 0xFFB0F4FF, 0xFF58C8E8, 0xFF3098B8, 0xFF1C6078
+
+.balign 16
+.CODE
+
+; ---- BeamInit — compile the composite VS/PS. After GpuInit (needs vsTarget/psTarget). ----
+.globl BeamInit
+BeamInit:
+    push    rbx
+    sub     rsp, 40
+    lea     rax, [rip + beamEnd]
+    lea     rcx, [rip + beamSrc]
+    sub     rax, rcx
+    mov     [rip + beamSrcLen], rax
+    invoke  D3DCompile, beamSrc, [rip + beamSrcLen], beamShName, 0, 0, beamVsEnt, vsTarget, 0, 0, pBeamVSBlob, pErrBlob
+    test    eax, eax
+    js      beam_fc
+    invoke  D3DCompile, beamSrc, [rip + beamSrcLen], beamShName, 0, 0, beamPsEnt, psTarget, 0, 0, pBeamPSBlob, pErrBlob
+    test    eax, eax
+    js      beam_fc
+    pBeamVSBlob.GetBufferPointer()
+    mov     [rip + beamTmpPtr], rax
+    pBeamVSBlob.GetBufferSize()
+    mov     [rip + beamTmpSz], rax
+    pDevice.CreateVertexShader([rip + beamTmpPtr], [rip + beamTmpSz], 0, pBeamVS)
+    test    eax, eax
+    js      beam_fd
+    pBeamPSBlob.GetBufferPointer()
+    mov     [rip + beamTmpPtr], rax
+    pBeamPSBlob.GetBufferSize()
+    mov     [rip + beamTmpSz], rax
+    pDevice.CreatePixelShader([rip + beamTmpPtr], [rip + beamTmpSz], 0, pBeamPS)
+    test    eax, eax
+    js      beam_fd
+    xor     ecx, ecx                          ; draw the beam in PHYSICAL 640x360 (the game's
+    xor     edx, edx                          ;   space) so the cone + per-line cascade align
+    call    CanvasSetOrigin
+    xor     eax, eax
+    add     rsp, 40
+    pop     rbx
+    ret
+beam_fc:
+    invoke  ExitProcess, 55
+beam_fd:
+    invoke  ExitProcess, 53
+
+; ---- BeamSet(ecx=x, edx=topY, r8d=botY): position + arm the beam ----
+.globl BeamSet
+BeamSet:
+    mov     [rip + beamCx], ecx
+    mov     [rip + beamTop], edx
+    mov     [rip + beamBot], r8d
+    mov     dword ptr [rip + beamActive], 1
+    ret
+
+; ---- BeamOff: disarm ----
+.globl BeamOff
+BeamOff:
+    mov     dword ptr [rip + beamActive], 0
+    ret
+
+; ---- BeamCascade: rewrite each beam scanline's index-1 colour from the ramp, stepped by
+;      (y + phase) so the bands scroll downward; bump phase; re-upload the per-line palette. ----
+BeamCascade:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    sub     rsp, 8
+    mov     r12d, [rip + beamTop]
+    mov     r13d, [rip + beamBot]
+    lea     rsi, [rip + palLineData]
+    mov     edi, r12d
+bc_loop:
+    cmp     edi, r13d
+    jg      bc_done
+    mov     eax, edi                          ; band = ((y - top + phase) >> 1) & 7
+    sub     eax, r12d
+    add     eax, [rip + beamPhase]
+    shr     eax, 1
+    and     eax, 7
+    lea     rcx, [rip + beamRamp]
+    mov     ecx, [rcx + rax*4]                ; ramp colour
+    mov     eax, edi
+    shl     eax, 4                            ; y*16
+    add     eax, 1                            ; + index 1
+    mov     [rsi + rax*4], ecx
+    inc     edi
+    jmp     bc_loop
+bc_done:
+    inc     dword ptr [rip + beamPhase]
+    call    UploadLinePalette
+    add     rsp, 8
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+; ---- BeamComposite(rcx=RTV): upload idxBuf, resolve over the cosmos (no clear, discard idx 0) ----
+BeamComposite:
+    push    rbx
+    sub     rsp, 32
+    mov     [rip + beamRTVtmp], rcx
+    pContext.UpdateSubresource([rip + pTexIdx], 0, 0, idxBuf, 640, 0)
+    pContext.OMSetRenderTargets(1, beamRTVtmp, 0)
+    pContext.RSSetViewports(1, vp)
+    pContext.RSSetState([rip + pRast])
+    pContext.VSSetShader([rip + pBeamVS], 0, 0)
+    pContext.PSSetShader([rip + pBeamPS], 0, 0)
+    mov     rax, [rip + pSRVidx]
+    mov     [rip + beamSrvArr + 0], rax
+    mov     rax, [rip + pSRVline]
+    mov     [rip + beamSrvArr + 8], rax
+    pContext.PSSetShaderResources(0, 2, beamSrvArr)
+    pContext.OMSetBlendState(0, 0, 0xFFFFFFFF)
+    pContext.IASetPrimitiveTopology(4)
+    pContext.Draw(3, 0)
+    add     rsp, 32
+    pop     rbx
+    ret
+
+; ---- BeamRender(rcx=RTV): if armed — clear idxBuf, draw the cone (index 1, widening down),
+;      cascade the palette, composite over the cosmos. Call after StarRender. ----
+.globl BeamRender
+BeamRender:
+    push    rbx
+    push    rsi
+    push    rdi
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8
+    cmp     dword ptr [rip + beamActive], 0
+    je      br_done
+    mov     r15, rcx                          ; RTV
+    xor     ecx, ecx                          ; Cls(0) -> transparent
+    call    Cls
+    mov     r12d, [rip + beamTop]
+    mov     r13d, [rip + beamBot]
+    mov     r14d, r13d                        ; range = bot - top (>=1)
+    sub     r14d, r12d
+    jg      br_haverange
+    mov     r14d, 1
+br_haverange:
+    mov     esi, r12d                         ; y = top
+br_cone:
+    cmp     esi, r13d
+    jg      br_conedone
+    mov     eax, esi                          ; hw = 4 + (y-top)*16/range
+    sub     eax, r12d
+    imul    eax, eax, 16
+    cdq
+    idiv    r14d
+    add     eax, 4
+    mov     r9d, 1                            ; index 1
+    mov     r8d, eax
+    add     r8d, r8d                          ; len = 2*hw
+    mov     ecx, [rip + beamCx]
+    sub     ecx, eax                          ; x0 = cx - hw
+    mov     edx, esi                          ; y
+    call    HLine
+    inc     esi
+    jmp     br_cone
+br_conedone:
+    call    BeamCascade
+    mov     rcx, r15
+    call    BeamComposite
+br_done:
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+
+endmodule

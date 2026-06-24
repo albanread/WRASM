@@ -91,6 +91,8 @@ GxFrame:
     call    StarSetTime                    ; advance the sky
     mov     rcx, [rip + pRTV]
     call    StarRender                     ; LAYER 0 — fills the back buffer, opaque
+    mov     rcx, [rip + pRTV]
+    call    BeamRender                     ; LAYER 1 — the capture beam (transparent over the sky)
     call    TxtUpload                       ; HUD glyphs over the sky
     pContext.RSSetViewports(1, vp)
     mov     rcx, [rip + pRTV]

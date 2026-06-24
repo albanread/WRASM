@@ -38,6 +38,7 @@
 .include "galaxigans_saucerart.was"   ; the bonus saucer (UFO) sprite, 2-frame
 .include "galaxigans_mineart.was"     ; the spinning space-mine sprite, 8 rotation frames
 .include "galaxigans_starfield.was"   ; the animated layer-0 nebula+starfield shader
+.include "galaxigans_beamfx.was"      ; the capture beam in indexed layer 1 (palette-cascaded)
 .include "galaxigans_enemies.was"     ; ResetGame + formation sway + dive AI + bombs
 .include "galaxigans_dance.was"       ; the triumphal spiral dance (game-over celebration)
 .include "galaxigans_player.was"      ; input -> move/fire + player bullets

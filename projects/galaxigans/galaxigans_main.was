@@ -30,6 +30,7 @@ GameInit:
     call    SprInit
     call    PtInit
     call    StarInit                         ; compile the layer-0 starfield shader
+    call    BeamInit                         ; compile the layer-1 capture-beam composite
     call    BuildSprAssets
     call    AudioBoot                        ; mixer + SFX bake + title music
     call    NewGame
