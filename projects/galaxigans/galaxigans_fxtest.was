@@ -1,0 +1,4 @@
+; FXTEST build — define the gate symbol, then pull in the game. Films the headless
+; BMP filmstrip via GameSelfTest and quits (no interactive window loop).
+FXTEST equ 1
+.include "galaxigans.was"

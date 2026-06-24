@@ -1,36 +1,38 @@
-; galaxigans_assets.was — synthesize the sprite atlas + palette (.CODE).
-; v1: solid-colour blocks (player/enemy/bullet) so the fleet is visible; real
-; indexed art comes next. The harness already ran SprInit before GameInit.
+; galaxigans_assets.was — decode the sprite-art bitmaps into the atlas + palette.
+; The harness already ran SprInit before GameInit.
 
 module Galaxigans
 .CODE
 
-; ---- BuildSprAssets: 3 solid frames into the atlas + the shared palette slot ----
+; ---- BuildSprAssets: decode the 3 art bitmaps into atlas frames + the palette ----
 proc BuildSprAssets uses rbx frame
-    mov     ecx, IDX_PLAYER                  ; player 16x12
-    mov     edx, 16 * 12
-    call    FillScratch
+    lea     rcx, [rip + playerArt]           ; player 8x8
+    mov     edx, 8
+    mov     r8d, 8
+    call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 16
-    mov     r8d, 12
+    mov     edx, 8
+    mov     r8d, 8
     call    SprAddFrame
     mov     [rip + fPlayer], eax
 
-    mov     ecx, IDX_ENEMY                   ; enemy 14x10
-    mov     edx, 14 * 10
-    call    FillScratch
+    lea     rcx, [rip + enemyArt]            ; enemy 8x8
+    mov     edx, 8
+    mov     r8d, 8
+    call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 14
-    mov     r8d, 10
+    mov     edx, 8
+    mov     r8d, 8
     call    SprAddFrame
     mov     [rip + fEnemy], eax
 
-    mov     ecx, IDX_BULLET                  ; bullet 3x8
-    mov     edx, 3 * 8
-    call    FillScratch
+    lea     rcx, [rip + bulletArt]           ; bullet 2x6
+    mov     edx, 2
+    mov     r8d, 6
+    call    DecodeSprite
     lea     rcx, [rip + sprScratch]
-    mov     edx, 3
-    mov     r8d, 8
+    mov     edx, 2
+    mov     r8d, 6
     call    SprAddFrame
     mov     [rip + fBullet], eax
 
@@ -39,27 +41,43 @@ proc BuildSprAssets uses rbx frame
     call    SprUploadPalette
 endproc
 
-; ---- FillScratch(ecx=index byte, edx=count): paint sprScratch with one index ----
-proc FillScratch uses rdi in rcx rdx
-    mov     al, cl
-    mov     ecx, edx
+; ---- DecodeSprite(rcx=textPtr, edx=w, r8d=h): hex-digit chars -> index bytes in
+;      sprScratch. '1'..'9' -> 1..9; '.' / '0' / anything else -> 0 (transparent). ----
+proc DecodeSprite uses rbx rdi in rcx rdx r8
+    mov     ebx, edx
+    imul    ebx, r8d                          ; count = w*h
+    mov     r9, rcx                           ; src text
     lea     rdi, [rip + sprScratch]
-    rep     stosb
+dsd_loop:
+    test    ebx, ebx
+    jz      dsd_done
+    movzx   eax, byte ptr [r9]
+    inc     r9
+    sub     al, '0'
+    cmp     al, 9                             ; unsigned: keep 0..9, else -> 0
+    jbe     dsd_store
+    xor     al, al
+dsd_store:
+    mov     [rdi], al
+    inc     rdi
+    dec     ebx
+    jmp     dsd_loop
+dsd_done:
 endproc
 
-; ---- SetupSprPalettes: slot 0 — [1]=white(player) [2]=red(enemy) [3]=yellow(bullet) ----
+; ---- SetupSprPalettes: slot 0 — [1]=white(ship/eyes) [2]=red(enemy) [3]=yellow(bullet) ----
 proc SetupSprPalettes
     mov     ecx, PAL_SLOT
     mov     edx, IDX_PLAYER
-    mov     r8d, 0x00E0E0FF
+    mov     r8d, 0x00D8E8FF
     call    SprSetPalette
     mov     ecx, PAL_SLOT
     mov     edx, IDX_ENEMY
-    mov     r8d, 0x00FF4040
+    mov     r8d, 0x00FF4848
     call    SprSetPalette
     mov     ecx, PAL_SLOT
     mov     edx, IDX_BULLET
-    mov     r8d, 0x00FFF000
+    mov     r8d, 0x00FFF030
     call    SprSetPalette
 endproc
 

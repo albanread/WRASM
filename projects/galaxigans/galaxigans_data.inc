@@ -56,5 +56,32 @@ fPlayer    DWORD ?
 fEnemy     DWORD ?
 fBullet    DWORD ?
 
-; scratch buffer for synthesising sprite frames (max 32x32 indexed pixels)
+; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
+;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
+.balign 16
+playerArt  BYTE "...11..."
+           BYTE "...11..."
+           BYTE "..1111.."
+           BYTE ".111111."
+           BYTE "11111111"
+           BYTE "11111111"
+           BYTE "1.1111.1"
+           BYTE "1..11..1"
+enemyArt   BYTE "2......2"
+           BYTE ".2....2."
+           BYTE ".222222."
+           BYTE "22122122"
+           BYTE "22222222"
+           BYTE ".222222."
+           BYTE ".2.22.2."
+           BYTE "2.2..2.2"
+bulletArt  BYTE "33"
+           BYTE "33"
+           BYTE "33"
+           BYTE "33"
+           BYTE "33"
+           BYTE "33"
+
+; scratch buffer for decoding a sprite frame (max 32x32 indexed pixels)
+.balign 16
 sprScratch BYTE  1024 dup(0)

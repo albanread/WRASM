@@ -13,10 +13,16 @@ main:
     lea     r8,  [rip + GameStep]
     lea     r9,  [rip + GameSprites]
     call    GameStart                        ; window + GpuInit/BlitInit/TxtInit + GameInit()
-    mov     ecx, 90                          ; headless: film 90 frames, sample some -> BMP gate
-    mov     edx, 30
+IFDEF FXTEST
+    mov     ecx, ACT_FIRE                    ; simulate a held shot so the filmstrip shows a bullet
+    mov     edx, 1
+    call    SimAction
+    mov     ecx, 120                         ; headless gate: film 120 frames (sample some), then quit
+    mov     edx, 20
     call    GameSelfTest
-    call    GameLoop                         ; then run interactively (Esc quits)
+    invoke  ExitProcess, 0
+ENDIF
+    call    GameLoop                         ; interactive: fixed-step timer pump (Esc quits)
     invoke  ExitProcess, 0
 
 ; ---- GameInit (callback): harness did Gpu/Blit/Txt; bring up sprites/particles + game ----
@@ -37,11 +43,12 @@ GameStep:
     call    FormationStep
     call    Collide
     call    DrawBackground
-    mov     ecx, 8                           ; HUD: score (white)
-    mov     edx, 6
-    mov     r8b, 15
-    lea     r9, [rip + scoreStr]
-    call    Text
+    mov     ecx, 0x00FFFFFF                  ; HUD: white score, top-left — GPU text layer,
+    call    TxtSetColour                     ;   640x360 px (same space as the sprites)
+    mov     ecx, 8
+    mov     edx, 8
+    lea     r8, [rip + scoreStr]
+    call    DrawText
     add     rsp, 40
     ret
 

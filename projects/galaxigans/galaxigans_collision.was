@@ -19,25 +19,25 @@ col_b:
 col_e:
     cmp     dword ptr [rdi + 8], 0
     je      col_enext
-    mov     eax, [rdi + 0]                   ; enemy screen x = x + formX (w=14)
+    mov     eax, [rdi + 0]                   ; enemy screen x = x + formX (8x8)
     add     eax, [rip + formX]
-    ; reject if no overlap on x: bx >= ex+14  ||  bx+3 <= ex
+    ; reject if no overlap on x: bx >= ex+8  ||  bx+2 <= ex  (bullet w=2)
     mov     ecx, eax
-    add     ecx, 14
+    add     ecx, 8
     cmp     r8d, ecx
     jge     col_enext
     mov     ecx, r8d
-    add     ecx, 3
+    add     ecx, 2
     cmp     ecx, eax
     jle     col_enext
-    ; reject if no overlap on y: by >= ey+10  ||  by+8 <= ey   (h=10)
+    ; reject if no overlap on y: by >= ey+8  ||  by+6 <= ey  (bullet h=6)
     mov     eax, [rdi + 4]                   ; enemy y
     mov     ecx, eax
-    add     ecx, 10
+    add     ecx, 8
     cmp     r9d, ecx
     jge     col_enext
     mov     ecx, r9d
-    add     ecx, 8
+    add     ecx, 6
     cmp     ecx, eax
     jle     col_enext
     ; hit

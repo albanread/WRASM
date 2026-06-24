@@ -22,9 +22,9 @@ ps_clamp:
     jns     ps_hi
     xor     eax, eax
 ps_hi:
-    cmp     eax, FIELD_W - 16
+    cmp     eax, FIELD_W - 8
     jle     ps_store
-    mov     eax, FIELD_W - 16
+    mov     eax, FIELD_W - 8
 ps_store:
     mov     [rip + playerX], eax
 
@@ -56,7 +56,7 @@ sb_find:
     jmp     sb_done                          ; pool full — drop the shot
 sb_spawn:
     mov     eax, [rip + playerX]
-    add     eax, 7                           ; ~centre of the 16-wide ship
+    add     eax, 3                           ; ~centre of the 8-wide ship
     mov     [rdi + 0], eax
     mov     dword ptr [rdi + 4], PLAYER_Y - 6
     mov     dword ptr [rdi + 8], 1
