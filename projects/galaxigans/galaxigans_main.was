@@ -72,7 +72,8 @@ gs_dance:
     call    PtUpdate                         ; let lingering debris fade
     dec     dword ptr [rip + danceTimer]
     jg      gs_dance_hud
-    call    ResetGame                        ; dance done -> back to STATE_PLAYING
+    call    MusicGameplay                    ; dance done -> back to the gameplay theme
+    call    ResetGame                        ; ... and STATE_PLAYING
 gs_dance_hud:
     mov     ecx, 0x00FF4040                  ; "GAME OVER" (red), centred near the top
     call    TxtSetColour

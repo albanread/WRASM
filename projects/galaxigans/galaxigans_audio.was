@@ -56,6 +56,28 @@ proc AudioStop frame
     call    AudioShutdown
 endproc
 
+; ---- MusicSwitch(rcx=ABC tune): stop the current tune + start a new one. The player
+;      thread reads tuneEv unlocked, so the safe switch is shutdown -> reparse -> reinit. ----
+proc MusicSwitch uses rbx frame in rcx
+    mov     rbx, rcx                          ; keep the tune ptr across MusicShutdown
+    call    MusicShutdown                     ; stop + join + close (zeroes the thread handle)
+    mov     rcx, rbx
+    call    ParseTune                         ; reparse into tuneEv
+    call    MusicInit                         ; reopen the device + restart the player
+endproc
+
+; ---- MusicGameOver: the aliens' triumph — switch to the "Alien Victory" fanfare ----
+proc MusicGameOver frame
+    lea     rcx, [rip + tuneGameOver]
+    call    MusicSwitch
+endproc
+
+; ---- MusicGameplay: back to the looping gameplay theme ----
+proc MusicGameplay frame
+    lea     rcx, [rip + soundtrack]
+    call    MusicSwitch
+endproc
+
 ; ---- PlayZap / PlayBoom / PlayDeath: fire a pre-rendered SFX into the mixer ----
 proc PlayZap frame
     lea     rcx, [rip + zapBuf]

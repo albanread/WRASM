@@ -26,6 +26,7 @@
 ; ---- the audio stack (distinct modules Sound/Player; no collision with gpu/*) ----
 .include "../../library/audio/sound/sound.was" ; the synth + waveOut mixer (SFX presets + Play)
 .include "../../library/audio/music/abc.was"   ; the ABC parser + midiOut soundtrack player
+.include "galaxigans_music.was"                 ; named ABC tunes (title/victory/gameover/...)
 
 ; ---- the game (each fragment opens `module Galaxigans`; data first) ----
 .include "galaxigans_data.inc"        ; .DATA: pools, player, formation, sprite frame-ids
