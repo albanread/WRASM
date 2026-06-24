@@ -1,0 +1,19 @@
+# Standalone crate (its own [workspace]) so it stays out of the rasm workspace's
+# member list — builds independently with `cargo build` in this directory.
+[workspace]
+
+[package]
+name = "nanotcl"
+version = "0.1.0"
+edition = "2021"
+description = "nano-TCL Tier-2 driver: full TCL locally (rust_tcl), forwards reg=val verb calls to a running game over a named pipe."
+
+[[bin]]
+name = "nanotcl"
+path = "src/main.rs"
+
+[dependencies]
+rust-tcl = { path = "../../../doccrate/crates/rust-tcl" }
+
+[profile.release]
+opt-level = 2
