@@ -11,7 +11,7 @@ main:
     lea     rcx, [rip + titleW]
     call    GxBoot                           ; OUR window + GpuInit/BlitInit/TxtInit + GameInit()
 IFDEF FXTEST
-    mov     ecx, ACT_FIRE                    ; a centred test shot
+    mov     ecx, ACT_FIRE                    ; a centred test shot (also starts the stage from INTRO)
     mov     edx, 1
     call    SimAction
     mov     ecx, 240                         ; headless gate: film 240 frames
@@ -31,16 +31,22 @@ GameInit:
     call    PtInit
     call    StarInit                         ; compile the layer-0 starfield shader
     call    BuildSprAssets
-    call    AudioBoot                        ; mixer + SFX bake + looping soundtrack
+    call    AudioBoot                        ; mixer + SFX bake + title music
     call    ResetGame
+    mov     dword ptr [rip + gameState], STATE_INTRO   ; boot to the title screen
     add     rsp, 40
     ret
 
 ; ---- GameStep (callback): input + logic + draw the indexed background + queue HUD text ----
 GameStep:
     sub     rsp, 40
-    cmp     dword ptr [rip + gameState], STATE_GAMEOVER
+    mov     eax, [rip + gameState]
+    cmp     eax, STATE_INTRO
+    je      gs_intro
+    cmp     eax, STATE_GAMEOVER
     je      gs_dance
+    cmp     eax, STATE_WIN
+    je      gs_win
     call    PlayerStep
     call    BulletsStep
     call    BombsStep
@@ -49,6 +55,13 @@ GameStep:
     call    CheckBombHit                     ; bombs reaching the ship
     call    Collide
     call    PtUpdate                         ; advance explosion debris
+    call    CountAlive                       ; stage cleared when none remain
+    test    eax, eax
+    jnz     gs_play_hud
+    mov     dword ptr [rip + gameState], STATE_WIN
+    mov     dword ptr [rip + winTimer], WIN_LEN
+    call    MusicVictory
+gs_play_hud:
     call    FormatScore                      ; refresh the HUD digits from `score`
     mov     ecx, 0x00FFFFFF                  ; HUD: white score, top-left — GPU text layer,
     call    TxtSetColour                     ;   640x360 px (same space as the sprites)
@@ -75,14 +88,58 @@ gs_dance:
     call    PtUpdate                         ; let lingering debris fade
     dec     dword ptr [rip + danceTimer]
     jg      gs_dance_hud
-    call    MusicGameplay                    ; dance done -> back to the gameplay theme
-    call    ResetGame                        ; ... and STATE_PLAYING
+    call    ResetGame
+    mov     dword ptr [rip + gameState], STATE_INTRO   ; dance done -> back to the title
+    call    MusicTitle
 gs_dance_hud:
-    mov     ecx, 0x00FF4040                  ; "GAME OVER" (red), centred near the top
+    mov     ecx, 0x00FF4040                  ; "GAME OVER" (red)
     call    TxtSetColour
-    mov     ecx, 280
+    mov     ecx, 272
     mov     edx, 30
     lea     r8, [rip + gameOverStr]
+    call    DrawText
+    add     rsp, 40
+    ret
+
+; ---- INTRO: title screen, waiting for fire to launch the stage ----
+gs_intro:
+    mov     ecx, ACT_FIRE
+    call    ActionHit
+    test    eax, eax
+    jz      gs_intro_hud
+    call    ResetGame
+    mov     dword ptr [rip + gameState], STATE_PLAYING
+    call    MusicGameplay
+gs_intro_hud:
+    mov     ecx, 0x0050D0FF                  ; "GALAXIGANS" (cyan), below the formation
+    call    TxtSetColour
+    mov     ecx, 263
+    mov     edx, 238
+    lea     r8, [rip + titleStr]
+    call    DrawText
+    mov     ecx, 0x00FFFFFF                  ; "PRESS FIRE TO START" (white)
+    call    TxtSetColour
+    mov     ecx, 263
+    mov     edx, 268
+    lea     r8, [rip + startStr]
+    call    DrawText
+    add     rsp, 40
+    ret
+
+; ---- WIN: stage clear, brief pause, then the next stage ----
+gs_win:
+    dec     dword ptr [rip + winTimer]
+    jg      gs_win_hud
+    inc     dword ptr [rip + stage]
+    call    ResetGame
+    mov     dword ptr [rip + gameState], STATE_PLAYING
+    call    MusicGameplay
+gs_win_hud:
+    mov     ecx, 0x0040FF40                  ; "STAGE CLEAR" (green)
+    call    TxtSetColour
+    mov     ecx, 288
+    mov     edx, 160
+    lea     r8, [rip + clearStr]
     call    DrawText
     add     rsp, 40
     ret

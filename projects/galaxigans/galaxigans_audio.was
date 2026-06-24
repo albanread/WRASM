@@ -21,7 +21,7 @@ deathBuf    real8 88200 dup(0.0)              ; player-death SFX (long deep Expl
 deathFrames DWORD ?
 
 ; looping A-minor chiptune (square lead + synth bass) — brickout's proven soundtrack.
-soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=140", 10, "%%MIDI program 1 80", 10, "%%MIDI program 2 38", 10, "K:Am", 10, "V:1", 10, "e2 a2 e2 c2 | d2 f2 e2 d2 | c2 e2 a2 g2 | e2 d2 c4 |", 10, "V:2", 10, "A,2 E,2 A,2 E,2 | D,2 A,2 E,2 E,2 | A,2 E,2 C2 G,2 | A,2 E,2 A,4 |", 10, 0
+soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=170", 10, "%%MIDI program 1 81", 10, "%%MIDI program 2 38", 10, "K:Em", 10, "V:1", 10, "e g b e' b g e g | d f a d' a f d f | c e g c' g e c e | B d f b a g f e | e g b e' b g e g | d f a d' a f d f | c e a c' a e c B | e2 B2 e4 |", 10, "V:2", 10, "E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | B,,4 E,4 | E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | E,4 E,4 |", 10, 0
 
 .balign 16
 .CODE
@@ -44,8 +44,8 @@ proc AudioBoot frame
     lea     rcx, [rip + deathBuf]
     lea     rdx, [rip + deathFrames]
     call    CopySfx
-    mov     dword ptr [rip + gMusicLoop], 1   ; loop the soundtrack
-    lea     rcx, [rip + soundtrack]
+    mov     dword ptr [rip + gMusicLoop], 1   ; loop the active tune
+    lea     rcx, [rip + tuneTitle]            ; boot into STATE_INTRO -> title music
     call    ParseTune                         ; ABC -> the scheduled event array
     call    MusicInit                         ; open MIDI_MAPPER + start the player thread
 endproc
@@ -72,9 +72,21 @@ proc MusicGameOver frame
     call    MusicSwitch
 endproc
 
-; ---- MusicGameplay: back to the looping gameplay theme ----
+; ---- MusicGameplay: the energetic gameplay loop ----
 proc MusicGameplay frame
     lea     rcx, [rip + soundtrack]
+    call    MusicSwitch
+endproc
+
+; ---- MusicTitle: the title-screen theme ----
+proc MusicTitle frame
+    lea     rcx, [rip + tuneTitle]
+    call    MusicSwitch
+endproc
+
+; ---- MusicVictory: stage-clear "You Win!" fanfare ----
+proc MusicVictory frame
+    lea     rcx, [rip + tuneVictory]
     call    MusicSwitch
 endproc
 

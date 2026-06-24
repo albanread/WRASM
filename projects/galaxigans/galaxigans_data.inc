@@ -54,9 +54,12 @@ BOMB_STRIDE    equ 12                        ; { x:i32, y:i32, active:i32 }
 BOMB_DY        equ 4                         ; pixels/frame down
 BOMB_PERIOD    equ 22                        ; frames between drops (the lowest diver drops)
 
-; ---- triumphal spiral dance (the aliens' game-over celebration) ----
+; ---- game lifecycle states + the triumphal spiral dance ----
 STATE_PLAYING  equ 0
 STATE_GAMEOVER equ 1
+STATE_INTRO    equ 2                         ; title screen, waiting for fire
+STATE_WIN      equ 3                         ; stage clear
+WIN_LEN        equ 180                       ; stage-clear pause before the next stage
 DANCE_CX       equ 320                       ; orbit centre (640x360 middle)
 DANCE_CY       equ 180
 DANCE_R0       equ 95                        ; base orbit radius
@@ -100,11 +103,17 @@ score      DWORD 0
 scoreStr   BYTE  "SCORE 000000", 0
 livesStr   BYTE  "LIVES 3", 0
 gameOverStr BYTE "GAME OVER", 0
+titleStr   BYTE  "G A L A X I G A N S", 0
+startStr   BYTE  "PRESS FIRE TO START", 0
+clearStr   BYTE  "STAGE CLEAR", 0
+stageStr   BYTE  "STAGE 1", 0
 
-; game state + the dance clocks
-gameState  DWORD 0                            ; STATE_PLAYING / STATE_GAMEOVER
+; game state + the dance/win clocks
+gameState  DWORD 2                            ; boots into STATE_INTRO
+stage      DWORD 1
 danceFrame DWORD 0
 danceTimer DWORD 0
+winTimer   DWORD 0
 
 ; formation sway + dive scheduling
 formX      DWORD 0                           ; horizontal sway offset

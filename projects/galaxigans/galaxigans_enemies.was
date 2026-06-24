@@ -11,7 +11,6 @@ module Galaxigans
 
 ; ---- ResetGame: reset player/score + lay out the 8x4 formation (home + live), all alive ----
 proc ResetGame uses rbx rsi rdi frame
-    mov     dword ptr [rip + gameState], STATE_PLAYING
     mov     dword ptr [rip + playerX], 312
     mov     dword ptr [rip + fireCool], 0
     mov     dword ptr [rip + pAlive], 1
@@ -210,6 +209,22 @@ td_next:
     jnz     td_loop
     mov     [rip + diveScan], esi
 td_done:
+endproc
+
+; ---- CountAlive -> eax = number of living enemies (0 = stage clear) ----
+proc CountAlive uses rbx rdi
+    lea     rdi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+    xor     edx, edx
+cl_loop:
+    cmp     dword ptr [rdi + EN_ALIVE], 0
+    je      cl_next
+    inc     edx
+cl_next:
+    add     rdi, ENEMY_STRIDE
+    dec     ebx
+    jnz     cl_loop
+    mov     eax, edx
 endproc
 
 ; ---- TriggerBomb: the first diving enemy drops a bomb from its belly ----
