@@ -58,6 +58,12 @@ pub fn answer(kb: &Kb, query: &str) -> Result<String> {
             return Ok(md);
         }
     }
+    // Your own library: a PUBLIC module symbol (capitalised name) swept from
+    // library/ + gpu/. It's unambiguously yours — you'd write the instruction
+    // `add`, not `Add` — so it resolves ahead of the generic ISA/Windows cards.
+    if let Some(md) = library_card(kb, q)? {
+        return Ok(md);
+    }
     // Cards that need no db — the ABI and the ISA. A register or mnemonic is an
     // unambiguous keyword in asm, so resolve it ahead of the db lookups.
     if let Some(md) = register_card(q) {
@@ -253,6 +259,56 @@ fn abi_slot(n: u32, type_name: &str) -> String {
 
 /// The WRASM dialect directive card (the `directives` table — `invoke`, `.if`,
 /// `proc`, `BYTE`, …). `None` if `name` isn't a documented directive.
+/// A PUBLIC symbol from your own standard library — a capitalised name inside a
+/// `module … endmodule`, swept from `library/` + `gpu/` into the `library_symbols`
+/// table by `import_library`. A name can resolve to several definitions (e.g. the
+/// CPU `Canvas` backend and the `Gpu` one), so the card lists them all.
+fn library_card(kb: &Kb, name: &str) -> Result<Option<String>> {
+    let defs = kb.library_symbols(name)?;
+    if defs.is_empty() {
+        return Ok(None);
+    }
+    let kindword = |k: &str| match k {
+        "proc" => "proc",
+        "data" => "data",
+        "equate" => "equate",
+        "macro" => "macro",
+        _ => "label",
+    };
+    let addressable = |k: &str| k != "equate" && k != "macro";
+
+    if let [d] = &defs[..] {
+        let mut s = format!("# {}  —  {} · public {}\n\n", d.name, d.module, kindword(&d.kind));
+        if !d.signature.trim().is_empty() {
+            s.push_str(&format!("`{}`\n\n", d.signature.trim()));
+        }
+        if !d.summary.trim().is_empty() {
+            s.push_str(&format!("{}\n\n", d.summary.trim()));
+        }
+        s.push_str(&format!("Defined in `{}:{}`.\n", d.file, d.line));
+        if addressable(&d.kind) {
+            s.push_str(&format!("\nReference it PC-relative: `[rip + {}]`.\n", d.name));
+        }
+        s.push_str(&format!("\n_your library · module {}_\n", d.module));
+        return Ok(Some(s));
+    }
+
+    let mut s = format!("# {}  —  {} definitions\n\n", name, defs.len());
+    for d in &defs {
+        s.push_str(&format!("**{}** · {}", d.module, kindword(&d.kind)));
+        if !d.signature.trim().is_empty() {
+            s.push_str(&format!(" `{}`", d.signature.trim()));
+        }
+        s.push_str(&format!(" — `{}:{}`\n", d.file, d.line));
+        if !d.summary.trim().is_empty() {
+            s.push_str(&format!("{}\n", d.summary.trim()));
+        }
+        s.push('\n');
+    }
+    s.push_str("_your library — same name in more than one module_\n");
+    Ok(Some(s))
+}
+
 fn directive_card(kb: &Kb, name: &str) -> Result<Option<String>> {
     let Some(d) = kb.directive(name)? else { return Ok(None) };
     let mut s = format!("# {}\n\n", d.summary);

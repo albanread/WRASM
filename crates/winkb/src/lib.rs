@@ -12,6 +12,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+pub mod library;
+pub use library::LibrarySymbol;
+
 /// The knowledge base: a read-only connection to `windows_api.db`.
 pub struct Kb {
     conn: Connection,
@@ -259,6 +262,41 @@ impl Kb {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Every public library symbol with this exact name (case-sensitive — public
+    /// names are capitalised). A name can resolve to more than one (e.g. `Blit`
+    /// in both the CPU `Canvas` module and the `Gpu` one). Empty if the
+    /// `library_symbols` table is absent or has no match.
+    pub fn library_symbols(&self, name: &str) -> Result<Vec<LibrarySymbol>> {
+        let has: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='library_symbols'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT name, module, file, line, kind, signature, summary \
+               FROM library_symbols WHERE name = ?1 ORDER BY module, file",
+        )?;
+        let rows = stmt.query_map([name.trim()], |r| {
+            Ok(LibrarySymbol {
+                name: r.get(0)?,
+                module: r.get(1)?,
+                file: r.get(2)?,
+                line: r.get::<_, i64>(3)? as usize,
+                kind: r.get(4)?,
+                signature: r.get(5)?,
+                summary: r.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     /// ③ Resolve a bare name to its value(s), unifying constants and enum members.
