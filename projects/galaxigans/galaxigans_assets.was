@@ -254,6 +254,16 @@ proc BuildSprAssets uses rbx frame
     call    DecAdd32
     mov     [rip + fCbBeam], eax
 
+    lea     rcx, [rip + pilotArt]            ; the 12x16 pilot life token
+    mov     edx, 12
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 12
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fPilot], eax
+
     call    SprUploadAtlas
     call    SetupSprPalettes
     call    SprUploadPalette
@@ -357,6 +367,10 @@ proc SetupSprPalettes
     mov     ecx, BOSS_CAP_SLOT
     lea     rdx, [rip + bossCapPal]
     mov     r8d, 12
+    call    SetSlotPal
+    mov     ecx, PILOT_SLOT
+    lea     rdx, [rip + pilotPal]
+    mov     r8d, 7
     call    SetSlotPal
 endproc
 

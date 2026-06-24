@@ -44,7 +44,8 @@ dsc_fleet:
     call    DrawSaucer                       ; the bonus saucer (if active)
     call    DrawMines                        ; the drifting spinning mines
     call    DrawBoss                         ; the capture boss (if present)
-    call    DrawPrisoner                     ; the captured ship (rising / docked)
+    call    DrawPilots                       ; the lives as a row of pilots
+    call    DrawAbductee                     ; a pilot being dragged up the beam
     lea     rsi, [rip + enemies]
     mov     ebx, ENEMY_MAX
 dsc_e:

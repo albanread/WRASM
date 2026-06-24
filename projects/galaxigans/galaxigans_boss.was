@@ -1,12 +1,20 @@
-; galaxigans_boss.was — the capture boss, Phase 1: the spectacle only (enter / station /
-; descend / charge / beam / return), driving the layer-1 tractor beam. No abduction yet
-; (that is Phase 2). (.CODE)
+; galaxigans_boss.was — the capture boss. It abducts the player's PILOTS (the lives, shown as
+; white-spacesuit figures at the bottom): the beam grabs a pilot and drags it up; shoot the boss
+; to drop the pilot back (saved); if it reaches the boss the life is lost. (.CODE)
 
 module Galaxigans
 .CODE
 
-; ---- BossStep: the capture-boss lifecycle. Arms/aims the beam during CHARGE/BEAM. ----
+; ---- BossStep: the boss lifecycle + the pilot abduction during the beam ----
 proc BossStep uses rbx frame
+    cmp     dword ptr [rip + abducting], 2    ; a freed pilot falling home (any boss state)
+    jne     bs_dispatch
+    add     dword ptr [rip + abducteeY], 5
+    mov     eax, PILOT_ROW_Y
+    cmp     [rip + abducteeY], eax
+    jl      bs_dispatch
+    mov     dword ptr [rip + abducting], 0    ; back in the row -> saved
+bs_dispatch:
     mov     eax, [rip + bossState]
     cmp     eax, BS_ENTER
     je      bs_enter
@@ -20,8 +28,6 @@ proc BossStep uses rbx frame
     je      bs_beam
     cmp     eax, BS_RETURN
     je      bs_return
-    cmp     eax, BS_CAPTURE
-    je      bs_capture
     ; BS_IDLE: count down to the next appearance
     dec     dword ptr [rip + bossTimer]
     jg      bs_done
@@ -31,7 +37,7 @@ proc BossStep uses rbx frame
     jmp     bs_done
 bs_enter:
     inc     dword ptr [rip + bossAnim]
-    mov     eax, [rip + bossY]                ; glide down to the station line
+    mov     eax, [rip + bossY]
     cmp     eax, BOSS_STATION_Y
     jge     bs_enterdone
     add     eax, 2
@@ -43,18 +49,16 @@ bs_enterdone:
     jmp     bs_done
 bs_station:
     inc     dword ptr [rip + bossAnim]
-    cmp     dword ptr [rip + captureHeld], 0  ; already holding a prisoner -> just hover
-    jne     bs_done
     dec     dword ptr [rip + bossTimer]
     jg      bs_done
+    cmp     dword ptr [rip + lives], 0        ; no pilots left -> nothing to abduct, hover
+    jle     bs_done
     mov     dword ptr [rip + bossState], BS_DESCEND
     jmp     bs_done
 bs_descend:
     inc     dword ptr [rip + bossAnim]
-    mov     ecx, [rip + playerX]              ; track to above the ship (emitter over playerX)
-    sub     ecx, 16
-    mov     eax, [rip + bossX]
-    cmp     eax, ecx
+    mov     eax, [rip + bossX]                ; drop to centre, over the pilots row
+    cmp     eax, 304
     jge     bs_descL
     add     eax, 3
     jmp     bs_descXs
@@ -62,7 +66,7 @@ bs_descL:
     sub     eax, 3
 bs_descXs:
     mov     [rip + bossX], eax
-    mov     eax, [rip + bossY]                ; drop to the capture line
+    mov     eax, [rip + bossY]
     cmp     eax, BOSS_CAP_Y
     jge     bs_descAt
     add     eax, 3
@@ -75,12 +79,12 @@ bs_descAt:
 bs_charge:
     inc     dword ptr [rip + bossAnim]
     inc     dword ptr [rip + bossBeamT]
-    mov     ecx, [rip + bossX]                ; beam grows downward as it charges
+    mov     ecx, [rip + bossX]                ; beam grows down toward the pilots
     add     ecx, 16
     mov     edx, [rip + bossY]
     add     edx, 24
     mov     r8d, [rip + bossBeamT]
-    imul    r8d, r8d, 12
+    imul    r8d, r8d, 14
     add     r8d, edx
     cmp     r8d, 350
     jle     bs_chcap
@@ -101,24 +105,29 @@ bs_beam:
     add     edx, 24
     mov     r8d, 350
     call    BeamSet
-    ; --- capture: ship alive + centre within CAPTURE_HALFW of the beam centre -> tractor it ---
-    cmp     dword ptr [rip + pAlive], 0
-    je      bs_beamhold
-    mov     eax, [rip + playerX]
-    add     eax, 12                           ; ship centre
-    mov     ecx, [rip + bossX]
-    add     ecx, 16                           ; beam centre
-    sub     eax, ecx
-    cmp     eax, 0 - CAPTURE_HALFW
-    jl      bs_beamhold
-    cmp     eax, CAPTURE_HALFW
-    jg      bs_beamhold
-    mov     dword ptr [rip + bossState], BS_CAPTURE   ; CAUGHT — lose the ship, start the lift
-    mov     eax, PLAYER_Y
-    mov     [rip + captureShipY], eax
-    mov     dword ptr [rip + pAlive], 0
-    mov     dword ptr [rip + pDeathT], RESPAWN_FRAMES
-    dec     dword ptr [rip + lives]
+    mov     eax, [rip + abducting]
+    cmp     eax, 1
+    je      bs_rising
+    test    eax, eax
+    jne     bs_beamhold                       ; abducting==2 (falling) handled at the top
+    cmp     dword ptr [rip + lives], 0        ; grab a pilot if any remain
+    jle     bs_beamhold
+    mov     dword ptr [rip + abducting], 1
+    mov     eax, [rip + bossX]                ; pilot rises at the beam centre (12 wide)
+    add     eax, 10
+    mov     [rip + abducteeX], eax
+    mov     dword ptr [rip + abducteeY], PILOT_ROW_Y
+    jmp     bs_done
+bs_rising:
+    sub     dword ptr [rip + abducteeY], 3    ; drag the pilot up
+    mov     eax, [rip + bossY]
+    add     eax, 26
+    cmp     [rip + abducteeY], eax
+    jg      bs_done                            ; still rising
+    dec     dword ptr [rip + lives]            ; reached the boss -> a pilot is lost
+    mov     dword ptr [rip + abducting], 0
+    call    BeamOff
+    mov     dword ptr [rip + bossState], BS_RETURN
     jmp     bs_done
 bs_beamhold:
     cmp     dword ptr [rip + bossBeamT], BEAM_HOLD
@@ -126,28 +135,9 @@ bs_beamhold:
     call    BeamOff
     mov     dword ptr [rip + bossState], BS_RETURN
     jmp     bs_done
-bs_capture:
-    inc     dword ptr [rip + bossAnim]
-    mov     ecx, [rip + bossX]                ; hold the beam while the ship rises up it
-    add     ecx, 16
-    mov     edx, [rip + bossY]
-    add     edx, 24
-    mov     r8d, 350
-    call    BeamSet
-    mov     eax, [rip + captureShipY]
-    sub     eax, 4
-    mov     [rip + captureShipY], eax
-    mov     ecx, [rip + bossY]
-    add     ecx, 22
-    cmp     eax, ecx
-    jg      bs_done                            ; still rising
-    mov     dword ptr [rip + captureHeld], 1   ; docked above the boss
-    call    BeamOff
-    mov     dword ptr [rip + bossState], BS_RETURN
-    jmp     bs_done
 bs_return:
     inc     dword ptr [rip + bossAnim]
-    mov     eax, [rip + bossY]                ; climb back to station
+    mov     eax, [rip + bossY]
     cmp     eax, BOSS_STATION_Y
     jle     bs_retdone
     sub     eax, 3
@@ -161,7 +151,62 @@ bs_retdone:
 bs_done:
 endproc
 
-; ---- DrawBoss: queue the 32x32 boss; frame by state (idle flap / charge / beam) ----
+; ---- CheckBossHit: a player bullet on the boss (while it's down) frees any abductee (drops it
+;      home -> saved) and kills the boss for a bonus. ----
+proc CheckBossHit uses rbx rdi frame
+    mov     eax, [rip + bossState]
+    cmp     eax, BS_DESCEND
+    je      cbh_active
+    cmp     eax, BS_CHARGE
+    je      cbh_active
+    cmp     eax, BS_BEAM
+    je      cbh_active
+    jmp     cbh_done
+cbh_active:
+    lea     rdi, [rip + bullets]
+    mov     ebx, BULLET_MAX
+cbh_b:
+    cmp     dword ptr [rdi + 8], 0
+    je      cbh_next
+    mov     eax, [rdi + 0]                    ; bullet point in the 32x32 boss box?
+    mov     ecx, [rip + bossX]
+    cmp     eax, ecx
+    jl      cbh_next
+    add     ecx, 32
+    cmp     eax, ecx
+    jge     cbh_next
+    mov     eax, [rdi + 4]
+    mov     ecx, [rip + bossY]
+    cmp     eax, ecx
+    jl      cbh_next
+    add     ecx, 32
+    cmp     eax, ecx
+    jge     cbh_next
+    ; hit -> drop the abductee (saved), kill the boss
+    mov     dword ptr [rdi + 8], 0
+    cmp     dword ptr [rip + abducting], 1
+    jne     cbh_nodrop
+    mov     dword ptr [rip + abducting], 2    ; release -> falls back home
+cbh_nodrop:
+    mov     ecx, [rip + bossX]
+    add     ecx, 16
+    mov     edx, [rip + bossY]
+    add     edx, 16
+    call    BurstAt
+    call    PlayBoom
+    add     dword ptr [rip + score], BOSS_SCORE
+    call    BeamOff
+    mov     dword ptr [rip + bossState], BS_IDLE
+    mov     dword ptr [rip + bossTimer], BOSS_RESPAWN
+    jmp     cbh_done
+cbh_next:
+    add     rdi, BULLET_STRIDE
+    dec     ebx
+    jnz     cbh_b
+cbh_done:
+endproc
+
+; ---- DrawBoss: the 32x32 boss; frame by state (idle flap / charge / beam) ----
 proc DrawBoss uses rbx frame
     cmp     dword ptr [rip + bossState], BS_IDLE
     je      db_done
@@ -170,7 +215,7 @@ proc DrawBoss uses rbx frame
     je      db_beam
     cmp     eax, BS_CHARGE
     je      db_charge
-    mov     ecx, [rip + fCbIdle0]             ; idle/enter/descend/return: gentle flap
+    mov     ecx, [rip + fCbIdle0]
     mov     eax, [rip + bossAnim]
     shr     eax, 3
     test    eax, 1
@@ -191,30 +236,45 @@ db_push:
 db_done:
 endproc
 
-; ---- DrawPrisoner: the captured ship — rising up the beam (BS_CAPTURE) or docked above the
-;      boss (captureHeld). Uses the player ship sprite. ----
-proc DrawPrisoner uses rbx frame
-    mov     eax, [rip + bossState]
-    cmp     eax, BS_CAPTURE
-    je      dp_lift
-    cmp     dword ptr [rip + captureHeld], 0
-    je      dp_done
-    mov     ecx, [rip + bossX]                ; docked: centre the ship above the boss
-    add     ecx, 4
-    mov     edx, [rip + bossY]
-    sub     edx, 18
-    jmp     dp_draw
-dp_lift:
-    mov     ecx, [rip + playerX]              ; rising up the beam
-    mov     edx, [rip + captureShipY]
-dp_draw:
-    cvtsi2ss xmm1, ecx
-    cvtsi2ss xmm2, edx
-    mov     ecx, [rip + fPlayerC]
-    mov     r8d, SHIP_SLOT
+; ---- DrawPilots: the lives as a centred row of pilots at the bottom (one fewer while one is
+;      in transit — the abductee is drawn separately so the total reads as `lives`). ----
+proc DrawPilots uses rbx rsi rdi frame
+    mov     ebx, [rip + lives]
+    cmp     dword ptr [rip + abducting], 0
+    je      dpl_cnt
+    dec     ebx
+dpl_cnt:
+    test    ebx, ebx
+    jle     dpl_done
+    xor     esi, esi
+dpl_loop:
+    mov     eax, esi
+    imul    eax, eax, PILOT_GAP
+    add     eax, PILOT_X0                     ; bottom-left row
+    cvtsi2ss xmm1, eax
+    mov     eax, PILOT_ROW_Y
+    cvtsi2ss xmm2, eax
+    mov     ecx, [rip + fPilot]
+    mov     r8d, PILOT_SLOT
     movss   xmm3, [rip + fOne]
     call    SprPush
-dp_done:
+    inc     esi
+    cmp     esi, ebx
+    jl      dpl_loop
+dpl_done:
+endproc
+
+; ---- DrawAbductee: the pilot being dragged up the beam (or falling back) ----
+proc DrawAbductee uses rbx frame
+    cmp     dword ptr [rip + abducting], 0
+    je      da_done
+    cvtsi2ss xmm1, dword ptr [rip + abducteeX]
+    cvtsi2ss xmm2, dword ptr [rip + abducteeY]
+    mov     ecx, [rip + fPilot]
+    mov     r8d, PILOT_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+da_done:
 endproc
 
 endmodule

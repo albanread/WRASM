@@ -95,6 +95,12 @@ BOSS_FIRST      equ 40                        ; frames before the first appearan
 BOSS_DWELL      equ 60                        ; station hover before a capture run
 BEAM_CHARGE     equ 30                        ; charge frames (beam grows)
 BEAM_HOLD       equ 90                        ; beam-active frames
+BOSS_SCORE      equ 500                       ; bonus for shooting the boss
+BOSS_RESPAWN    equ 360                       ; frames before it returns after a kill
+PILOT_SLOT      equ 11                        ; the pilot life-token palette
+PILOT_GAP       equ 16                        ; spacing of the pilots row
+PILOT_X0        equ 14                        ; the lives row sits bottom-left, clear of the ship
+PILOT_ROW_Y     equ 340                       ; the pilots stand here (bottom)
 
 ; ---- game lifecycle states + the triumphal spiral dance ----
 STATE_PLAYING  equ 0
@@ -195,8 +201,9 @@ bossY      DWORD -36
 bossAnim   DWORD 0
 bossTimer  DWORD 40
 bossBeamT  DWORD 0
-captureHeld  DWORD 0                           ; a captured ship is docked above the boss
-captureShipY DWORD 0                           ; the tractored ship's y during the lift
+abducting   DWORD 0                            ; 0 none / 1 a pilot rising / 2 falling back (saved)
+abducteeX   DWORD 0                            ; the abducted pilot's position in the beam
+abducteeY   DWORD 0
 saucerSndT   DWORD 0                            ; countdown to re-trigger the looping wah-wah
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
@@ -223,6 +230,7 @@ fCbIdle0   DWORD ?                            ; capture boss 32x32: idle A/B, ch
 fCbIdle1   DWORD ?
 fCbCharge  DWORD ?
 fCbBeam    DWORD ?
+fPilot     DWORD ?                            ; the white-spacesuit life token
 fBullet    DWORD ?
 fBomb      DWORD ?
 
@@ -298,6 +306,10 @@ minePal    DWORD 0x00181820, 0x00303840, 0x00505868, 0x00788090, 0x00B0B8C8   ; 
 bossCapPal DWORD 0x00200828, 0x00481858, 0x00683078, 0x00884898, 0x00B06CC0
            DWORD 0x00D080E0, 0x00C8A030, 0x00FFE060, 0x002060A0, 0x0040C0FF
            DWORD 0x00B0ECFF, 0x00FFFFFF
+.balign 16
+; pilot palette (slot 11): outline, suit shadow/white/highlight, (5 unused), visor, chest light
+pilotPal   DWORD 0x00202830, 0x00A0A8B8, 0x00E8ECF4, 0x00FFFFFF, 0x00000000
+           DWORD 0x0040C0FF, 0x00FF8020
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
