@@ -289,6 +289,9 @@ fn library_card(kb: &Kb, name: &str) -> Result<Option<String>> {
         if addressable(&d.kind) {
             s.push_str(&format!("\nReference it PC-relative: `[rip + {}]`.\n", d.name));
         }
+        if d.kind == "proc" && !d.source.trim().is_empty() {
+            s.push_str(&format!("\n```was\n{}\n```\n", d.source));
+        }
         s.push_str(&format!("\n_your library · module {}_\n", d.module));
         return Ok(Some(s));
     }
@@ -302,6 +305,9 @@ fn library_card(kb: &Kb, name: &str) -> Result<Option<String>> {
         s.push_str(&format!(" — `{}:{}`\n", d.file, d.line));
         if !d.summary.trim().is_empty() {
             s.push_str(&format!("{}\n", d.summary.trim()));
+        }
+        if d.kind == "proc" && !d.source.trim().is_empty() {
+            s.push_str(&format!("```was\n{}\n```\n", d.source));
         }
         s.push('\n');
     }

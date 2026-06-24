@@ -13,6 +13,9 @@
 //! [`crate::Kb::library_symbols`] reads back so the IDE can answer "where does
 //! `Blit` come from?" for your own code, the way it already does for Windows.
 
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::{Path, PathBuf};
+
 /// One public symbol defined inside a module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibrarySymbol {
@@ -27,6 +30,9 @@ pub struct LibrarySymbol {
     pub signature: String,
     /// The doc comment immediately above the definition (cleaned), or empty.
     pub summary: String,
+    /// The definition's source — a `proc`'s body through `endproc` (capped), or
+    /// the single definition line for data/equates. For the IDE's peek view.
+    pub source: String,
 }
 
 /// Scan one `.was`/`.inc` file's `module … endmodule` regions for PUBLIC symbols
@@ -63,8 +69,9 @@ pub fn scan_was(file: &str, text: &str) -> Vec<LibrarySymbol> {
             file: file.to_string(),
             line: i + 1,
             kind: kind.to_string(),
-            signature,
             summary: doc_above(&lines, i),
+            source: snippet(&lines, i, kind),
+            signature,
         });
     }
     out
@@ -154,6 +161,26 @@ fn doc_above(lines: &[&str], i: usize) -> String {
     block.join(" ")
 }
 
+/// The definition's source for the peek view: a `proc` body through its
+/// `endproc` (capped at `MAX` lines), else just the definition line.
+fn snippet(lines: &[&str], i: usize, kind: &str) -> String {
+    const MAX: usize = 48;
+    if kind != "proc" {
+        return lines[i].trim_end().to_string();
+    }
+    let mut end = i;
+    for (k, raw) in lines.iter().enumerate().skip(i + 1).take(MAX * 4) {
+        end = k;
+        if strip_comment(raw).trim() == "endproc" {
+            break;
+        }
+        if k - i >= MAX {
+            break; // runaway / missing endproc guard
+        }
+    }
+    lines[i..=end].iter().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n")
+}
+
 // ── small syntax helpers (kept self-contained so winkb stays a leaf crate) ──
 
 /// `kw` followed by whitespace at the start of `t` → the remainder, else None.
@@ -193,6 +220,184 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
+// ── incremental sync into the database ──────────────────────────────────────
+
+/// What a [`sync`] changed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncReport {
+    /// Files seen on disk under the roots.
+    pub scanned: usize,
+    /// Files (re-)swept because their contents changed.
+    pub changed: usize,
+    /// Files pruned because they vanished from disk.
+    pub removed: usize,
+    /// Total public symbols indexed afterwards.
+    pub symbols: usize,
+}
+
+impl SyncReport {
+    /// Whether anything actually changed (so callers can skip a UI refresh).
+    pub fn is_dirty(&self) -> bool {
+        self.changed > 0 || self.removed > 0
+    }
+}
+
+/// The default library roots: `$WRASMLIB/library` + `$WRASMLIB/gpu`, or just
+/// `library` + `gpu` (relative to the CWD) when `$WRASMLIB` is unset.
+pub fn default_roots() -> Vec<PathBuf> {
+    let base: PathBuf = std::env::var_os("WRASMLIB").map(PathBuf::from).unwrap_or_default();
+    vec![base.join("library"), base.join("gpu")]
+}
+
+/// Bring the `library_symbols` index up to date with the `.was`/`.inc` files
+/// under `roots`, incrementally: a file is re-swept only when its `(mtime, size)`
+/// *and* content hash changed; vanished files are pruned. Enables WAL so a
+/// read-only [`crate::Kb`] keeps querying (and sees each commit) while this
+/// writes. `conn` must be writable.
+pub fn sync(roots: &[PathBuf], conn: &Connection) -> rusqlite::Result<SyncReport> {
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    ensure_schema(conn)?;
+
+    let mut on_disk = Vec::new();
+    for root in roots {
+        collect(root, &mut on_disk);
+    }
+
+    let mut report = SyncReport::default();
+    let mut seen = std::collections::HashSet::new();
+    let tx = conn.unchecked_transaction()?;
+
+    for path in &on_disk {
+        let key = norm(path);
+        seen.insert(key.clone());
+        report.scanned += 1;
+        let Ok(meta) = std::fs::metadata(path) else { continue };
+        let (size, mtime) = (meta.len() as i64, mtime_secs(&meta));
+
+        let prior: Option<(i64, i64, i64)> = tx
+            .query_row("SELECT mtime, size, hash FROM library_files WHERE path=?1", [&key], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        if let Some((pm, ps, _)) = prior {
+            if pm == mtime && ps == size {
+                continue; // stat-gate: untouched, no read
+            }
+        }
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let hash = fnv1a(text.as_bytes()) as i64;
+        if let Some((_, _, ph)) = prior {
+            if ph == hash {
+                // touched but byte-identical (e.g. a checkout) — refresh stat only.
+                tx.execute("UPDATE library_files SET mtime=?1, size=?2 WHERE path=?3", params![mtime, size, key])?;
+                continue;
+            }
+        }
+        reindex_file(&tx, &key, &text)?;
+        tx.execute(
+            "INSERT INTO library_files(path, mtime, size, hash) VALUES(?1,?2,?3,?4) \
+             ON CONFLICT(path) DO UPDATE SET mtime=?2, size=?3, hash=?4",
+            params![key, mtime, size, hash],
+        )?;
+        report.changed += 1;
+    }
+
+    // Prune files that are indexed but no longer on disk.
+    let stale: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT path FROM library_files")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).filter(|p| !seen.contains(p)).collect()
+    };
+    for p in &stale {
+        tx.execute("DELETE FROM library_symbols WHERE file=?1", [p])?;
+        tx.execute("DELETE FROM library_files WHERE path=?1", [p])?;
+        report.removed += 1;
+    }
+
+    report.symbols = tx.query_row("SELECT COUNT(*) FROM library_symbols", [], |r| r.get::<_, i64>(0))? as usize;
+    tx.commit()?;
+    Ok(report)
+}
+
+/// Replace one file's symbols with a fresh sweep.
+fn reindex_file(conn: &Connection, file: &str, text: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM library_symbols WHERE file=?1", [file])?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO library_symbols(name, module, file, line, kind, signature, summary, source) \
+           VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    )?;
+    for s in scan_was(file, text) {
+        stmt.execute(params![
+            s.name, s.module, s.file, s.line as i64, s.kind, s.signature, s.summary, s.source
+        ])?;
+    }
+    Ok(())
+}
+
+/// Create the tables if absent; rebuild from scratch if an older schema (no
+/// `source` column) is found.
+fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='library_symbols'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let has_source: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('library_symbols') WHERE name='source'")
+        .and_then(|mut s| s.exists([]))
+        .unwrap_or(false);
+    if exists && !has_source {
+        conn.execute_batch("DROP TABLE IF EXISTS library_symbols; DROP TABLE IF EXISTS library_files;")?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS library_symbols (
+            name TEXT NOT NULL, module TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL,
+            kind TEXT NOT NULL, signature TEXT NOT NULL, summary TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '');
+         CREATE INDEX IF NOT EXISTS library_symbols_name ON library_symbols(name);
+         CREATE TABLE IF NOT EXISTS library_files (
+            path TEXT PRIMARY KEY, mtime INTEGER NOT NULL, size INTEGER NOT NULL, hash INTEGER NOT NULL);",
+    )
+}
+
+fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect(&p, out);
+        } else if matches!(p.extension().and_then(|x| x.to_str()), Some("was") | Some("inc")) {
+            out.push(p);
+        }
+    }
+}
+
+fn norm(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+fn mtime_secs(m: &std::fs::Metadata) -> i64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// FNV-1a 64-bit — small, dependency-free, and stable across runs (so a hash
+/// stored last session is comparable this session).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x00000100000001b3);
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +431,11 @@ mov dword ptr [rip + x], 1   ; outside any module — ignored
         assert_eq!(blit.kind, "proc");
         assert_eq!(blit.signature, "in rcx rdx r8 r9 · frame");
         assert_eq!(blit.summary, "Blit: opaque rectangular copy");
+        assert!(
+            blit.source.starts_with("proc Blit") && blit.source.ends_with("endproc"),
+            "peek snippet is the proc body:\n{}",
+            blit.source
+        );
 
         let pal = syms.iter().find(|s| s.name == "Palette").unwrap();
         assert_eq!(pal.kind, "data");
@@ -240,5 +450,35 @@ mov dword ptr [rip + x], 1   ; outside any module — ignored
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].kind, "equate");
         assert_eq!(syms[0].signature, "320");
+    }
+
+    #[test]
+    fn sync_is_incremental_and_prunes() {
+        let dir = std::env::temp_dir().join(format!("winkb_sync_{}", std::process::id()));
+        let lib = dir.join("library");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&lib).unwrap();
+        let f = lib.join("m.was");
+        std::fs::write(&f, "module M\nproc Alpha\n  ret\nendproc\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let roots = vec![lib.clone()];
+
+        let r1 = sync(&roots, &conn).unwrap();
+        assert_eq!((r1.changed, r1.symbols), (1, 1), "first sweep");
+
+        let r2 = sync(&roots, &conn).unwrap();
+        assert_eq!(r2.changed, 0, "unchanged → stat-gate skips");
+
+        // A bigger file (size differs) → re-swept; Beta now indexed too.
+        std::fs::write(&f, "module M\nproc Alpha\n  ret\nendproc\nproc Beta\n  ret\nendproc\n").unwrap();
+        let r3 = sync(&roots, &conn).unwrap();
+        assert_eq!((r3.changed, r3.symbols), (1, 2), "edited → re-swept");
+
+        std::fs::remove_file(&f).unwrap();
+        let r4 = sync(&roots, &conn).unwrap();
+        assert_eq!((r4.removed, r4.symbols), (1, 0), "vanished → pruned");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

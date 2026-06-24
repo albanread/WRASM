@@ -282,7 +282,7 @@ impl Kb {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
-            "SELECT name, module, file, line, kind, signature, summary \
+            "SELECT name, module, file, line, kind, signature, summary, source \
                FROM library_symbols WHERE name = ?1 ORDER BY module, file",
         )?;
         let rows = stmt.query_map([name.trim()], |r| {
@@ -294,6 +294,7 @@ impl Kb {
                 kind: r.get(4)?,
                 signature: r.get(5)?,
                 summary: r.get(6)?,
+                source: r.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
