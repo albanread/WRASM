@@ -1,0 +1,453 @@
+; jewels_logic.was — the Columns game logic: rng, spawn, fall/lock, match scan
+; (horizontal + vertical runs of 3+), clear, gravity-collapse, chains, input, and
+; the nano-TCL app verbs that make it scriptable/testable.
+
+.CODE
+
+; ---- RngNext: eax = next pseudo-random (LCG), advances jwSeed ----
+proc RngNext
+    mov     eax, [rip + jwSeed]
+    imul    eax, eax, 1103515245
+    add     eax, 12345
+    mov     [rip + jwSeed], eax
+    shr     eax, 16
+endproc
+
+; ---- RandColour: eax = a random jewel palette index from jwPal[0..3] ----
+proc RandColour uses rbx frame
+    call    RngNext
+    and     eax, 3
+    lea     rbx, [rip + jwPal]
+    movzx   eax, byte ptr [rbx + rax]
+endproc
+
+; ---- ClearGrid: zero the whole well ----
+proc ClearGrid uses rdi
+    lea     rdi, [rip + jwGrid]
+    xor     eax, eax
+    mov     ecx, 72
+    rep     stosb
+endproc
+
+; ---- CellAt(rcx=row, rdx=col): eax = grid[row*COLS+col] ----
+proc CellAt uses rbx in rcx rdx
+    mov     eax, ecx
+    imul    eax, eax, COLS
+    add     eax, edx
+    lea     rbx, [rip + jwGrid]
+    movzx   eax, byte ptr [rbx + rax]
+endproc
+
+; ---- SpawnPiece: drop a new triple at the top-middle; game over if blocked ----
+proc SpawnPiece frame
+    mov     dword ptr [rip + jwPieceCol], 2
+    mov     dword ptr [rip + jwPieceRow], 0
+    mov     dword ptr [rip + jwGrav], 0
+    mov     eax, [rip + jwNext0]
+    test    eax, eax
+    jnz     sp_forced
+    call    RandColour
+    mov     [rip + jwP0], eax
+    call    RandColour
+    mov     [rip + jwP1], eax
+    call    RandColour
+    mov     [rip + jwP2], eax
+    jmp     sp_check
+sp_forced:
+    mov     [rip + jwP0], eax
+    mov     eax, [rip + jwNext1]
+    mov     [rip + jwP1], eax
+    mov     eax, [rip + jwNext2]
+    mov     [rip + jwP2], eax
+    mov     dword ptr [rip + jwNext0], 0     ; one-shot
+sp_check:
+    xor     ecx, ecx                          ; row 0
+    mov     edx, [rip + jwPieceCol]
+    call    CellAt
+    test    eax, eax
+    jz      sp_done
+    mov     dword ptr [rip + jwState], ST_OVER
+sp_done:
+endproc
+
+; ---- CanFall: eax = 1 if the triple can move down one row ----
+proc CanFall frame
+    mov     eax, [rip + jwPieceRow]
+    add     eax, 3                            ; cell just below the bottom jewel
+    cmp     eax, ROWS
+    jge     cf_no
+    mov     ecx, eax
+    mov     edx, [rip + jwPieceCol]
+    call    CellAt
+    test    eax, eax
+    jnz     cf_no
+    mov     eax, 1
+    jmp     cf_done
+cf_no:
+    xor     eax, eax
+cf_done:
+endproc
+
+; ---- LockPiece: write the triple into the grid ----
+proc LockPiece uses rbx
+    lea     rbx, [rip + jwGrid]
+    mov     eax, [rip + jwPieceRow]
+    imul    eax, eax, COLS
+    add     eax, [rip + jwPieceCol]            ; idx of the top jewel
+    mov     ecx, [rip + jwP0]
+    mov     [rbx + rax], cl
+    add     eax, COLS
+    mov     ecx, [rip + jwP1]
+    mov     [rbx + rax], cl
+    add     eax, COLS
+    mov     ecx, [rip + jwP2]
+    mov     [rbx + rax], cl
+endproc
+
+; ---- MovePiece(rcx=dir, -1/+1): slide the column if the 3 target cells are free ----
+proc MovePiece uses rbx rsi rdi frame in rcx
+    mov     esi, [rip + jwPieceCol]
+    add     esi, ecx                          ; newCol
+    cmp     esi, 0
+    jl      mp_done
+    cmp     esi, COLS
+    jge     mp_done
+    mov     edi, [rip + jwPieceRow]
+    mov     ebx, 3
+mp_chk:
+    mov     ecx, edi
+    mov     edx, esi
+    call    CellAt
+    test    eax, eax
+    jnz     mp_done
+    inc     edi
+    dec     ebx
+    jnz     mp_chk
+    mov     [rip + jwPieceCol], esi
+mp_done:
+endproc
+
+; ---- CyclePiece: rotate the triple's colours downward ----
+proc CyclePiece
+    mov     eax, [rip + jwP0]
+    mov     ecx, [rip + jwP1]
+    mov     edx, [rip + jwP2]
+    mov     [rip + jwP0], edx
+    mov     [rip + jwP1], eax
+    mov     [rip + jwP2], ecx
+endproc
+
+; ---- ScanMatches: mark every cell in a horizontal/vertical run of >=3; eax = #marked ----
+proc ScanMatches uses rbx rsi rdi r12 r13 r14 r15
+    lea     rdi, [rip + jwMarked]
+    xor     eax, eax
+    mov     ecx, 72
+    rep     stosb
+    lea     rbx, [rip + jwGrid]
+    lea     r15, [rip + jwMarked]
+    xor     r12d, r12d                         ; row
+sm_row:
+    cmp     r12d, ROWS
+    jge     sm_rows_done
+    xor     r13d, r13d                         ; col
+sm_col:
+    cmp     r13d, COLS
+    jge     sm_col_done
+    mov     eax, r12d
+    imul    eax, eax, COLS
+    add     eax, r13d
+    mov     r14d, eax                          ; idx
+    movzx   esi, byte ptr [rbx + r14]          ; colour
+    test    esi, esi
+    jz      sm_next
+    ; ---- horizontal run (only count from the start of a run) ----
+    test    r13d, r13d
+    jz      sm_h_start
+    mov     eax, r14d
+    dec     eax
+    movzx   eax, byte ptr [rbx + rax]         ; cell to the left
+    cmp     eax, esi
+    je      sm_v
+sm_h_start:
+    xor     r10d, r10d                         ; run length
+    mov     r11d, r13d                         ; cc
+    mov     ecx, r14d                          ; ii
+sm_h_count:
+    cmp     r11d, COLS
+    jge     sm_h_eval
+    movzx   eax, byte ptr [rbx + rcx]
+    cmp     eax, esi
+    jne     sm_h_eval
+    inc     r10d
+    inc     r11d
+    inc     ecx
+    jmp     sm_h_count
+sm_h_eval:
+    cmp     r10d, 3
+    jl      sm_v
+    mov     ecx, r14d
+    mov     r11d, r10d
+sm_h_mark:
+    mov     byte ptr [r15 + rcx], 1
+    inc     ecx
+    dec     r11d
+    jnz     sm_h_mark
+    ; ---- vertical run ----
+sm_v:
+    test    r12d, r12d
+    jz      sm_v_start
+    mov     eax, r14d
+    sub     eax, COLS
+    movzx   eax, byte ptr [rbx + rax]
+    cmp     eax, esi
+    je      sm_next
+sm_v_start:
+    xor     r10d, r10d
+    mov     r11d, r12d                         ; rr
+    mov     ecx, r14d
+sm_v_count:
+    cmp     r11d, ROWS
+    jge     sm_v_eval
+    movzx   eax, byte ptr [rbx + rcx]
+    cmp     eax, esi
+    jne     sm_v_eval
+    inc     r10d
+    inc     r11d
+    add     ecx, COLS
+    jmp     sm_v_count
+sm_v_eval:
+    cmp     r10d, 3
+    jl      sm_next
+    mov     ecx, r14d
+    mov     r11d, r10d
+sm_v_mark:
+    mov     byte ptr [r15 + rcx], 1
+    add     ecx, COLS
+    dec     r11d
+    jnz     sm_v_mark
+sm_next:
+    inc     r13d
+    jmp     sm_col
+sm_col_done:
+    inc     r12d
+    jmp     sm_row
+sm_rows_done:
+    xor     eax, eax
+    xor     edx, edx
+    mov     ecx, 72
+sm_cnt:
+    movzx   r8d, byte ptr [r15 + rdx]
+    add     eax, r8d
+    inc     edx
+    dec     ecx
+    jnz     sm_cnt
+endproc
+
+; ---- ClearMarked: zero every marked grid cell; eax = #cleared ----
+proc ClearMarked uses rbx rsi rdi
+    lea     rbx, [rip + jwGrid]
+    lea     rsi, [rip + jwMarked]
+    xor     eax, eax
+    xor     edi, edi
+cm_l:
+    cmp     edi, 72
+    jge     cm_done
+    movzx   ecx, byte ptr [rsi + rdi]
+    test    ecx, ecx
+    jz      cm_skip
+    mov     byte ptr [rbx + rdi], 0
+    inc     eax
+cm_skip:
+    inc     edi
+    jmp     cm_l
+cm_done:
+endproc
+
+; ---- Collapse: per column, compact non-empty cells down to the floor ----
+proc Collapse uses rbx rsi r12 r13
+    lea     rbx, [rip + jwGrid]
+    xor     r12d, r12d                         ; col
+co_col:
+    cmp     r12d, COLS
+    jge     co_done
+    mov     r13d, ROWSM1                       ; write row (bottom up)
+    mov     esi, ROWSM1                        ; read row
+co_scan:
+    cmp     esi, 0
+    jl      co_fill
+    mov     eax, esi
+    imul    eax, eax, COLS
+    add     eax, r12d
+    movzx   ecx, byte ptr [rbx + rax]
+    test    ecx, ecx
+    jz      co_rdec
+    mov     edx, r13d
+    imul    edx, edx, COLS
+    add     edx, r12d
+    mov     byte ptr [rbx + rdx], cl
+    dec     r13d
+co_rdec:
+    dec     esi
+    jmp     co_scan
+co_fill:
+    cmp     r13d, 0
+    jl      co_nextcol
+    mov     edx, r13d
+    imul    edx, edx, COLS
+    add     edx, r12d
+    mov     byte ptr [rbx + rdx], 0
+    dec     r13d
+    jmp     co_fill
+co_nextcol:
+    inc     r12d
+    jmp     co_col
+co_done:
+endproc
+
+; ---- ResolveMatches: clear/score/collapse, repeating for chains ----
+proc ResolveMatches uses rbx frame
+rm_loop:
+    call    ScanMatches
+    test    eax, eax
+    jz      rm_done
+    mov     ebx, eax
+    imul    ebx, ebx, 10
+    add     [rip + jwScore], ebx
+    add     [rip + jwClears], eax
+    call    ClearMarked
+    call    Collapse
+    jmp     rm_loop
+rm_done:
+endproc
+
+; ---- ReadInput: edge-triggered left/right/cycle from the action layer ----
+proc ReadInput frame
+    mov     ecx, ACT_LEFT
+    call    ActionHit
+    test    eax, eax
+    jz      ri_r
+    mov     ecx, -1
+    call    MovePiece
+ri_r:
+    mov     ecx, ACT_RIGHT
+    call    ActionHit
+    test    eax, eax
+    jz      ri_u
+    mov     ecx, 1
+    call    MovePiece
+ri_u:
+    mov     ecx, ACT_UP
+    call    ActionHit
+    test    eax, eax
+    jz      ri_done
+    call    CyclePiece
+ri_done:
+endproc
+
+; ---- GravityStep: tick the fall timer; fall, or lock+resolve+spawn ----
+proc GravityStep uses rbx frame
+    inc     dword ptr [rip + jwGrav]
+    mov     ebx, GRAV1
+    mov     ecx, ACT_DOWN
+    call    Action
+    test    eax, eax
+    jz      gv_thresh
+    mov     ebx, GRAVFAST
+gv_thresh:
+    mov     eax, [rip + jwGrav]
+    cmp     eax, ebx
+    jl      gv_done
+    mov     dword ptr [rip + jwGrav], 0
+    call    CanFall
+    test    eax, eax
+    jz      gv_lock
+    inc     dword ptr [rip + jwPieceRow]
+    jmp     gv_done
+gv_lock:
+    call    LockPiece
+    call    ResolveMatches
+    call    SpawnPiece
+gv_done:
+endproc
+
+; ---- ExposeState: publish state into the introspector ping (TclReg slots) ----
+proc ExposeState frame
+    xor     ecx, ecx
+    mov     edx, [rip + jwScore]
+    call    TclReg
+    mov     ecx, 1
+    mov     edx, [rip + jwState]
+    call    TclReg
+    mov     ecx, 2
+    mov     edx, [rip + jwPieceCol]
+    call    TclReg
+    mov     ecx, 3
+    mov     edx, [rip + jwPieceRow]
+    call    TclReg
+    mov     ecx, 4
+    mov     edx, [rip + jwClears]
+    call    TclReg
+endproc
+
+; ---- AdvanceFrame: one frame of game logic ----
+proc AdvanceFrame frame
+    cmp     dword ptr [rip + jwState], ST_FALL
+    jne     af_expose
+    call    ReadInput
+    call    GravityStep
+af_expose:
+    call    ExposeState
+endproc
+
+; ============================================================================
+; nano-TCL app verbs (registered in GameInit) — make the game scriptable/testable
+; ============================================================================
+
+; setpiece rcx=c0, rdx=c1, r8=c2 — force the CURRENT falling triple's colours
+proc SetPieceVerb in rcx rdx r8
+    mov     [rip + jwP0], ecx
+    mov     [rip + jwP1], edx
+    mov     [rip + jwP2], r8d
+endproc
+
+; left / right — slide the piece one column (the parser has no minus sign, so
+; these are nullary verbs rather than `move rcx=-1`)
+proc LeftVerb frame
+    mov     ecx, -1
+    call    MovePiece
+endproc
+proc RightVerb frame
+    mov     ecx, 1
+    call    MovePiece
+endproc
+
+; drop — fall the piece to rest, lock, resolve matches, spawn the next
+proc DropVerb frame
+    cmp     dword ptr [rip + jwState], ST_FALL
+    jne     dv_done
+dv_fall:
+    call    CanFall
+    test    eax, eax
+    jz      dv_land
+    inc     dword ptr [rip + jwPieceRow]
+    jmp     dv_fall
+dv_land:
+    call    LockPiece
+    call    ResolveMatches
+    call    SpawnPiece
+dv_done:
+endproc
+
+; step — advance exactly one frame of logic (handy when the game is paced by hand)
+proc StepVerb frame
+    call    AdvanceFrame
+endproc
+
+; newgame — reset the board and score
+proc NewGameVerb frame
+    call    ClearGrid
+    mov     dword ptr [rip + jwScore], 0
+    mov     dword ptr [rip + jwClears], 0
+    mov     dword ptr [rip + jwState], ST_FALL
+    call    SpawnPiece
+endproc

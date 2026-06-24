@@ -108,6 +108,30 @@ fn build_registry(pipe: Arc<Mutex<Pipe>>, failed: Arc<AtomicBool>) -> Registry {
         }
         Ok(Value::new(if truthy { "1" } else { "0" }))
     });
+    // `send <line…>` — forward a raw verb line to the game. Generic: drives ANY
+    // app's verbs (setpiece, drop, …) with no hardcoding in this tool.
+    let p = pipe.clone();
+    r.register("send", Arity::at_least(1), move |_, args: &[Value]| {
+        let line = args.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(" ");
+        p.lock().unwrap().send(&line);
+        Ok(Value::new(""))
+    });
+    // `regs` — take ONE frame-sync snapshot and return the 16 shadow registers as
+    // a TCL list (decimal). Lets a script read game state a game published via
+    // TclReg: `set s [regs]; lindex $s 0`. Order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15.
+    let p = pipe.clone();
+    r.register("regs", Arity::at_least(0), move |_, _args: &[Value]| {
+        let pp = p.lock().unwrap();
+        pp.send("intro rcx=1");
+        let mut buf = [0u8; 1024];
+        let n = pp.recv(&mut buf);
+        let line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+        pp.send("free");
+        drop(pp);
+        let regs = parse_ping(&line).unwrap_or([0i32; 16]);
+        let s = regs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+        Ok(Value::new(s))
+    });
     r
 }
 

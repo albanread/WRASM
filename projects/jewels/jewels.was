@@ -1,0 +1,33 @@
+; jewels.was — RASM Jewels: a small Columns-style puzzle (level 1).
+;
+;   was projects\jewels\jewels.was -o projects\jewels\jewels.exe
+;
+; Drop a falling triple of jewels into the 6x12 well; line up 3+ of one colour
+; horizontally or vertically to clear them; the stack collapses and chains score
+; more. Controls: LEFT/RIGHT move, UP cycles the triple's colours, DOWN soft-drops.
+;
+; Built on the CPU GamesCanvas library and wired for nano-TCL: a dev build opens
+; \\.\pipe\nanotcl so a script can SimAction-drive input, or use the game's own
+; verbs (setpiece / move / drop / step / newgame) to test deterministically.
+
+; ---- nano-TCL: dev channel + the verb subsystems this game uses ----
+NANOTCL_LIVE   equ 1
+NTV_canvas     equ 1
+NTV_input      equ 1
+NTV_introspect equ 1
+
+; ---- the CPU GamesCanvas library (harness LAST; then the nano-TCL executor) ----
+.include "../../library/canvas.was"
+.include "../../library/blit.was"
+.include "../../library/sprite.was"
+.include "../../library/input.was"
+.include "../../library/harness.was"
+.include "../../library/introspect.was"
+.include "../../library/tcl/tcl.was"
+.include "../../library/tcl/stdverbs.was"
+
+; ---- the game (data first, then logic/draw, then main + callbacks) ----
+.include "jewels_data.inc"
+.include "jewels_logic.was"
+.include "jewels_draw.was"
+.include "jewels_main.was"

@@ -1,0 +1,116 @@
+; jewels_draw.was — render the well, the settled jewels, the falling triple, score.
+
+.CODE
+
+; ---- DrawJewel(rcx=col, rdx=row, r8b=colour): a filled disc centred in its cell ----
+proc DrawJewel uses rbx rsi rdi frame in rcx rdx r8
+    movzx   edi, r8b                          ; colour (save before clobbering r8)
+    mov     eax, ecx
+    imul    eax, eax, CELL
+    add     eax, JCXOFF
+    mov     ebx, eax                          ; centre x
+    mov     eax, edx
+    imul    eax, eax, CELL
+    add     eax, JCYOFF
+    mov     esi, eax                          ; centre y
+    mov     ecx, ebx
+    mov     edx, esi
+    mov     r8d, JEWR
+    mov     r9d, edi
+    call    Disc
+endproc
+
+; ---- IntToStr5(rcx=value, rdx=ptr): 5 zero-padded decimal digits ----
+proc IntToStr5 uses rbx rdi in rcx rdx
+    mov     eax, ecx
+    mov     rdi, rdx
+    add     rdi, 4                            ; fill from the last digit back
+    mov     ebx, 10
+    mov     ecx, 5
+its_loop:
+    xor     edx, edx
+    div     ebx                               ; eax/10 -> eax, rem -> edx
+    add     dl, '0'
+    mov     [rdi], dl
+    dec     rdi
+    dec     ecx
+    jnz     its_loop
+endproc
+
+; ---- DrawScore: format jwScore into the label, then draw it top-left ----
+proc DrawScore frame
+    mov     ecx, [rip + jwScore]
+    lea     rdx, [rip + jwScoreStr + 6]       ; digits begin after "SCORE "
+    call    IntToStr5
+    mov     ecx, 8
+    mov     edx, 4
+    mov     r8b, PAL_TEXT
+    lea     r9, [rip + jwScoreStr]
+    call    Text
+endproc
+
+; ---- DrawBoard: clear, draw the well + border, all jewels, the piece, the score ----
+proc DrawBoard uses rbx rsi r12 r13 frame
+    mov     cl, PAL_BG
+    call    Cls
+    mov     ecx, WELLX
+    mov     edx, WELLY
+    mov     r8d, WELLW
+    mov     r9d, WELLH
+    mov     r10b, PAL_WELL
+    call    FillRect
+    mov     ecx, WELLBX
+    mov     edx, WELLBY
+    mov     r8d, WELLBW
+    mov     r9d, WELLBH
+    mov     r10b, PAL_BORD
+    call    Rect
+    ; settled jewels
+    lea     rbx, [rip + jwGrid]
+    xor     r12d, r12d                         ; row
+db_row:
+    cmp     r12d, ROWS
+    jge     db_rows_done
+    xor     r13d, r13d                         ; col
+db_col:
+    cmp     r13d, COLS
+    jge     db_col_done
+    mov     eax, r12d
+    imul    eax, eax, COLS
+    add     eax, r13d
+    movzx   esi, byte ptr [rbx + rax]
+    test    esi, esi
+    jz      db_skip
+    mov     ecx, r13d
+    mov     edx, r12d
+    mov     r8d, esi
+    call    DrawJewel
+db_skip:
+    inc     r13d
+    jmp     db_col
+db_col_done:
+    inc     r12d
+    jmp     db_row
+db_rows_done:
+    ; the falling triple
+    cmp     dword ptr [rip + jwState], ST_FALL
+    jne     db_score
+    mov     r13d, [rip + jwPieceCol]
+    mov     r12d, [rip + jwPieceRow]
+    mov     ecx, r13d
+    mov     edx, r12d
+    mov     r8d, [rip + jwP0]
+    call    DrawJewel
+    mov     ecx, r13d
+    mov     edx, r12d
+    inc     edx
+    mov     r8d, [rip + jwP1]
+    call    DrawJewel
+    mov     ecx, r13d
+    mov     edx, r12d
+    add     edx, 2
+    mov     r8d, [rip + jwP2]
+    call    DrawJewel
+db_score:
+    call    DrawScore
+endproc

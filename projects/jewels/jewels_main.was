@@ -1,0 +1,63 @@
+; jewels_main.was — entry point + the three harness callbacks + nano-TCL wiring.
+
+.DATA
+.balign 16
+jwTitle    WCHAR "RASM Jewels", 0
+vnSetPiece BYTE "setpiece", 0
+vnLeft     BYTE "left", 0
+vnRight    BYTE "right", 0
+vnDrop     BYTE "drop", 0
+vnStep     BYTE "step", 0
+vnNew      BYTE "newgame", 0
+.balign 16
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + jwTitle]
+    lea     rdx, [rip + GameInit]
+    lea     r8,  [rip + GameStep]
+    lea     r9,  [rip + GameSprites]
+    call    GameStart                  ; create the window, call GameInit
+    call    GameLoop                   ; run the frame loop until quit
+    invoke  ExitProcess, 0
+
+; ---- GameInit: seed the board, spawn the first piece, open the nano-TCL channel ----
+GameInit:
+    call    SeedLinePalette            ; per-line palette = the global CGA-16
+    call    ClearGrid
+    mov     dword ptr [rip + jwState], ST_FALL
+    call    SpawnPiece
+    call    TclInit                    ; control verbs (intro/free/cont)
+    call    TclStdVerbs                ; documented canvas/input/introspect verbs
+    lea     rcx, [rip + vnSetPiece]    ; the game's OWN verbs (deterministic testing)
+    lea     rdx, [rip + SetPieceVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnLeft]
+    lea     rdx, [rip + LeftVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnRight]
+    lea     rdx, [rip + RightVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnDrop]
+    lea     rdx, [rip + DropVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnStep]
+    lea     rdx, [rip + StepVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnNew]
+    lea     rdx, [rip + NewGameVerb]
+    call    TclAddVerb
+    call    TclChannelInit             ; \\.\pipe\nanotcl + reader thread (dev build)
+    ret
+
+; ---- GameStep: drain a live command, advance the logic, draw the frame ----
+GameStep:
+    call    TclPoll
+    call    AdvanceFrame
+    call    DrawBoard
+    ret
+
+; ---- GameSprites: nothing layered over the framebuffer ----
+GameSprites:
+    ret
