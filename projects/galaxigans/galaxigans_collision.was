@@ -57,4 +57,52 @@ col_bnext:
     jnz     col_b
 endproc
 
+; ---- CheckPlayerHit: any DIVING enemy overlapping the ship kills the player (and the
+;      diver). Player AABB is [playerX..+8] x [PLAYER_Y..+8]. No-op while already dead. ----
+proc CheckPlayerHit uses rbx rdi frame
+    cmp     dword ptr [rip + pAlive], 0
+    je      cph_done
+    mov     r8d, [rip + playerX]             ; player x (kept across the loop; BurstAt exits after a hit)
+    lea     rdi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+cph_e:
+    cmp     dword ptr [rdi + EN_ALIVE], 0
+    je      cph_next
+    cmp     dword ptr [rdi + EN_STATE], ST_DIVE
+    jne     cph_next
+    mov     eax, [rdi + EN_X]                ; x overlap: ex < px+8 && ex+8 > px
+    mov     ecx, r8d
+    add     ecx, 8
+    cmp     eax, ecx
+    jge     cph_next
+    mov     ecx, eax
+    add     ecx, 8
+    cmp     ecx, r8d
+    jle     cph_next
+    mov     eax, [rdi + EN_Y]                ; y overlap: ey < PLAYER_Y+8 && ey+8 > PLAYER_Y
+    cmp     eax, PLAYER_Y + 8
+    jge     cph_next
+    mov     ecx, eax
+    add     ecx, 8
+    cmp     ecx, PLAYER_Y
+    jle     cph_next
+    ; collision — both explode
+    mov     ecx, [rdi + EN_X]
+    mov     edx, [rdi + EN_Y]
+    call    BurstAt
+    mov     dword ptr [rdi + EN_ALIVE], 0
+    mov     ecx, [rip + playerX]
+    mov     edx, PLAYER_Y
+    call    BurstAt
+    mov     dword ptr [rip + pAlive], 0
+    mov     dword ptr [rip + pDeathT], RESPAWN_FRAMES
+    dec     dword ptr [rip + lives]
+    jmp     cph_done                         ; one death per frame
+cph_next:
+    add     rdi, ENEMY_STRIDE
+    dec     ebx
+    jnz     cph_e
+cph_done:
+endproc
+
 endmodule

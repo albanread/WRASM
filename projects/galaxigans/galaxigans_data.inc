@@ -36,6 +36,7 @@ BULLET_MAX     equ 4
 BULLET_STRIDE  equ 12                        ; { x:i32, y:i32, active:i32 }
 BULLET_DY      equ 7                         ; pixels/frame up
 FIRE_COOLDOWN  equ 8                         ; frames between shots
+RESPAWN_FRAMES equ 90                        ; death pause before the ship comes back
 
 ; ---- sprite palette slot + colour indices (one shared 16-colour bank) ----
 PAL_SLOT       equ 0
@@ -53,8 +54,12 @@ titleW     WCHAR "RASM — Galaxigans", 0
 ; player
 playerX    DWORD 312                         ; ship x (top-left), centred-ish
 fireCool   DWORD 0                           ; frames until next shot allowed
+pAlive     DWORD 1                           ; 0 while exploding/respawning
+pDeathT    DWORD 0                           ; respawn countdown while dead
+lives      DWORD 3
 score      DWORD 0
 scoreStr   BYTE  "SCORE 000000", 0
+livesStr   BYTE  "LIVES 3", 0
 
 ; formation sway + dive scheduling
 formX      DWORD 0                           ; horizontal sway offset

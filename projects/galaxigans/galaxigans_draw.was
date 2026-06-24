@@ -22,6 +22,8 @@ endproc
 ; ---- DrawScene: queue the player, every alive enemy (x + sway), every live bullet.
 ;      SprPush takes float screen coords in xmm1/xmm2 and alpha in xmm3. ----
 proc DrawScene uses rbx rsi frame
+    cmp     dword ptr [rip + pAlive], 0
+    je      dsc_fleet                        ; dead -> hide the ship (it's exploding)
     mov     ecx, [rip + fPlayer]
     cvtsi2ss xmm1, dword ptr [rip + playerX]
     mov     eax, PLAYER_Y
@@ -29,7 +31,7 @@ proc DrawScene uses rbx rsi frame
     mov     r8d, PAL_SLOT
     movss   xmm3, [rip + fOne]
     call    SprPush
-
+dsc_fleet:
     lea     rsi, [rip + enemies]
     mov     ebx, ENEMY_MAX
 dsc_e:

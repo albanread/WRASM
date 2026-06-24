@@ -41,6 +41,7 @@ GameStep:
     call    PlayerStep
     call    BulletsStep
     call    FormationStep
+    call    CheckPlayerHit                   ; divers reaching the ship
     call    Collide
     call    PtUpdate                         ; advance explosion debris
     call    FormatScore                      ; refresh the HUD digits from `score`
@@ -50,6 +51,15 @@ GameStep:
     mov     ecx, 8
     mov     edx, 8
     lea     r8, [rip + scoreStr]
+    call    DrawText
+    mov     eax, [rip + lives]               ; lives HUD (top-right, green)
+    add     al, '0'
+    mov     byte ptr [rip + livesStr + 6], al
+    mov     ecx, 0x0040FF40
+    call    TxtSetColour
+    mov     ecx, 560
+    mov     edx, 8
+    lea     r8, [rip + livesStr]
     call    DrawText
     add     rsp, 40
     ret

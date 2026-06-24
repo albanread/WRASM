@@ -3,8 +3,23 @@
 module Galaxigans
 .CODE
 
-; ---- PlayerStep: LEFT/RIGHT move (clamped), tap-to-fire with a cooldown ----
+; ---- PlayerStep: while dead, run the respawn countdown; while alive, LEFT/RIGHT move
+;      (clamped) + tap-to-fire with a cooldown. ----
 proc PlayerStep uses rbx frame
+    cmp     dword ptr [rip + pAlive], 0
+    jne     ps_alive
+    dec     dword ptr [rip + pDeathT]         ; exploding -> count down to respawn
+    jg      ps_done
+    cmp     dword ptr [rip + lives], 0        ; out of lives -> full restart
+    jg      ps_respawn
+    call    ResetGame
+    jmp     ps_done
+ps_respawn:
+    mov     dword ptr [rip + pAlive], 1
+    mov     dword ptr [rip + playerX], 312
+    mov     dword ptr [rip + fireCool], 0
+    jmp     ps_done
+ps_alive:
     mov     ecx, ACT_LEFT
     call    Action
     test    eax, eax
