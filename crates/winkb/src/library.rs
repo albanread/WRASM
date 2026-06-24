@@ -302,21 +302,36 @@ pub fn sync(roots: &[PathBuf], conn: &Connection) -> rusqlite::Result<SyncReport
         report.changed += 1;
     }
 
-    // Prune files that are indexed but no longer on disk.
-    let stale: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT path FROM library_files")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.filter_map(Result::ok).filter(|p| !seen.contains(p)).collect()
-    };
-    for p in &stale {
-        tx.execute("DELETE FROM library_symbols WHERE file=?1", [p])?;
-        tx.execute("DELETE FROM library_files WHERE path=?1", [p])?;
-        report.removed += 1;
+    // Prune files that are indexed but no longer on disk — but ONLY when at least
+    // one root directory actually exists. If none do (a wrong CWD, or `$WRASMLIB`
+    // unset so the relative `library`/`gpu` don't resolve), `seen` is empty for the
+    // wrong reason and pruning would wipe a perfectly good index. Skip it.
+    if roots.iter().any(|r| r.exists()) {
+        let stale: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT path FROM library_files")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(Result::ok).filter(|p| !seen.contains(p)).collect()
+        };
+        for p in &stale {
+            tx.execute("DELETE FROM library_symbols WHERE file=?1", [p])?;
+            tx.execute("DELETE FROM library_files WHERE path=?1", [p])?;
+            report.removed += 1;
+        }
     }
 
     report.symbols = tx.query_row("SELECT COUNT(*) FROM library_symbols", [], |r| r.get::<_, i64>(0))? as usize;
     tx.commit()?;
     Ok(report)
+}
+
+/// Open `db_path` writable and [`sync`] it — the entry point for callers (like
+/// studio's watcher thread) that shouldn't depend on rusqlite directly.
+pub fn sync_db(db_path: &str, roots: &[PathBuf]) -> rusqlite::Result<SyncReport> {
+    let conn = Connection::open(db_path)?;
+    // Wait out a brief writer (e.g. the import_library CLI) instead of failing the
+    // whole tick with SQLITE_BUSY the instant the WAL write lock is contended.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    sync(roots, &conn)
 }
 
 /// Replace one file's symbols with a fresh sweep.
@@ -478,6 +493,25 @@ mov dword ptr [rip + x], 1   ; outside any module — ignored
         std::fs::remove_file(&f).unwrap();
         let r4 = sync(&roots, &conn).unwrap();
         assert_eq!((r4.removed, r4.symbols), (1, 0), "vanished → pruned");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_does_not_prune_when_no_root_exists() {
+        // A wrong CWD / unset $WRASMLIB must NOT be mistaken for "every file deleted".
+        let dir = std::env::temp_dir().join(format!("winkb_prune_{}", std::process::id()));
+        let lib = dir.join("library");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("m.was"), "module M\nproc Pub\n  ret\nendproc\n").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(sync(&[lib.clone()], &conn).unwrap().symbols, 1, "populated");
+
+        // Sync against a root that doesn't exist → the index must survive intact.
+        let r = sync(&[dir.join("nonexistent")], &conn).unwrap();
+        assert_eq!((r.removed, r.symbols), (0, 1), "absent roots preserve the index");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

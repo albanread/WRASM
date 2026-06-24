@@ -37,6 +37,10 @@ fn main() -> anyhow::Result<()> {
 mod gui {
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use windows::core::{w, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -79,7 +83,8 @@ mod gui {
         HTCLIENT, IDC_ARROW, IDC_SIZENS, IDC_SIZEWE, MSG, SW_SHOW, WINDOW_EX_STYLE, WM_CHAR,
         WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER,
-        WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        WM_ACTIVATEAPP, WNDCLASSEXW, WNDCLASS_STYLES, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
+        WS_VISIBLE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateMenu, CreatePopupMenu, DeleteMenu, DrawMenuBar, GetMenuItemCount,
@@ -544,6 +549,12 @@ main:
         fbar_on_replace: bool,
         /// The seeded needle is "selected": the first keystroke replaces it.
         fbar_fresh: bool,
+
+        /// Set by the library-index watcher thread when the index changed, so the
+        /// next UI poll refreshes an open card. `watch_tx` nudges the watcher
+        /// (focus → sync now; drop → Stop). The watcher runs detached.
+        lib_dirty: Arc<AtomicBool>,
+        watch_tx: Option<Sender<WatchMsg>>,
     }
 
     /// Pixel rects of the find-bar widgets, shared by drawing + hit-testing.
@@ -562,6 +573,56 @@ main:
     /// Point-in-rect test for `(x, y, w, h)`.
     fn in_rect(r: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
         x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
+    }
+
+    /// A nudge from the UI thread to the library-index watcher.
+    enum WatchMsg {
+        /// Sync now (the window just regained focus).
+        Wake,
+        /// Exit the thread.
+        Stop,
+    }
+
+    /// Spawn the background library-index watcher. It syncs the `library_symbols`
+    /// table once immediately, then again on each `Wake` (focus) or every `POLL`,
+    /// whichever comes first — setting `dirty` only when the index actually
+    /// changed, so the UI can refresh an open card. Exits on `Stop` or when the
+    /// sender drops. winkb owns the writable connection (studio has no rusqlite);
+    /// WAL lets the read-only Kb keep querying while this writes.
+    fn spawn_library_watcher(db: String, dirty: Arc<AtomicBool>) -> std::io::Result<Sender<WatchMsg>> {
+        const POLL: Duration = Duration::from_secs(30);
+        let (tx, rx) = mpsc::channel::<WatchMsg>();
+        // The JoinHandle is dropped (the thread detaches): we never join — see
+        // `impl Drop for App`. The closure captures only owned 'static data.
+        std::thread::Builder::new()
+            .name("studio-libwatch".into())
+            .spawn(move || {
+                let roots = winkb::library::default_roots();
+                loop {
+                    match winkb::library::sync_db(&db, &roots) {
+                        Ok(report) if report.is_dirty() => dirty.store(true, Ordering::Relaxed),
+                        _ => {} // unchanged, or db busy/missing — retry next tick
+                    }
+                    match rx.recv_timeout(POLL) {
+                        Ok(WatchMsg::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                        Ok(WatchMsg::Wake) | Err(RecvTimeoutError::Timeout) => continue,
+                    }
+                }
+            })?;
+        Ok(tx)
+    }
+
+    impl Drop for App {
+        fn drop(&mut self) {
+            // Detach the watcher rather than join it on the UI thread: a mid-sweep
+            // join would freeze window-close. It captures only owned data (a String
+            // + an Arc), so it is safe to outlive us; Stop wakes it from its wait,
+            // and an interrupted WAL write rolls back cleanly. The JoinHandle drops
+            // here, detaching the thread.
+            if let Some(tx) = self.watch_tx.take() {
+                let _ = tx.send(WatchMsg::Stop);
+            }
+        }
     }
 
     impl App {
@@ -630,6 +691,8 @@ main:
                 fbar_idx: 0,
                 fbar_on_replace: false,
                 fbar_fresh: false,
+                lib_dirty: Arc::new(AtomicBool::new(false)),
+                watch_tx: None,
             };
             unsafe { app.build_menu() };
             app.update_title();
@@ -650,6 +713,22 @@ main:
         }
         fn invalidate(&self) {
             let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        }
+
+        /// Spawn the library-index watcher (windowed mode only — not `--script`).
+        /// A spawn failure soft-degrades: the IDE runs without live re-indexing.
+        fn start_library_watcher(&mut self, db: String) {
+            match spawn_library_watcher(db, self.lib_dirty.clone()) {
+                Ok(tx) => self.watch_tx = Some(tx),
+                Err(e) => self.notice = format!("library watcher disabled: {e}"),
+            }
+        }
+
+        /// Tell the watcher to sync now (the window regained focus).
+        fn wake_library_watcher(&self) {
+            if let Some(tx) = &self.watch_tx {
+                let _ = tx.send(WatchMsg::Wake);
+            }
         }
 
         // ── splitter geometry (single source of truth for pane bounds) ───────
@@ -908,6 +987,15 @@ main:
                     }
                     _ => {} // a superseded reply, or one for a sync call() already taken
                 }
+            }
+            // The watcher re-indexed the library: refresh an open card so a peek
+            // reflects it. Clear card_word to force a re-card though the caret
+            // didn't move, then reuse after_caret() — it is search-box-guarded and
+            // posts the card request ASYNC, so it never blocks this UI timer tick.
+            if self.lib_dirty.swap(false, Ordering::Relaxed) {
+                self.card_word.clear();
+                self.after_caret();
+                self.invalidate();
             }
         }
 
@@ -3070,6 +3158,23 @@ main:
             Ok(Value::new(with_app(|app| app.fbar_needle.clone())))
         });
         r.register("notice", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.notice.clone()))));
+        r.register("card-has", Arity::exact(1), |_, a| {
+            let needle = a[0].as_str().to_string();
+            Ok(boolstr(with_app(|app| app.card_md.contains(&needle))))
+        });
+        // Simulate one watcher tick: sync the index, then drive the same
+        // dirty -> poll_lang -> refresh_card path the live watcher uses.
+        r.register("lib-sync-tick", Arity::exact(0), |_, _| {
+            let db = std::env::var("WINKB_DB").unwrap_or_else(|_| r"E:\windows_api\windows_api.db".to_string());
+            let roots = winkb::library::default_roots();
+            let report = winkb::library::sync_db(&db, &roots)
+                .map_err(|e| TclError::runtime(format!("sync_db: {e}")))?;
+            with_app(|app| {
+                app.lib_dirty.store(true, Ordering::Relaxed);
+                app.poll_lang();
+            });
+            Ok(Value::new(format!("changed={} symbols={}", report.changed, report.symbols)))
+        });
         r.register("card-md", Arity::exact(0), |_, _| Ok(Value::new(with_app(|app| app.card_md.clone()))));
         r.register("split-frac", Arity::exact(0), |_, _| {
             Ok(Value::new(with_app(|app| format!("{:.4}", app.split_frac))))
@@ -3330,6 +3435,15 @@ TCL UI SCRIPTING (--script / --exec)
         // Poll the language thread ~30×/s to apply async replies.
         let _ = unsafe { SetTimer(Some(hwnd), 1, 33, None) };
 
+        // Start the library-index watcher now the window (and its App) exist — but
+        // only when the knowledge DB is usable (lang started). In editor-only mode
+        // there's nothing to index, and a writable open would fabricate an empty
+        // phantom DB diverging from the read side.
+        let app_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+        if !app_ptr.is_null() && unsafe { (*app_ptr).lang.is_some() } {
+            unsafe { (*app_ptr).start_library_watcher(db) };
+        }
+
         let mut msg = MSG::default();
         unsafe {
             loop {
@@ -3380,6 +3494,12 @@ TCL UI SCRIPTING (--script / --exec)
         match msg {
             WM_TIMER => {
                 app.poll_lang();
+                LRESULT(0)
+            }
+            WM_ACTIVATEAPP => {
+                if wparam.0 != 0 {
+                    app.wake_library_watcher(); // regained focus → re-sync the library now
+                }
                 LRESULT(0)
             }
             WM_COMMAND => {
