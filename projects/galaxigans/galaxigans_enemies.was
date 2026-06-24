@@ -58,6 +58,12 @@ rg_col:
     mov     dword ptr [rdi + EN_STATE], ST_FORM
     mov     dword ptr [rdi + EN_VX], 0
     mov     dword ptr [rdi + EN_DT], 0
+    mov     eax, ebx                          ; stagger the flap phase by col*7 + row*5
+    imul    eax, eax, 7
+    mov     ecx, esi
+    imul    ecx, ecx, 5
+    add     eax, ecx
+    mov     [rdi + EN_ANIM], eax
     add     rdi, ENEMY_STRIDE
     inc     ebx
     cmp     ebx, ENEMY_COLS
@@ -98,6 +104,7 @@ fs_walk:
 fs_e:
     cmp     dword ptr [rdi + EN_ALIVE], 0
     je      fs_enext
+    inc     dword ptr [rdi + EN_ANIM]         ; advance the wing-flap
     cmp     dword ptr [rdi + EN_STATE], ST_DIVE
     je      fs_dive
     ; --- formation: live pos = home + sway ---

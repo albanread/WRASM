@@ -12,7 +12,7 @@ PLAYER_Y       equ 330                       ; ship sits near the bottom
 ENEMY_COLS     equ 8
 ENEMY_ROWS     equ 4
 ENEMY_MAX      equ 32                        ; COLS*ROWS
-ENEMY_STRIDE   equ 32                        ; 8 i32 fields (see EN_* below)
+ENEMY_STRIDE   equ 36                        ; 9 i32 fields (see EN_* below)
 EN_X           equ 0                         ; live SCREEN x (sway already folded in)
 EN_Y           equ 4                         ; live SCREEN y
 EN_ALIVE       equ 8
@@ -21,6 +21,7 @@ EN_HX          equ 16                        ; home slot x (pre-sway)
 EN_HY          equ 20                        ; home slot y
 EN_VX          equ 24                        ; peel velocity during the early dive
 EN_DT          equ 28                        ; dive step counter
+EN_ANIM        equ 32                        ; wing-flap phase counter
 ST_FORM        equ 0
 ST_DIVE        equ 1
 ENEMY_W        equ 16                        ; the new 16x16 shaded aliens (was 8x8)
@@ -79,13 +80,14 @@ diveScan   DWORD 0                            ; rotating start index for picking
 bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
-enemies    BYTE  1024 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (32*32)
+enemies    BYTE  1152 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (32*36)
 bullets    BYTE  48  dup(0)                   ; BULLET_MAX * BULLET_STRIDE
 bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
 
 ; sprite frame ids (set by BuildSprAssets)
 fPlayer    DWORD ?
 fEnemy     DWORD ?
+fEnemyFlap DWORD ?                            ; Bee wings-down frame
 fBullet    DWORD ?
 fBomb      DWORD ?
 
@@ -120,6 +122,23 @@ beeArt     BYTE "................"
            BYTE ".98.12355321.89."
            BYTE "..9.12344321.9.."
            BYTE "....12344321...."
+           BYTE "....12333321...."
+           BYTE ".....123321....."
+           BYTE ".....122221....."
+           BYTE "......1221......"
+           BYTE "......1221......"
+           BYTE "................"
+           BYTE "................"
+; BEE frame 1 — wings DOWN (the amber sweep dropped two rows for the flap)
+beeArt2    BYTE "................"
+           BYTE "......1221......"
+           BYTE ".....12AA21....."
+           BYTE ".....1AAAA1....."
+           BYTE "....12333321...."
+           BYTE "..9.12344321.9.."
+           BYTE ".98.12355321.89."
+           BYTE "798.12344321.897"
+           BYTE "98..12344321..89"
            BYTE "....12333321...."
            BYTE ".....123321....."
            BYTE ".....122221....."

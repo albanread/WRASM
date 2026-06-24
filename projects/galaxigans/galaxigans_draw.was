@@ -37,7 +37,13 @@ dsc_fleet:
 dsc_e:
     cmp     dword ptr [rsi + EN_ALIVE], 0
     je      dsc_enext
-    mov     ecx, [rip + fEnemy]
+    mov     ecx, [rip + fEnemy]              ; wings-up by default
+    mov     eax, [rsi + EN_ANIM]             ; flap: toggle frame every 16 ticks
+    shr     eax, 4
+    test    eax, 1
+    jz      dsc_efr
+    mov     ecx, [rip + fEnemyFlap]          ; wings-down
+dsc_efr:
     cvtsi2ss xmm1, dword ptr [rsi + EN_X]    ; live screen pos (sway/dive already folded in)
     cvtsi2ss xmm2, dword ptr [rsi + EN_Y]
     mov     r8d, BEE_SLOT

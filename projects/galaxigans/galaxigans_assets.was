@@ -26,6 +26,16 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fEnemy], eax
 
+    lea     rcx, [rip + beeArt2]             ; Bee wings-down (flap frame 1)
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fEnemyFlap], eax
+
     lea     rcx, [rip + bulletArt]           ; bullet 2x6
     mov     edx, 2
     mov     r8d, 6
