@@ -31,7 +31,7 @@ float3 col=float3(0.015+neb*0.05, 0.010+neb*0.03, 0.055+neb*0.20);
 for(int L=0;L<3;L++){
 float sp=16.0+L*30.0;
 float cell=13.0+L*6.0;
-float2 cp=float2(px, py+t*sp)/cell;
+float2 cp=float2(px, py-t*sp)/cell;
 float2 gi=floor(cp);
 float h=frac(sin(dot(gi,float2(127.1,311.7)))*43758.5453);
 if(h>0.90){
@@ -63,7 +63,7 @@ starTmpSize QWORD ?
 .balign 16
 starCB    DWORD 0, 0, 0, 0                 ; float4 { time, 0, 0, 0 }
 starTime  DWORD 0                          ; running float (starts 0.0)
-starStep  DWORD 0x3DCCCCCD                 ; 0.1f per frame
+starStep  DWORD 0x3C23D70A                 ; 0.01f/frame — very slow, gentle drift
 .balign 16
 starCBArr QWORD 0
 
