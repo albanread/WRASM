@@ -23,12 +23,17 @@
 .include "../../gpu/introspect.was"           ; Snapshot — the headless BMP filmstrip (GameSelfTest)
 .include "../../gpu/harness.was"              ; window + loop + input + default present (GameStart/Loop)
 
+; ---- the audio stack (distinct modules Sound/Player; no collision with gpu/*) ----
+.include "../../library/audio/sound/sound.was" ; the synth + waveOut mixer (SFX presets + Play)
+.include "../../library/audio/music/abc.was"   ; the ABC parser + midiOut soundtrack player
+
 ; ---- the game (each fragment opens `module Galaxigans`; data first) ----
 .include "galaxigans_data.inc"        ; .DATA: pools, player, formation, sprite frame-ids
 .include "galaxigans_assets.was"      ; BuildSprAssets: synth sprite frames + palettes
-.include "galaxigans_enemies.was"     ; ResetGame + formation sway (dive AI next)
+.include "galaxigans_enemies.was"     ; ResetGame + formation sway + dive AI + bombs
 .include "galaxigans_player.was"      ; input -> move/fire + player bullets
-.include "galaxigans_collision.was"   ; bullet x enemy + scoring
+.include "galaxigans_collision.was"   ; bullet x enemy + diver/bomb x player + scoring
+.include "galaxigans_audio.was"       ; SFX bake/playback + the ABC soundtrack
 .include "galaxigans_draw.was"        ; background + queue the fleet
 .include "galaxigans_main.was"        ; main + the GameInit/GameStep/GameSprites callbacks
-; TODO: galaxigans_audio.was (SFX + ABC soundtrack), the dive/return AI, the bonus saucer.
+; TODO: the bonus saucer, dive-arc tuning, a 2nd enemy tier.

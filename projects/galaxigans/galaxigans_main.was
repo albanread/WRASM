@@ -20,9 +20,11 @@ IFDEF FXTEST
     mov     ecx, 150                         ; headless gate: film 150 frames (catch the first dive ~f60)
     mov     edx, 25
     call    GameSelfTest
+    call    AudioStop
     invoke  ExitProcess, 0
 ENDIF
     call    GameLoop                         ; interactive: fixed-step timer pump (Esc quits)
+    call    AudioStop                        ; stop the mixer + soundtrack threads
     invoke  ExitProcess, 0
 
 ; ---- GameInit (callback): harness did Gpu/Blit/Txt; bring up sprites/particles + game ----
@@ -31,6 +33,7 @@ GameInit:
     call    SprInit
     call    PtInit
     call    BuildSprAssets
+    call    AudioBoot                        ; mixer + SFX bake + looping soundtrack
     call    ResetGame
     add     rsp, 40
     ret

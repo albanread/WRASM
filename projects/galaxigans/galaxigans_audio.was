@@ -1,0 +1,95 @@
+; galaxigans_audio.was — SFX bake/playback + the ABC soundtrack (.CODE + .DATA).
+;
+; AudioInit must run before any Play (it starts the waveOut mixer thread). Every preset
+; (Zap/Explode/...) renders into the ONE shared library buffer `sndBuf` and sets
+; `sndFrames` — so each must be CopySfx'd into a private buffer IMMEDIATELY, before the
+; next preset overwrites sndBuf. `sndBuf`/`sndFrames`/`gMusicLoop` are .globl library
+; symbols (resolve across `module Galaxigans`). CopySfx is AUTHOR-OWNED — verbatim from
+; brickout_fx.was:231. `.balign 16` guards EACH real8 buffer (data-alignment trap).
+
+module Galaxigans
+.balign 16
+.DATA
+.balign 16
+zapBuf      real8 88200 dup(0.0)              ; fire SFX (short Zap)
+zapFrames   DWORD ?
+.balign 16
+boomBuf     real8 88200 dup(0.0)              ; enemy-kill SFX (punchy Explode)
+boomFrames  DWORD ?
+.balign 16
+deathBuf    real8 88200 dup(0.0)              ; player-death SFX (long deep Explode)
+deathFrames DWORD ?
+
+; looping A-minor chiptune (square lead + synth bass) — brickout's proven soundtrack.
+soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=140", 10, "%%MIDI program 1 80", 10, "%%MIDI program 2 38", 10, "K:Am", 10, "V:1", 10, "e2 a2 e2 c2 | d2 f2 e2 d2 | c2 e2 a2 g2 | e2 d2 c4 |", 10, "V:2", 10, "A,2 E,2 A,2 E,2 | D,2 A,2 E,2 E,2 | A,2 E,2 C2 G,2 | A,2 E,2 A,4 |", 10, 0
+
+.balign 16
+.CODE
+
+; ---- AudioBoot: mixer up, the three SFX pre-rendered, the looping soundtrack started ----
+proc AudioBoot frame
+    call    AudioInit                         ; waveOut mixer thread (before any Play)
+    mov     edx, 90                           ; fire: a short bright zap
+    call    Zap
+    lea     rcx, [rip + zapBuf]
+    lea     rdx, [rip + zapFrames]
+    call    CopySfx
+    mov     edx, 320                          ; enemy kill: a punchy explode
+    call    Explode
+    lea     rcx, [rip + boomBuf]
+    lea     rdx, [rip + boomFrames]
+    call    CopySfx
+    mov     edx, 800                          ; player death: a long deep detonation
+    call    Explode
+    lea     rcx, [rip + deathBuf]
+    lea     rdx, [rip + deathFrames]
+    call    CopySfx
+    mov     dword ptr [rip + gMusicLoop], 1   ; loop the soundtrack
+    lea     rcx, [rip + soundtrack]
+    call    ParseTune                         ; ABC -> the scheduled event array
+    call    MusicInit                         ; open MIDI_MAPPER + start the player thread
+endproc
+
+; ---- AudioStop: stop + join the soundtrack and mixer threads (call on exit) ----
+proc AudioStop frame
+    call    MusicShutdown
+    call    AudioShutdown
+endproc
+
+; ---- PlayZap / PlayBoom / PlayDeath: fire a pre-rendered SFX into the mixer ----
+proc PlayZap frame
+    lea     rcx, [rip + zapBuf]
+    mov     edx, [rip + zapFrames]
+    call    Play
+endproc
+
+proc PlayBoom frame
+    lea     rcx, [rip + boomBuf]
+    mov     edx, [rip + boomFrames]
+    call    Play
+endproc
+
+proc PlayDeath frame
+    lea     rcx, [rip + deathBuf]
+    mov     edx, [rip + deathFrames]
+    call    Play
+endproc
+
+; ---- CopySfx(rcx=dstBuf, rdx=dstFramesPtr): the last render's sndBuf -> a private
+;      buffer + save the frame count. AUTHOR-OWNED — verbatim from brickout_fx.was. ----
+proc CopySfx uses rbx rsi rdi r12 in rcx rdx
+    mov     rdi, rcx                          ; dst
+    mov     rbx, rdx                          ; dstFramesPtr
+    mov     r12d, [rip + sndFrames]
+    mov     [rbx], r12d                       ; *dstFramesPtr = sndFrames
+    mov     ecx, r12d
+    add     ecx, ecx                          ; interleaved samples = frames*2
+    cmp     ecx, 88200                        ; clamp to the 1 s stereo buffer
+    jbe     cs_go
+    mov     ecx, 88200
+cs_go:
+    lea     rsi, [rip + sndBuf]
+    rep     movsq                             ; copy ecx f64 qwords src->dst
+endproc
+
+endmodule

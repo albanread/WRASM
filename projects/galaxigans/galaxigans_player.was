@@ -54,6 +54,7 @@ ps_canfire:
     test    eax, eax
     jz      ps_done
     call    SpawnBullet
+    call    PlayZap
     mov     dword ptr [rip + fireCool], FIRE_COOLDOWN
 ps_done:
 endproc
