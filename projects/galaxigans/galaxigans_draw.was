@@ -43,6 +43,7 @@ dsc_pship:
 dsc_fleet:
     call    DrawSaucer                       ; the bonus saucer (if active)
     call    DrawMines                        ; the drifting spinning mines
+    call    DrawBoss                         ; the capture boss (if present)
     lea     rsi, [rip + enemies]
     mov     ebx, ENEMY_MAX
 dsc_e:

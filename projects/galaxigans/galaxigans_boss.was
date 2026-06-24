@@ -1,0 +1,151 @@
+; galaxigans_boss.was — the capture boss, Phase 1: the spectacle only (enter / station /
+; descend / charge / beam / return), driving the layer-1 tractor beam. No abduction yet
+; (that is Phase 2). (.CODE)
+
+module Galaxigans
+.CODE
+
+; ---- BossStep: the capture-boss lifecycle. Arms/aims the beam during CHARGE/BEAM. ----
+proc BossStep uses rbx frame
+    mov     eax, [rip + bossState]
+    cmp     eax, BS_ENTER
+    je      bs_enter
+    cmp     eax, BS_STATION
+    je      bs_station
+    cmp     eax, BS_DESCEND
+    je      bs_descend
+    cmp     eax, BS_CHARGE
+    je      bs_charge
+    cmp     eax, BS_BEAM
+    je      bs_beam
+    cmp     eax, BS_RETURN
+    je      bs_return
+    ; BS_IDLE: count down to the next appearance
+    dec     dword ptr [rip + bossTimer]
+    jg      bs_done
+    mov     dword ptr [rip + bossState], BS_ENTER
+    mov     dword ptr [rip + bossX], 304
+    mov     dword ptr [rip + bossY], -36
+    jmp     bs_done
+bs_enter:
+    inc     dword ptr [rip + bossAnim]
+    mov     eax, [rip + bossY]                ; glide down to the station line
+    cmp     eax, BOSS_STATION_Y
+    jge     bs_enterdone
+    add     eax, 2
+    mov     [rip + bossY], eax
+    jmp     bs_done
+bs_enterdone:
+    mov     dword ptr [rip + bossState], BS_STATION
+    mov     dword ptr [rip + bossTimer], BOSS_DWELL
+    jmp     bs_done
+bs_station:
+    inc     dword ptr [rip + bossAnim]
+    dec     dword ptr [rip + bossTimer]
+    jg      bs_done
+    mov     dword ptr [rip + bossState], BS_DESCEND
+    jmp     bs_done
+bs_descend:
+    inc     dword ptr [rip + bossAnim]
+    mov     ecx, [rip + playerX]              ; track to above the ship (emitter over playerX)
+    sub     ecx, 16
+    mov     eax, [rip + bossX]
+    cmp     eax, ecx
+    jge     bs_descL
+    add     eax, 3
+    jmp     bs_descXs
+bs_descL:
+    sub     eax, 3
+bs_descXs:
+    mov     [rip + bossX], eax
+    mov     eax, [rip + bossY]                ; drop to the capture line
+    cmp     eax, BOSS_CAP_Y
+    jge     bs_descAt
+    add     eax, 3
+    mov     [rip + bossY], eax
+    jmp     bs_done
+bs_descAt:
+    mov     dword ptr [rip + bossState], BS_CHARGE
+    mov     dword ptr [rip + bossBeamT], 0
+    jmp     bs_done
+bs_charge:
+    inc     dword ptr [rip + bossAnim]
+    inc     dword ptr [rip + bossBeamT]
+    mov     ecx, [rip + bossX]                ; beam grows downward as it charges
+    add     ecx, 16
+    mov     edx, [rip + bossY]
+    add     edx, 24
+    mov     r8d, [rip + bossBeamT]
+    imul    r8d, r8d, 12
+    add     r8d, edx
+    cmp     r8d, 350
+    jle     bs_chcap
+    mov     r8d, 350
+bs_chcap:
+    call    BeamSet
+    cmp     dword ptr [rip + bossBeamT], BEAM_CHARGE
+    jl      bs_done
+    mov     dword ptr [rip + bossState], BS_BEAM
+    mov     dword ptr [rip + bossBeamT], 0
+    jmp     bs_done
+bs_beam:
+    inc     dword ptr [rip + bossAnim]
+    inc     dword ptr [rip + bossBeamT]
+    mov     ecx, [rip + bossX]                ; full-length beam (Phase 2 will test capture here)
+    add     ecx, 16
+    mov     edx, [rip + bossY]
+    add     edx, 24
+    mov     r8d, 350
+    call    BeamSet
+    cmp     dword ptr [rip + bossBeamT], BEAM_HOLD
+    jl      bs_done
+    call    BeamOff
+    mov     dword ptr [rip + bossState], BS_RETURN
+    jmp     bs_done
+bs_return:
+    inc     dword ptr [rip + bossAnim]
+    mov     eax, [rip + bossY]                ; climb back to station
+    cmp     eax, BOSS_STATION_Y
+    jle     bs_retdone
+    sub     eax, 3
+    mov     [rip + bossY], eax
+    jmp     bs_done
+bs_retdone:
+    mov     dword ptr [rip + bossY], BOSS_STATION_Y
+    mov     dword ptr [rip + bossX], 304
+    mov     dword ptr [rip + bossState], BS_STATION
+    mov     dword ptr [rip + bossTimer], 150
+bs_done:
+endproc
+
+; ---- DrawBoss: queue the 32x32 boss; frame by state (idle flap / charge / beam) ----
+proc DrawBoss uses rbx frame
+    cmp     dword ptr [rip + bossState], BS_IDLE
+    je      db_done
+    mov     eax, [rip + bossState]
+    cmp     eax, BS_BEAM
+    je      db_beam
+    cmp     eax, BS_CHARGE
+    je      db_charge
+    mov     ecx, [rip + fCbIdle0]             ; idle/enter/descend/return: gentle flap
+    mov     eax, [rip + bossAnim]
+    shr     eax, 3
+    test    eax, 1
+    jz      db_push
+    mov     ecx, [rip + fCbIdle1]
+    jmp     db_push
+db_charge:
+    mov     ecx, [rip + fCbCharge]
+    jmp     db_push
+db_beam:
+    mov     ecx, [rip + fCbBeam]
+db_push:
+    cvtsi2ss xmm1, dword ptr [rip + bossX]
+    cvtsi2ss xmm2, dword ptr [rip + bossY]
+    mov     r8d, BOSS_CAP_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+db_done:
+endproc
+
+endmodule

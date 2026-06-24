@@ -81,20 +81,8 @@ PAL = [None,(32,8,40),(72,24,88),(104,48,120),(136,72,152),(176,108,192),(208,12
        (200,160,48),(255,224,96),(32,96,160),(64,192,255),(176,236,255),(255,255,255)]
 def colr(i): return PAL[i] if 0<i<len(PAL) else None
 
-def beam_seg(frame):
-    """A 32x32 tileable tractor-beam slice: cyan column + downward-scrolling scan-bands."""
-    g = [[0]*W for _ in range(H)]
-    for y in range(H):
-        scan = ((y + frame*3) % 6) < 2
-        for x in range(W):
-            dx = abs(x - CXL)
-            v = 3 if dx < 2.5 else 2 if dx < 5.5 else 1 if dx < 8.5 else 0
-            if v and scan: v = min(4, v+1)
-            g[y][x] = v
-    return g
-
-frames = [build(k) for k in range(4)] + [beam_seg(0), beam_seg(1)]
-labels = ['idle A','idle B','charge','beam','beamSeg0','beamSeg1']
+frames = [build(k) for k in range(4)]
+labels = ['idle A','idle B','charge','beam']
 S = 9
 img = Image.new('RGB', (W*S*4+50, H*S+30), (12,12,22)); d = ImageDraw.Draw(img)
 for k,g in enumerate(frames):

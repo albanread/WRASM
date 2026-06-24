@@ -241,6 +241,19 @@ proc BuildSprAssets uses rbx frame
     call    DecAdd16
     mov     [rip + fMine + 28], eax
 
+    lea     rcx, [rip + bossIdle0]           ; the 32x32 capture boss, 4 frames
+    call    DecAdd32
+    mov     [rip + fCbIdle0], eax
+    lea     rcx, [rip + bossIdle1]
+    call    DecAdd32
+    mov     [rip + fCbIdle1], eax
+    lea     rcx, [rip + bossCharge]
+    call    DecAdd32
+    mov     [rip + fCbCharge], eax
+    lea     rcx, [rip + bossBeam]
+    call    DecAdd32
+    mov     [rip + fCbBeam], eax
+
     call    SprUploadAtlas
     call    SetupSprPalettes
     call    SprUploadPalette
@@ -254,6 +267,17 @@ proc DecAdd16 frame in rcx
     lea     rcx, [rip + sprScratch]
     mov     edx, 16
     mov     r8d, 16
+    call    SprAddFrame
+endproc
+
+; ---- DecAdd32(rcx=art) -> eax = frame id: decode a 32x32 hex sprite + add an atlas frame ----
+proc DecAdd32 frame in rcx
+    mov     edx, 32
+    mov     r8d, 32
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 32
+    mov     r8d, 32
     call    SprAddFrame
 endproc
 
@@ -329,6 +353,10 @@ proc SetupSprPalettes
     mov     ecx, MINE_SLOT
     lea     rdx, [rip + minePal]
     mov     r8d, 8
+    call    SetSlotPal
+    mov     ecx, BOSS_CAP_SLOT
+    lea     rdx, [rip + bossCapPal]
+    mov     r8d, 12
     call    SetSlotPal
 endproc
 

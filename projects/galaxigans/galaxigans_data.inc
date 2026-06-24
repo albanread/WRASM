@@ -78,6 +78,22 @@ MINE_H          equ 16
 MINE_SLOT       equ 9                         ; its own palette (aliens own 1..8)
 MINE_SCORE      equ 150                       ; the "treat" — bonus for shooting one
 
+; ---- capture boss (32x32, Phase 1: enter/station/descend/charge/beam/return) ----
+BOSS_CAP_SLOT   equ 10                        ; the boss's own 16-colour palette
+BS_IDLE         equ 0
+BS_ENTER        equ 1
+BS_STATION      equ 2
+BS_DESCEND      equ 3
+BS_CHARGE       equ 4
+BS_BEAM         equ 5
+BS_RETURN       equ 6
+BOSS_STATION_Y  equ 18                        ; hovers here, top-centre
+BOSS_CAP_Y      equ 140                       ; descends to here to fire the beam
+BOSS_FIRST      equ 40                        ; frames before the first appearance
+BOSS_DWELL      equ 60                        ; station hover before a capture run
+BEAM_CHARGE     equ 30                        ; charge frames (beam grows)
+BEAM_HOLD       equ 90                        ; beam-active frames
+
 ; ---- game lifecycle states + the triumphal spiral dance ----
 STATE_PLAYING  equ 0
 STATE_GAMEOVER equ 1
@@ -169,6 +185,14 @@ saucerDir    DWORD -1                          ; flips each spawn (enter L<->R)
 saucerAnim   DWORD 0
 saucerSpawn  DWORD 120                         ; countdown to the first appearance
 saucerBombT  DWORD 0
+
+; capture-boss state
+bossState  DWORD 0                            ; BS_IDLE
+bossX      DWORD 304
+bossY      DWORD -36
+bossAnim   DWORD 0
+bossTimer  DWORD 40
+bossBeamT  DWORD 0
 saucerSndT   DWORD 0                            ; countdown to re-trigger the looping wah-wah
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
@@ -191,6 +215,10 @@ fWasp      DWORD ?                            ; Wasp (single frame)
 fDrone     DWORD ?                            ; Drone/Grunt (single frame)
 fSaucer    DWORD ?                            ; bonus saucer (2-frame)
 fSaucer2   DWORD ?
+fCbIdle0   DWORD ?                            ; capture boss 32x32: idle A/B, charge, beam
+fCbIdle1   DWORD ?
+fCbCharge  DWORD ?
+fCbBeam    DWORD ?
 fBullet    DWORD ?
 fBomb      DWORD ?
 
@@ -261,6 +289,11 @@ stingPal   DWORD 0x00102838, 0x00184050, 0x00205868, 0x00287888, 0x003898A8   ; 
 .balign 16
 minePal    DWORD 0x00181820, 0x00303840, 0x00505868, 0x00788090, 0x00B0B8C8   ; mine: dark metal -> sheen,
            DWORD 0x00606878, 0x00802018, 0x00FF4030                            ;   spike grey, red trigger light
+.balign 16
+; capture-boss palette (slot 10): purple body (2-6), gold trim (7-8), cyan emitter eye (9-12)
+bossCapPal DWORD 0x00200828, 0x00481858, 0x00683078, 0x00884898, 0x00B06CC0
+           DWORD 0x00D080E0, 0x00C8A030, 0x00FFE060, 0x002060A0, 0x0040C0FF
+           DWORD 0x00B0ECFF, 0x00FFFFFF
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----

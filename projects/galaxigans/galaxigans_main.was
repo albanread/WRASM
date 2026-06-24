@@ -60,6 +60,7 @@ GameStep:
     call    MineStep                         ; the saucer's rare spinning mines
     call    CheckMineHit
     call    CheckMineShot
+    call    BossStep                         ; the capture boss (Phase 1: descend + beam)
     call    PtUpdate                         ; advance explosion debris
     call    CountAlive                       ; stage cleared when none remain
     test    eax, eax
