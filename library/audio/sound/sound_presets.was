@@ -227,4 +227,46 @@ to_pw:
     call    Render
 endproc
 
+; ----------------------------------------------------------------------------
+; Wah(rcx = base freq Hz, edx = durMs, r8d = detune Hz): the flying-saucer warble.
+; Two sine oscillators `detune` Hz apart BEAT against each other — their sum throbs in
+; amplitude at the detune rate: the classic "wah-wah-wah" UFO siren. High sustain so the
+; warble holds the whole duration. Frames -> sndBuf for the caller (CopySfx / WriteWav).
+; ----------------------------------------------------------------------------
+proc Wah frame in rcx rdx r8
+    cvtsi2sd xmm0, ecx                   ; f0 = base (stash before ClearEffect clobbers)
+    movsd   [rip + toneFreq], xmm0
+    add     ecx, r8d                     ; f1 = base + detune
+    cvtsi2sd xmm0, ecx
+    movsd   [rip + wahFreq2], xmm0
+    cvtsi2sd xmm0, edx                   ; dur seconds = durMs/1000
+    divsd   xmm0, [rip + cThousand]
+    call    ClearEffect
+    lea     r9, [rip + fxOsc]
+    ; osc0: sine @ f0 x kWahAmp
+    mov     dword ptr [r9 + 0], 0
+    movsd   xmm0, [rip + toneFreq]
+    movsd   [r9 + 8], xmm0
+    movsd   xmm0, [rip + kWahAmp]
+    movsd   [r9 + 16], xmm0
+    xorps   xmm0, xmm0
+    movsd   [r9 + 24], xmm0
+    movsd   xmm0, [rip + kDfltPw]
+    movsd   [r9 + 32], xmm0
+    ; osc1: sine @ f1 x kWahAmp (the beat partner)
+    mov     dword ptr [r9 + 40], 0
+    movsd   xmm0, [rip + wahFreq2]
+    movsd   [r9 + 48], xmm0
+    movsd   xmm0, [rip + kWahAmp]
+    movsd   [r9 + 56], xmm0
+    xorps   xmm0, xmm0
+    movsd   [r9 + 64], xmm0
+    movsd   xmm0, [rip + kDfltPw]
+    movsd   [r9 + 72], xmm0
+    mov     dword ptr [rip + fxOscCount], 2
+    movsd   xmm0, [rip + kWahSus]        ; hold the warble (high sustain)
+    movsd   [rip + fxSus], xmm0
+    call    Render
+endproc
+
 endmodule

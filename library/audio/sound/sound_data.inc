@@ -154,6 +154,9 @@ cThousand real8  1000.0                 ; ms -> s divisor
 presetDur real8  0.0                    ; scratch: preset duration (seconds)
 toneFreq  real8  0.0                    ; scratch: Tone frequency
 toneWave  DWORD  0                       ; scratch: Tone waveform id
+kWahAmp   real8  0.45                   ; Wah: per-osc amp (two detuned sines beat -> warble)
+kWahSus   real8  0.92                   ; Wah: high sustain so the warble holds
+wahFreq2  real8  0.0                    ; scratch: Wah detuned (second) oscillator freq
 
 ; --- ADSR parameters (seconds / level) ---
 cAtk      real8  0.01                 ; attack  time

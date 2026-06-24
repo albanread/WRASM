@@ -15,6 +15,7 @@ proc SaucerStep uses rbx frame
     mov     eax, [rip + gSaucerGap]
     mov     [rip + saucerBombT], eax
     mov     dword ptr [rip + saucerAnim], 0
+    mov     dword ptr [rip + saucerSndT], 0   ; warble starts on the first move tick
     mov     eax, [rip + saucerDir]            ; flip side each spawn
     neg     eax
     mov     [rip + saucerDir], eax
@@ -27,6 +28,11 @@ ss_fromright:
     jmp     ss_done
 ss_move:
     inc     dword ptr [rip + saucerAnim]
+    dec     dword ptr [rip + saucerSndT]      ; loop the wah-wah for the whole crossing
+    jg      ss_dir
+    mov     dword ptr [rip + saucerSndT], 52
+    call    PlaySaucerWah
+ss_dir:
     mov     eax, [rip + saucerDir]
     test    eax, eax
     jl      ss_left

@@ -147,6 +147,7 @@ saucerDir    DWORD -1                          ; flips each spawn (enter L<->R)
 saucerAnim   DWORD 0
 saucerSpawn  DWORD 120                         ; countdown to the first appearance
 saucerBombT  DWORD 0
+saucerSndT   DWORD 0                            ; countdown to re-trigger the looping wah-wah
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
 enemies    BYTE  1760 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*44)

@@ -19,6 +19,9 @@ boomFrames  DWORD ?
 .balign 16
 deathBuf    real8 88200 dup(0.0)              ; player-death SFX (long deep Explode)
 deathFrames DWORD ?
+.balign 16
+wahBuf      real8 88200 dup(0.0)              ; saucer UFO warble (looped while it crosses)
+wahFrames   DWORD ?
 
 ; looping A-minor chiptune (square lead + synth bass) — brickout's proven soundtrack.
 soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=170", 10, "%%MIDI program 1 81", 10, "%%MIDI program 2 38", 10, "K:Em", 10, "V:1", 10, "e g b e' b g e g | d f a d' a f d f | c e g c' g e c e | B d f b a g f e | e g b e' b g e g | d f a d' a f d f | c e a c' a e c B | e2 B2 e4 |", 10, "V:2", 10, "E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | B,,4 E,4 | E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | E,4 E,4 |", 10, 0
@@ -43,6 +46,13 @@ proc AudioBoot frame
     call    Explode
     lea     rcx, [rip + deathBuf]
     lea     rdx, [rip + deathFrames]
+    call    CopySfx
+    mov     ecx, 280                          ; saucer warble: 280 Hz + 5 Hz detune -> ~5/s "wah"
+    mov     edx, 900
+    mov     r8d, 5
+    call    Wah
+    lea     rcx, [rip + wahBuf]
+    lea     rdx, [rip + wahFrames]
     call    CopySfx
     mov     dword ptr [rip + gMusicLoop], 1   ; loop the active tune
     lea     rcx, [rip + tuneTitle]            ; boot into STATE_INTRO -> title music
@@ -106,6 +116,13 @@ endproc
 proc PlayDeath frame
     lea     rcx, [rip + deathBuf]
     mov     edx, [rip + deathFrames]
+    call    Play
+endproc
+
+; ---- PlaySaucerWah: the UFO warble (re-triggered on a loop while the saucer crosses) ----
+proc PlaySaucerWah frame
+    lea     rcx, [rip + wahBuf]
+    mov     edx, [rip + wahFrames]
     call    Play
 endproc
 
