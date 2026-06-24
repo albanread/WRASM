@@ -191,6 +191,14 @@ saucerPal  DWORD 0x00303840, 0x00505860, 0x00707880, 0x00909AA4, 0x00C0C8D0, 0x0
            DWORD 0x002080B0, 0x0040C8FF, 0x00C0F0FF, 0x00682018, 0x00FFE040, 0x00FF7818
            DWORD 0x00C0C8D0, 0x0040C8FF, 0x00FFFFFF
 
+; per-stage saucer dome tint (indices 7,8,9) — a different-looking saucer each level
+.balign 16
+saucerDome DWORD 0x002080B0, 0x0040C8FF, 0x00C0F0FF    ; cyan   (stage 1)
+           DWORD 0x00B03020, 0x00FF6038, 0x00FFC0A0    ; red    (stage 2)
+           DWORD 0x0020A030, 0x0050E060, 0x00C0FFC0    ; green  (stage 3)
+           DWORD 0x007030B0, 0x00B060F0, 0x00E0C0FF    ; violet (stage 4)
+           DWORD 0x00B08010, 0x00FFC828, 0x00FFF0A0    ; gold   (stage 5)
+
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
 .balign 16

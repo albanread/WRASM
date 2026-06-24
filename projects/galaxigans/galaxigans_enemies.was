@@ -61,6 +61,23 @@ rg_sg:
     mov     ecx, 5
     div     ecx
     mov     [rip + gStageOff], edx
+    ; --- recolour the saucer dome for this stage ("different saucers") ---
+    imul    eax, edx, 12                      ; 3 dwords/stage; rsi -> this stage's dome
+    lea     rsi, [rip + saucerDome]
+    add     rsi, rax
+    mov     ecx, SAUCER_SLOT
+    mov     edx, 7
+    mov     r8d, [rsi]
+    call    SprSetPalette
+    mov     ecx, SAUCER_SLOT
+    mov     edx, 8
+    mov     r8d, [rsi + 4]
+    call    SprSetPalette
+    mov     ecx, SAUCER_SLOT
+    mov     edx, 9
+    mov     r8d, [rsi + 8]
+    call    SprSetPalette
+    call    SprUploadPalette
 
     lea     rdi, [rip + bullets]             ; all bullets inactive
     mov     ecx, BULLET_MAX
