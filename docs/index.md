@@ -43,6 +43,7 @@ flowchart LR
 | [GPU Canvas Design](gpucanvas.md) | D3D11 shader backend — the `gpu/` profile |
 | [Game Audio Design](gameaudio.md) | SFX synthesis and ABC/audio design |
 | [Studio TCL scripting](studio-tcl.md) | Drive the IDE headlessly (UI tests, screenshots) with the embedded TCL interpreter |
+| [nano-TCL (design)](nano-tcl.md) | In-app register-machine REPL to script a game's global procs for dev automation + testing |
 
 ## At a glance
 
