@@ -209,38 +209,71 @@ fs_return:
     mov     dword ptr [rdi + EN_STATE], ST_FORM
     jmp     fs_enext
 fs_dive:
-    ; --- diver: vy = 2 + dt/4 (cap 8) downward; vx peels out, then homes on player ---
+    ; --- diver: accelerating descent + a randomized WEAVE blended with gentle homing, so
+    ;     every swoop is a different snaking curve (params packed in EN_SWOOP). ---
     inc     dword ptr [rdi + EN_DT]
+    mov     eax, [rdi + EN_SWOOP]            ; this dive's random params
+    ; vy = 2 + dt/4, cap 8 (or 10 when the 'fast' bit is set)
     mov     ecx, [rdi + EN_DT]
     shr     ecx, 2
     add     ecx, 2
+    test    eax, 0x80
+    jz      fs_vcap8
+    cmp     ecx, 10
+    jle     fs_vyadd
+    mov     ecx, 10
+    jmp     fs_vyadd
+fs_vcap8:
     cmp     ecx, 8
-    jle     fs_vy
+    jle     fs_vyadd
     mov     ecx, 8
-fs_vy:
+fs_vyadd:
     add     [rdi + EN_Y], ecx                ; y += vy
-    mov     eax, [rdi + EN_DT]
-    cmp     eax, DIVE_PEEL
-    jl      fs_peel
-    mov     ecx, [rip + playerX]             ; home toward the player's x
+    ; weave velocity = sineLUT[(dt*wspeed + phase) & 255] * wamp >> 8
+    mov     ecx, eax                         ; wspeed = ((seed>>3)&7)+3
+    shr     ecx, 3
+    and     ecx, 7
+    add     ecx, 3
+    mov     edx, [rdi + EN_DT]
+    imul    edx, ecx
+    mov     ecx, eax                         ; + phase = (seed>>8)&255
+    shr     ecx, 8
+    and     ecx, 255
+    add     edx, ecx
+    and     edx, 255
+    lea     rcx, [rip + sineLUT]
+    movsx   ecx, word ptr [rcx + rdx*2]      ; s in [-256,256]
+    mov     edx, eax                         ; wamp = (seed&7)+2
+    and     edx, 7
+    add     edx, 2
+    imul    ecx, edx
+    sar     ecx, 8                           ; vx_weave ~ [-9,9]
+    mov     r8d, ecx                         ; net horizontal velocity (volatile; no calls below)
+    ; gentle homing once past the peel window (strength 1, or 3 if the 'hard' bit is set)
+    cmp     dword ptr [rdi + EN_DT], DIVE_PEEL
+    jl      fs_applyx
+    mov     edx, 1
+    test    eax, 0x40
+    jz      fs_homeAmt
+    mov     edx, 3
+fs_homeAmt:
+    mov     ecx, [rip + playerX]
     cmp     [rdi + EN_X], ecx
-    jge     fs_homeL
-    mov     ecx, [rip + gDiveVX]
-    add     [rdi + EN_X], ecx
-    mov     dword ptr [rdi + EN_BANK], 1     ; banking right toward the player
-    jmp     fs_offcheck
-fs_homeL:
-    mov     ecx, [rip + gDiveVX]
-    sub     [rdi + EN_X], ecx
-    mov     dword ptr [rdi + EN_BANK], -1    ; banking left
-    jmp     fs_offcheck
-fs_peel:
-    mov     ecx, [rdi + EN_VX]               ; early outward peel
-    add     [rdi + EN_X], ecx
-    mov     dword ptr [rdi + EN_BANK], 1     ; bank toward the peel direction
-    cmp     ecx, 0
-    jge     fs_offcheck
+    jge     fs_homeNeg
+    add     r8d, edx                         ; pull toward the player (right)
+    jmp     fs_applyx
+fs_homeNeg:
+    sub     r8d, edx                         ; pull left
+fs_applyx:
+    add     [rdi + EN_X], r8d                ; integrate horizontal velocity
+    mov     dword ptr [rdi + EN_BANK], 0     ; bank into the turn (sign of net velocity)
+    test    r8d, r8d
+    jz      fs_offcheck
+    jg      fs_bankR
     mov     dword ptr [rdi + EN_BANK], -1
+    jmp     fs_offcheck
+fs_bankR:
+    mov     dword ptr [rdi + EN_BANK], 1
 fs_offcheck:
     cmp     dword ptr [rdi + EN_Y], FIELD_H + 8   ; exited the bottom -> re-enter from the top
     jl      fs_enext
@@ -256,8 +289,24 @@ fs_enext:
     jnz     fs_e
 endproc
 
+; ---- Rng -> eax: xorshift32 PRNG (advances rngState). Leaf. ----
+proc Rng
+    mov     eax, [rip + rngState]
+    mov     ecx, eax
+    shl     ecx, 13
+    xor     eax, ecx
+    mov     ecx, eax
+    shr     ecx, 17
+    xor     eax, ecx
+    mov     ecx, eax
+    shl     ecx, 5
+    xor     eax, ecx
+    mov     [rip + rngState], eax
+    ret
+endproc
+
 ; ---- TriggerDive: from a rotating start index, find the next alive formation enemy and
-;      launch it. Peel direction is outward from centre so divers fan out. ----
+;      launch it with a random swoop seed (the dive AI reads it for weave/home variety). ----
 proc TriggerDive uses rbx rsi rdi frame
     mov     esi, [rip + diveScan]
     mov     ebx, ENEMY_MAX                   ; bounded scan
@@ -273,20 +322,11 @@ td_loop:
     je      td_next
     cmp     dword ptr [rdi + EN_STATE], ST_FORM
     jne     td_next
-    ; launch this one
+    ; launch this one with a fresh random swoop seed
     mov     dword ptr [rdi + EN_STATE], ST_DIVE
     mov     dword ptr [rdi + EN_DT], 0
-    mov     eax, [rdi + EN_HX]               ; peel left on the left half, else right
-    cmp     eax, 320
-    jl      td_peelL
-    mov     eax, [rip + gDiveVX]
-    mov     [rdi + EN_VX], eax
-    jmp     td_set
-td_peelL:
-    mov     eax, [rip + gDiveVX]
-    neg     eax
-    mov     [rdi + EN_VX], eax
-td_set:
+    call    Rng
+    mov     [rdi + EN_SWOOP], eax
     inc     esi
     mov     [rip + diveScan], esi
     jmp     td_done

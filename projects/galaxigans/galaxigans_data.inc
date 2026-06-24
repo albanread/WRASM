@@ -19,7 +19,8 @@ EN_ALIVE       equ 8
 EN_STATE       equ 12                        ; ST_FORM / ST_DIVE
 EN_HX          equ 16                        ; home slot x (pre-sway)
 EN_HY          equ 20                        ; home slot y
-EN_VX          equ 24                        ; peel velocity during the early dive
+EN_VX          equ 24                        ; (legacy peel velocity — slot reused below)
+EN_SWOOP       equ 24                        ; per-dive random swoop seed (weave/home params)
 EN_DT          equ 28                        ; dive step counter
 EN_ANIM        equ 32                        ; wing-flap phase counter
 EN_TYPE        equ 36                        ; TYPE_BEE / TYPE_BUTTERFLY / TYPE_BOSS
@@ -147,6 +148,7 @@ gBombPeriod  DWORD 22                          ; formation bomb cadence
 gDiveVX      DWORD 3                            ; diver homing/peel speed
 gSaucerGap   DWORD 28                           ; saucer bomb cadence
 gStageOff    DWORD 0                            ; (stage-1) mod 5 — rotates the per-row species
+rngState     DWORD 0x1A2B3C4D                   ; xorshift32 PRNG state (per-dive swoop variety)
 
 ; bonus saucer state
 saucerActive DWORD 0
