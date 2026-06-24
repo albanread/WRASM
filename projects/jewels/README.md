@@ -52,8 +52,19 @@ projects/jewels/jewels.exe                    # 1. start the game
 nanotcl projects/jewels/tests/level1.tcl      # 2. run the test  (exit 0 = pass)
 ```
 
-`level1.tcl` drives the game with `send "<verb args>"` and reads published state
-with `regs`, asserting: a vertical triple scores 30, a horizontal match that
-chains scores 90, a mixed column clears nothing, and a packed spawn column ends
-the game. Both `send` and `regs` are generic `nanotcl` primitives — they work
-against any nano-TCL game, not just this one.
+The tests drive the game with `send "<verb args>"` and read published state with
+`regs` (and rendered pixels with `probe`). Both `send` and `regs` are generic
+`nanotcl` primitives — they work against any nano-TCL game, not just this one.
+
+### Example scripts (`tests/`)
+
+| script | what it demonstrates |
+|--------|----------------------|
+| `level1.tcl` | the level-1 rules: vertical = 30, horizontal + chain = 90, no false match, game over, FIRE-to-restart (real input path), and a rendered-pixel probe |
+| `moves.tcl` | input + a published slot — the falling column clamps at both walls (`pieceCol`) |
+| `probe_board.tcl` | rendered-board assertions — `probe` each drawn jewel's centre pixel and the black gap (beats an eyeballed snapshot) |
+| `demo.tcl` | no asserts — drives a scripted game and narrates the score (the "watch it play" mode) |
+
+Run any of them while the game is up: `nanotcl projects/jewels/tests/<name>.tcl`
+(exit 0 = all asserts passed). See `docs/nano-tcl-journal.md` for a field log of
+building and testing this game with nano-TCL.
