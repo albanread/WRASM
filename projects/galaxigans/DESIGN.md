@@ -1,7 +1,20 @@
 # Galaxigans — design note
 
-> **Status:** scaffold only (created the evening before). Not yet buildable — the
-> fragments are header-stubbed TODOs. Tomorrow's work fills them in.
+> **Status:** playable core loop — built + FXTEST-filmstrip verified. Done: the
+> harness-driven shell; indexed sprite art (ship / bug / bullet / bomb) + palettes;
+> a swaying 8×4 formation; peel-and-home **dive AI**; a 4-bullet pool with
+> bullet↔enemy collision + scoring; **particle explosions**; **player death / lives /
+> respawn** + game-over restart; **enemy bombs** (diver-dropped) that kill the ship.
+> Build the headless film via `galaxigans_fxtest.was` (it defines `FXTEST` then
+> includes the game; `main` films through `GameSelfTest` and exits).
+> **Next:** audio (`AudioInit` + `Zap`/`Explode` SFX + the ABC soundtrack), the bonus
+> saucer, dive-arc tuning so formation divers also threaten a centred ship, a 2nd tier.
+>
+> **Resolved unknowns:** `module Galaxigans` cross-fragment scoping works *with*
+> comobjs (`pContext.RSSetViewports` resolves from inside the game module). Text-space
+> trap: the canvas `Text` (`gpu/canvas.was`) is **320×200 logical, centre-biased** —
+> the HUD must use the GPU text layer `TxtSetColour` + `DrawText`, which is **640×360
+> px, the same space as the sprites/particles**. `PtBurst`/`DrawSprites` are 640×360.
 
 A Galaxian/Galaga-style fixed shooter — our **first multi-file game project** (not an
 `examples/` monolith). It's the natural next showcase after BrickOut FX: where brickout
