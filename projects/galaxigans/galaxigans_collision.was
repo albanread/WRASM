@@ -1,0 +1,58 @@
+; galaxigans_collision.was — hit tests + scoring (.CODE). v1: bullet x enemy.
+; Bomb/diver x player + explosion bursts (PtBurst) land with the dive AI.
+
+module Galaxigans
+.CODE
+
+; ---- Collide: each active bullet vs each alive enemy (AABB). On hit: kill both,
+;      +10 score. Enemy screen-x is its stored x plus the formation sway. ----
+proc Collide uses rbx rsi rdi r12 r13 frame
+    lea     rsi, [rip + bullets]
+    mov     r12d, BULLET_MAX
+col_b:
+    cmp     dword ptr [rsi + 8], 0
+    je      col_bnext
+    mov     r8d, [rsi + 0]                   ; bullet x (w=3)
+    mov     r9d, [rsi + 4]                   ; bullet y (h=8)
+    lea     rdi, [rip + enemies]
+    mov     r13d, ENEMY_MAX
+col_e:
+    cmp     dword ptr [rdi + 8], 0
+    je      col_enext
+    mov     eax, [rdi + 0]                   ; enemy screen x = x + formX (w=14)
+    add     eax, [rip + formX]
+    ; reject if no overlap on x: bx >= ex+14  ||  bx+3 <= ex
+    mov     ecx, eax
+    add     ecx, 14
+    cmp     r8d, ecx
+    jge     col_enext
+    mov     ecx, r8d
+    add     ecx, 3
+    cmp     ecx, eax
+    jle     col_enext
+    ; reject if no overlap on y: by >= ey+10  ||  by+8 <= ey   (h=10)
+    mov     eax, [rdi + 4]                   ; enemy y
+    mov     ecx, eax
+    add     ecx, 10
+    cmp     r9d, ecx
+    jge     col_enext
+    mov     ecx, r9d
+    add     ecx, 8
+    cmp     ecx, eax
+    jle     col_enext
+    ; hit
+    mov     dword ptr [rdi + 8], 0           ; enemy dead
+    mov     dword ptr [rsi + 8], 0           ; bullet spent
+    add     dword ptr [rip + score], 10
+    jmp     col_bnext                        ; one kill per bullet
+col_enext:
+    add     rdi, ENEMY_STRIDE
+    dec     r13d
+    jnz     col_e
+col_bnext:
+    add     rsi, BULLET_STRIDE
+    dec     r12d
+    jnz     col_b
+endproc
+
+endmodule

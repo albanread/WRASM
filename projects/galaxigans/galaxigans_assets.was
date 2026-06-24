@@ -1,0 +1,66 @@
+; galaxigans_assets.was — synthesize the sprite atlas + palette (.CODE).
+; v1: solid-colour blocks (player/enemy/bullet) so the fleet is visible; real
+; indexed art comes next. The harness already ran SprInit before GameInit.
+
+module Galaxigans
+.CODE
+
+; ---- BuildSprAssets: 3 solid frames into the atlas + the shared palette slot ----
+proc BuildSprAssets uses rbx frame
+    mov     ecx, IDX_PLAYER                  ; player 16x12
+    mov     edx, 16 * 12
+    call    FillScratch
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 12
+    call    SprAddFrame
+    mov     [rip + fPlayer], eax
+
+    mov     ecx, IDX_ENEMY                   ; enemy 14x10
+    mov     edx, 14 * 10
+    call    FillScratch
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 14
+    mov     r8d, 10
+    call    SprAddFrame
+    mov     [rip + fEnemy], eax
+
+    mov     ecx, IDX_BULLET                  ; bullet 3x8
+    mov     edx, 3 * 8
+    call    FillScratch
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 3
+    mov     r8d, 8
+    call    SprAddFrame
+    mov     [rip + fBullet], eax
+
+    call    SprUploadAtlas
+    call    SetupSprPalettes
+    call    SprUploadPalette
+endproc
+
+; ---- FillScratch(ecx=index byte, edx=count): paint sprScratch with one index ----
+proc FillScratch uses rdi in rcx rdx
+    mov     al, cl
+    mov     ecx, edx
+    lea     rdi, [rip + sprScratch]
+    rep     stosb
+endproc
+
+; ---- SetupSprPalettes: slot 0 — [1]=white(player) [2]=red(enemy) [3]=yellow(bullet) ----
+proc SetupSprPalettes
+    mov     ecx, PAL_SLOT
+    mov     edx, IDX_PLAYER
+    mov     r8d, 0x00E0E0FF
+    call    SprSetPalette
+    mov     ecx, PAL_SLOT
+    mov     edx, IDX_ENEMY
+    mov     r8d, 0x00FF4040
+    call    SprSetPalette
+    mov     ecx, PAL_SLOT
+    mov     edx, IDX_BULLET
+    mov     r8d, 0x00FFF000
+    call    SprSetPalette
+endproc
+
+endmodule

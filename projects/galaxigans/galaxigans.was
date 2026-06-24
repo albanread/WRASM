@@ -1,0 +1,34 @@
+; galaxigans.was — the project SHELL (shell-of-includes). A Galaxian/Galaga-style
+; fixed shooter; our first multi-file game PROJECT (projects/ is a sibling of examples/).
+;
+;   was projects\galaxigans\galaxigans.was -o galaxigans.exe   &&   galaxigans.exe
+;
+; SCAFFOLD ONLY — the game fragments below are header-stubbed TODOs, so this does NOT
+; build yet. See DESIGN.md for the gameplay model, the library mapping, and the plan.
+; Port/extend E:\NewFB\bas\demo\16_galaxigans.bas (NewFB "FasterBASIC", 1447 lines).
+;
+; This shell owns NOTHING but the include order: the gpu/library module shells, then the
+; game fragments. Each fragment opens `module Galaxigans` — so its lowercase locals are
+; module-private and jump labels (loop:/done:/row:) are proc-private (no hand-prefixing);
+; Capitalised proc names export across fragments. Only shared .DATA/equate names live in
+; one global namespace, so keep THOSE unique (ENEMY_MAX, *_STRIDE, pool bases).
+
+; ---- the GPU stack (gpu/* family only; harness LAST — it depends on the rest) ----
+.include "../../gpu/canvas.was"               ; idxBuf + palette LUTs + indexed primitives + present
+.include "../../gpu/blit.was"                 ; blend states (alpha-over)
+.include "../../gpu/sprite.was"               ; the instanced sprite compositor (the fleet)
+.include "../../gpu/text.was"                 ; instanced text (HUD: score / lives)
+.include "../../gpu/input.was"                ; keyboard + actions
+.include "../../gpu/particles.was"            ; explosions (PtBurst)
+.include "../../gpu/introspect.was"           ; Snapshot — the headless BMP filmstrip (GameSelfTest)
+.include "../../gpu/harness.was"              ; window + loop + input + default present (GameStart/Loop)
+
+; ---- the game (each fragment opens `module Galaxigans`; data first) ----
+.include "galaxigans_data.inc"        ; .DATA: pools, player, formation, sprite frame-ids
+.include "galaxigans_assets.was"      ; BuildSprAssets: synth sprite frames + palettes
+.include "galaxigans_enemies.was"     ; ResetGame + formation sway (dive AI next)
+.include "galaxigans_player.was"      ; input -> move/fire + player bullets
+.include "galaxigans_collision.was"   ; bullet x enemy + scoring
+.include "galaxigans_draw.was"        ; background + queue the fleet
+.include "galaxigans_main.was"        ; main + the GameInit/GameStep/GameSprites callbacks
+; TODO: galaxigans_audio.was (SFX + ABC soundtrack), the dive/return AI, the bonus saucer.

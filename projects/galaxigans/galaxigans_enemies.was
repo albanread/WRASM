@@ -1,0 +1,63 @@
+; galaxigans_enemies.was — the formation (.CODE). v1: lay out the grid + sway it.
+; The dive/return AI (the heart of Galaga) lands next — a per-step path LUT.
+
+module Galaxigans
+.CODE
+
+; ---- ResetGame: reset player/score + lay out the 8x4 formation, all alive ----
+proc ResetGame uses rbx rsi rdi frame
+    mov     dword ptr [rip + playerX], 312
+    mov     dword ptr [rip + fireCool], 0
+    mov     dword ptr [rip + score], 0
+    mov     dword ptr [rip + formX], 0
+    mov     dword ptr [rip + formDir], 1
+
+    lea     rdi, [rip + bullets]             ; all bullets inactive
+    mov     ecx, BULLET_MAX
+rg_bz:
+    mov     dword ptr [rdi + 8], 0
+    add     rdi, BULLET_STRIDE
+    dec     ecx
+    jnz     rg_bz
+
+    lea     rdi, [rip + enemies]
+    xor     esi, esi                         ; row
+rg_row:
+    xor     ebx, ebx                         ; col
+rg_col:
+    mov     eax, ebx                         ; x = GRID_X0 + col*COL_GAP
+    imul    eax, eax, COL_GAP
+    add     eax, GRID_X0
+    mov     [rdi + 0], eax
+    mov     eax, esi                         ; y = GRID_Y0 + row*ROW_GAP
+    imul    eax, eax, ROW_GAP
+    add     eax, GRID_Y0
+    mov     [rdi + 4], eax
+    mov     dword ptr [rdi + 8], 1           ; alive
+    add     rdi, ENEMY_STRIDE
+    inc     ebx
+    cmp     ebx, ENEMY_COLS
+    jl      rg_col
+    inc     esi
+    cmp     esi, ENEMY_ROWS
+    jl      rg_row
+endproc
+
+; ---- FormationStep: sway formX in [-16,+16], flip at the edges. DrawScene adds
+;      formX to each enemy's x, so the whole grid slides together. ----
+proc FormationStep
+    mov     eax, [rip + formX]
+    add     eax, [rip + formDir]
+    mov     [rip + formX], eax
+    cmp     eax, 16
+    jl      fs_lo
+    mov     dword ptr [rip + formDir], -1
+    jmp     fs_end
+fs_lo:
+    cmp     eax, -16
+    jg      fs_end
+    mov     dword ptr [rip + formDir], 1
+fs_end:
+endproc
+
+endmodule

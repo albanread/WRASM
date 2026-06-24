@@ -1,0 +1,64 @@
+; galaxigans_draw.was — the indexed background + the sprite-queue (.CODE).
+; DrawBackground runs in GameStep (into idxBuf); DrawScene runs in GameSprites
+; (over the resolved frame). Pure draw — no game logic.
+
+module Galaxigans
+.balign 16
+.DATA
+fOne       real4 1.0                          ; SprPush alpha
+.balign 16
+.CODE
+
+; ---- DrawBackground: clear the indexed canvas to black (the fleet composites over) ----
+proc DrawBackground uses rbx frame
+    xor     cl, cl                            ; index 0 -> black
+    call    Cls
+endproc
+
+; ---- DrawScene: queue the player, every alive enemy (x + sway), every live bullet.
+;      SprPush takes float screen coords in xmm1/xmm2 and alpha in xmm3. ----
+proc DrawScene uses rbx rsi frame
+    mov     ecx, [rip + fPlayer]
+    cvtsi2ss xmm1, dword ptr [rip + playerX]
+    mov     eax, PLAYER_Y
+    cvtsi2ss xmm2, eax
+    mov     r8d, PAL_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+
+    lea     rsi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+dsc_e:
+    cmp     dword ptr [rsi + 8], 0
+    je      dsc_enext
+    mov     ecx, [rip + fEnemy]
+    mov     eax, [rsi + 0]
+    add     eax, [rip + formX]
+    cvtsi2ss xmm1, eax
+    cvtsi2ss xmm2, dword ptr [rsi + 4]
+    mov     r8d, PAL_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+dsc_enext:
+    add     rsi, ENEMY_STRIDE
+    dec     ebx
+    jnz     dsc_e
+
+    lea     rsi, [rip + bullets]
+    mov     ebx, BULLET_MAX
+dsc_b:
+    cmp     dword ptr [rsi + 8], 0
+    je      dsc_bnext
+    mov     ecx, [rip + fBullet]
+    cvtsi2ss xmm1, dword ptr [rsi + 0]
+    cvtsi2ss xmm2, dword ptr [rsi + 4]
+    mov     r8d, PAL_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+dsc_bnext:
+    add     rsi, BULLET_STRIDE
+    dec     ebx
+    jnz     dsc_b
+endproc
+
+endmodule

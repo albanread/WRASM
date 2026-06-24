@@ -1,0 +1,60 @@
+; galaxigans_main.was — main + the three harness callbacks (.CODE).
+; The GPU harness (gpu/harness.was) owns the window, message pump, fixed-step timer,
+; input latch, and the default present (resolve idxBuf -> text -> sprites() -> flip).
+; A game is just main wiring the callbacks + GameInit / GameStep / GameSprites.
+
+module Galaxigans
+.CODE
+.globl main
+main:
+    sub     rsp, 40                          ; shadow space + 16-align for the calls
+    lea     rcx, [rip + titleW]
+    lea     rdx, [rip + GameInit]
+    lea     r8,  [rip + GameStep]
+    lea     r9,  [rip + GameSprites]
+    call    GameStart                        ; window + GpuInit/BlitInit/TxtInit + GameInit()
+    mov     ecx, 90                          ; headless: film 90 frames, sample some -> BMP gate
+    mov     edx, 30
+    call    GameSelfTest
+    call    GameLoop                         ; then run interactively (Esc quits)
+    invoke  ExitProcess, 0
+
+; ---- GameInit (callback): harness did Gpu/Blit/Txt; bring up sprites/particles + game ----
+GameInit:
+    sub     rsp, 40
+    call    SprInit
+    call    PtInit
+    call    BuildSprAssets
+    call    ResetGame
+    add     rsp, 40
+    ret
+
+; ---- GameStep (callback): input + logic + draw the indexed background + queue HUD text ----
+GameStep:
+    sub     rsp, 40
+    call    PlayerStep
+    call    BulletsStep
+    call    FormationStep
+    call    Collide
+    call    DrawBackground
+    mov     ecx, 8                           ; HUD: score (white)
+    mov     edx, 6
+    mov     r8b, 15
+    lea     r9, [rip + scoreStr]
+    call    Text
+    add     rsp, 40
+    ret
+
+; ---- GameSprites (callback, r9): composite the fleet over the resolved frame ----
+GameSprites:
+    sub     rsp, 40
+    call    SprClear
+    call    DrawScene                        ; SprPush player + alive enemies + bullets
+    call    SprUpload
+    pContext.RSSetViewports(1, vp)
+    mov     rcx, [rip + pRTV]
+    call    DrawSprites                      ; one DrawInstanced over the back buffer
+    add     rsp, 40
+    ret
+
+endmodule
