@@ -7,8 +7,12 @@
 ; main + the three game procs; the library owns the window/loop/present.
 ; Verifies headlessly: GameSelfTest films snap_*.bmp every few frames.
 
-; nano-TCL — expose the documented verbs of the modules this game links
-; (generated stdverbs.was IFDEF-gates each subsystem behind its NTV_ flag):
+; nano-TCL — dev build: NANOTCL_LIVE opens the live introspection channel (the
+; named pipe). Omit this define for a release build and the whole channel
+; compiles out (no pipe, no reader thread); the baked scripts still run.
+NANOTCL_LIVE   equ 1
+; expose the documented verbs of the modules this game links (stdverbs.was
+; IFDEF-gates each subsystem behind its NTV_ flag):
 NTV_canvas     equ 1
 NTV_blit       equ 1
 NTV_sprite     equ 1

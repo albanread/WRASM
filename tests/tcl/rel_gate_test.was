@@ -1,0 +1,41 @@
+; rel_gate_test.was — RELEASE-mode build of the nano-TCL stack (NANOTCL_LIVE is
+; deliberately NOT defined). Proves the dev-only gate:
+;   * the live channel compiles out — no CreateNamedPipeA / ConnectNamedPipe /
+;     CreateThread import reaches the PE (check the import list after building);
+;   * the channel call sites (TclChannelInit / TclPoll / TclReg) still LINK,
+;     resolving to the no-op stubs in tcl.was;
+;   * the baked-script executor (RunTcl + the verb table) still runs, so an
+;     author-controlled scene script works in a shipped build.
+;
+;   was tests\tcl\rel_gate_test.was -o tests\tcl\rel_gate_test.exe   (exit 0, draws, returns)
+
+NTV_canvas equ 1            ; documented canvas verbs only (no NANOTCL_LIVE)
+
+.DATA
+.balign 16
+relScript:
+    BYTE "Cls rcx=1", 10
+    BYTE "Disc rcx=160, rdx=100, r8=40, r9=15", 10, 0
+.balign 16
+
+.CODE
+.globl main
+main:
+    call    TclInit              ; builds the verb table (no intro/free/cont in release)
+    call    TclStdVerbs          ; registers the canvas verbs
+    call    TclChannelInit       ; stub -> ret (no pipe opened)
+    lea     rcx, [rip + relScript]
+    call    RunTcl               ; executor: dispatches Cls + Disc into fb
+    call    TclPoll              ; stub -> ret
+    xor     ecx, ecx
+    xor     edx, edx
+    call    TclReg               ; stub -> ret
+    invoke  ExitProcess, 0
+
+.include "../../library/canvas.was"
+.include "../../library/blit.was"
+.include "../../library/sprite.was"
+.include "../../library/input.was"
+.include "../../library/introspect.was"
+.include "../../library/tcl/tcl.was"
+.include "../../library/tcl/stdverbs.was"

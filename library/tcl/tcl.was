@@ -29,9 +29,11 @@ verbTbl     QWORD 128 dup(0)       ; up to 64 rows of { nameptr, procaddr } (std
 verbCount   QWORD 0
 nameBuf     BYTE  32 dup(0)
 regBuf      BYTE  16 dup(0)
-vn_intro      BYTE "intro", 0
-vn_free       BYTE "free", 0
+IFDEF NANOTCL_LIVE
+vn_intro      BYTE "intro", 0       ; the live-channel control verbs — built in
+vn_free       BYTE "free", 0        ;   only when NANOTCL_LIVE is defined
 vn_cont       BYTE "cont", 0
+ENDIF
 .balign 16
 
 .CODE
@@ -60,8 +62,9 @@ endproc
 ; order: TclInit (resets the table) -> TclStdVerbs -> the app's TclAddVerb.
 proc TclInit frame
     mov     qword ptr [rip + verbCount], 0
-    lea     rcx, [rip + vn_intro]
-    lea     rdx, [rip + IntroOn]
+IFDEF NANOTCL_LIVE
+    lea     rcx, [rip + vn_intro]      ; intro/free/cont steer the live channel —
+    lea     rdx, [rip + IntroOn]       ;   registered only in a NANOTCL_LIVE build
     call    TclAddVerb
     lea     rcx, [rip + vn_free]
     lea     rdx, [rip + IntroFree]
@@ -69,6 +72,7 @@ proc TclInit frame
     lea     rcx, [rip + vn_cont]
     lea     rdx, [rip + IntroCont]
     call    TclAddVerb
+ENDIF
 endproc
 
 ; ---- nanoCall: load shadow GP -> call the parked verb -> capture rax ----
@@ -316,10 +320,15 @@ endproc
 ; A reader thread does the blocking pipe I/O and hands one command at a time to
 ; the frame thread via a flag: the reader writes cmdBuf then sets cmdReady=1; the
 ; game runs cmdBuf then clears cmdReady. (SPSC; x86 store/load ordering keeps the
-; handshake honest.) Dev-only — a real build should gate this behind a flag.
+; handshake honest.) GATED behind IFDEF NANOTCL_LIVE: a release build (flag
+; undefined) compiles the WHOLE channel out: no pipe, no reader thread, no path
+; for external code into the process. TclChannelInit/TclPoll/TclReg survive as
+; no-op stubs so a game's call sites still link; the baked-script executor
+; (RunTcl + the verb table) is unaffected and runs in every build.
 ; ============================================================================
 .DATA
 .balign 16
+IFDEF NANOTCL_LIVE
 ; \\.\pipe\nanotcl — explicit bytes (was escapes backslashes inside "string" literals)
 pipeName    BYTE 92, 92, 46, 92, 112, 105, 112, 101, 92, 110, 97, 110, 111, 116, 99, 108, 0
 hPipe       QWORD 0
@@ -334,9 +343,11 @@ gotCont     DWORD 0          ; the `cont` verb sets this to release a held frame
 cmdBuf      BYTE  2048 dup(0)
 pingHdr     BYTE  "frame ", 0
 pingBuf     BYTE  512 dup(0)
+ENDIF
 .balign 16
 
 .CODE
+IFDEF NANOTCL_LIVE
 
 ; ---- TclChannelInit: create the pipe + start the reader thread ----
 proc TclChannelInit frame
@@ -494,5 +505,23 @@ endproc
 proc IntroCont                                 ; `cont` — release the held frame
     mov     dword ptr [rip + gotCont], 1
 endproc
+
+ELSE
+; ---- release stubs (NANOTCL_LIVE undefined): the live channel compiled out;
+;      these no-ops keep a game's GameInit/GameStep/advance_one call sites
+;      linking without dragging in the pipe, the reader thread, or any verb
+;      that could execute attacker-supplied input. The executor above (RunTcl,
+;      the verb table, TclInit/TclStdVerbs) is always present, so baked,
+;      author-controlled scripts still run.
+proc TclChannelInit
+    ret
+endproc
+proc TclPoll
+    ret
+endproc
+proc TclReg
+    ret
+endproc
+ENDIF
 
 endmodule
