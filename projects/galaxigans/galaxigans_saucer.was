@@ -50,9 +50,16 @@ ss_bombs:
     jg      ss_exitchk
     mov     ecx, [rip + gSaucerGap]
     mov     [rip + saucerBombT], ecx
-    mov     ecx, eax
+    call    Rng                                ; ~1 in 8 drops is a rare spinning mine
+    and     eax, 7
+    mov     ecx, [rip + saucerX]
     add     ecx, 16                            ; drop from the belly centre
     mov     edx, SAUCER_Y + 12
+    test    eax, eax
+    jnz     ss_dropbomb
+    call    DropMine
+    jmp     ss_exitchk
+ss_dropbomb:
     call    DropBomb
 ss_exitchk:
     mov     eax, [rip + saucerX]              ; off the far side -> despawn

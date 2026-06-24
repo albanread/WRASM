@@ -56,6 +56,9 @@ GameStep:
     call    Collide
     call    SaucerStep                       ; the bonus saucer flyby (drops bombs)
     call    CheckSaucerHit
+    call    MineStep                         ; the saucer's rare spinning mines
+    call    CheckMineHit
+    call    CheckMineShot
     call    PtUpdate                         ; advance explosion debris
     call    CountAlive                       ; stage cleared when none remain
     test    eax, eax

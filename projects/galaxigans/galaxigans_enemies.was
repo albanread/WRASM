@@ -111,6 +111,14 @@ rg_bombz:
     dec     ecx
     jnz     rg_bombz
 
+    lea     rdi, [rip + mines]               ; all mines inactive
+    mov     ecx, MINE_MAX
+rg_minez:
+    mov     dword ptr [rdi + MIN_ACTIVE], 0
+    add     rdi, MINE_STRIDE
+    dec     ecx
+    jnz     rg_minez
+
     lea     rdi, [rip + enemies]
     xor     esi, esi                         ; row
 rg_row:

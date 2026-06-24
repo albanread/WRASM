@@ -216,6 +216,31 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fSaucer2], eax
 
+    lea     rcx, [rip + mineArt0]            ; the spinning mine's 8 rotation frames
+    call    DecAdd16
+    mov     [rip + fMine + 0], eax
+    lea     rcx, [rip + mineArt1]
+    call    DecAdd16
+    mov     [rip + fMine + 4], eax
+    lea     rcx, [rip + mineArt2]
+    call    DecAdd16
+    mov     [rip + fMine + 8], eax
+    lea     rcx, [rip + mineArt3]
+    call    DecAdd16
+    mov     [rip + fMine + 12], eax
+    lea     rcx, [rip + mineArt4]
+    call    DecAdd16
+    mov     [rip + fMine + 16], eax
+    lea     rcx, [rip + mineArt5]
+    call    DecAdd16
+    mov     [rip + fMine + 20], eax
+    lea     rcx, [rip + mineArt6]
+    call    DecAdd16
+    mov     [rip + fMine + 24], eax
+    lea     rcx, [rip + mineArt7]
+    call    DecAdd16
+    mov     [rip + fMine + 28], eax
+
     call    SprUploadAtlas
     call    SetupSprPalettes
     call    SprUploadPalette
@@ -300,6 +325,10 @@ proc SetupSprPalettes
     mov     ecx, STING_SLOT
     lea     rdx, [rip + stingPal]
     mov     r8d, 10
+    call    SetSlotPal
+    mov     ecx, MINE_SLOT
+    lea     rdx, [rip + minePal]
+    mov     r8d, 8
     call    SetSlotPal
 endproc
 

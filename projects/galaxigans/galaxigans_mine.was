@@ -1,0 +1,164 @@
+; galaxigans_mine.was — the rare spinning space-mine the saucer sometimes drops instead of a
+; bomb. It drifts down slowly while spinning; touching it kills the ship (threat), shooting it
+; pays a bonus (treat). (.CODE)
+
+module Galaxigans
+.CODE
+
+; ---- DropMine(ecx=x, edx=y): activate a free mine slot at (x,y) ----
+proc DropMine uses rbx rdi frame in rcx rdx
+    lea     rdi, [rip + mines]
+    mov     ebx, MINE_MAX
+dm_find:
+    cmp     dword ptr [rdi + MIN_ACTIVE], 0
+    je      dm_free
+    add     rdi, MINE_STRIDE
+    dec     ebx
+    jnz     dm_find
+    jmp     dm_done                           ; pool full -> skip the drop
+dm_free:
+    mov     [rdi + MIN_X], ecx
+    mov     [rdi + MIN_Y], edx
+    mov     dword ptr [rdi + MIN_ACTIVE], 1
+    mov     dword ptr [rdi + MIN_ANIM], 0
+dm_done:
+endproc
+
+; ---- MineStep: advance spin + slow (0.5 px/frame) downward drift; despawn off the bottom ----
+proc MineStep uses rbx rdi frame
+    lea     rdi, [rip + mines]
+    mov     ebx, MINE_MAX
+ms_e:
+    cmp     dword ptr [rdi + MIN_ACTIVE], 0
+    je      ms_next
+    mov     eax, [rdi + MIN_ANIM]
+    inc     eax
+    mov     [rdi + MIN_ANIM], eax
+    test    eax, 1                            ; drift only every other frame -> slow
+    jz      ms_off
+    inc     dword ptr [rdi + MIN_Y]
+ms_off:
+    cmp     dword ptr [rdi + MIN_Y], FIELD_H + 8
+    jl      ms_next
+    mov     dword ptr [rdi + MIN_ACTIVE], 0
+ms_next:
+    add     rdi, MINE_STRIDE
+    dec     ebx
+    jnz     ms_e
+endproc
+
+; ---- DrawMines: push each active mine; spin frame = (anim>>2) & 7 ----
+proc DrawMines uses rbx rsi frame
+    lea     rsi, [rip + mines]
+    mov     ebx, MINE_MAX
+dmn_e:
+    cmp     dword ptr [rsi + MIN_ACTIVE], 0
+    je      dmn_next
+    mov     eax, [rsi + MIN_ANIM]
+    shr     eax, 2
+    and     eax, 7
+    lea     rdx, [rip + fMine]
+    mov     ecx, [rdx + rax*4]
+    cvtsi2ss xmm1, dword ptr [rsi + MIN_X]
+    cvtsi2ss xmm2, dword ptr [rsi + MIN_Y]
+    mov     r8d, MINE_SLOT
+    movss   xmm3, [rip + fOne]
+    call    SprPush
+dmn_next:
+    add     rsi, MINE_STRIDE
+    dec     ebx
+    jnz     dmn_e
+endproc
+
+; ---- CheckMineHit: a mine overlapping the ship kills the player (threat) ----
+proc CheckMineHit uses rbx rdi frame
+    cmp     dword ptr [rip + pAlive], 0
+    je      cmh_done
+    mov     r8d, [rip + playerX]
+    add     r8d, 8                            ; centre the ship hitbox
+    lea     rdi, [rip + mines]
+    mov     ebx, MINE_MAX
+cmh_e:
+    cmp     dword ptr [rdi + MIN_ACTIVE], 0
+    je      cmh_next
+    mov     eax, [rdi + MIN_X]               ; x overlap: mx < px+8 && mx+16 > px
+    mov     ecx, r8d
+    add     ecx, 8
+    cmp     eax, ecx
+    jge     cmh_next
+    mov     ecx, eax
+    add     ecx, MINE_W
+    cmp     ecx, r8d
+    jle     cmh_next
+    mov     eax, [rdi + MIN_Y]               ; y overlap: my < PLAYER_Y+8 && my+16 > PLAYER_Y
+    cmp     eax, PLAYER_Y + 8
+    jge     cmh_next
+    mov     ecx, eax
+    add     ecx, MINE_H
+    cmp     ecx, PLAYER_Y
+    jle     cmh_next
+    ; hit
+    mov     dword ptr [rdi + MIN_ACTIVE], 0
+    mov     ecx, [rip + playerX]
+    mov     edx, PLAYER_Y
+    call    BurstAt
+    call    PlayDeath
+    mov     dword ptr [rip + pAlive], 0
+    mov     dword ptr [rip + pDeathT], RESPAWN_FRAMES
+    dec     dword ptr [rip + lives]
+    jmp     cmh_done
+cmh_next:
+    add     rdi, MINE_STRIDE
+    dec     ebx
+    jnz     cmh_e
+cmh_done:
+endproc
+
+; ---- CheckMineShot: a player bullet destroying a mine -> bonus (treat) ----
+proc CheckMineShot uses rbx rsi rdi frame
+    lea     rsi, [rip + bullets]
+    mov     ebx, BULLET_MAX
+cms_b:
+    cmp     dword ptr [rsi + 8], 0
+    je      cms_bnext
+    mov     r8d, [rsi + 0]                   ; bullet x
+    mov     r9d, [rsi + 4]                   ; bullet y
+    lea     rdi, [rip + mines]
+    mov     ecx, MINE_MAX
+cms_m:
+    cmp     dword ptr [rdi + MIN_ACTIVE], 0
+    je      cms_mnext
+    mov     eax, [rdi + MIN_X]               ; bullet point inside the mine AABB?
+    cmp     r8d, eax
+    jl      cms_mnext
+    add     eax, MINE_W
+    cmp     r8d, eax
+    jge     cms_mnext
+    mov     eax, [rdi + MIN_Y]
+    cmp     r9d, eax
+    jl      cms_mnext
+    add     eax, MINE_H
+    cmp     r9d, eax
+    jge     cms_mnext
+    ; hit -> destroy + burst + bonus
+    mov     dword ptr [rdi + MIN_ACTIVE], 0
+    mov     dword ptr [rsi + 8], 0
+    mov     ecx, [rdi + MIN_X]
+    add     ecx, 8
+    mov     edx, [rdi + MIN_Y]
+    add     edx, 8
+    call    BurstAt
+    call    PlayBoom
+    add     dword ptr [rip + score], MINE_SCORE
+    jmp     cms_bnext                         ; one mine per bullet
+cms_mnext:
+    add     rdi, MINE_STRIDE
+    dec     ecx
+    jnz     cms_m
+cms_bnext:
+    add     rsi, BULLET_STRIDE
+    dec     ebx
+    jnz     cms_b
+endproc
+
+endmodule

@@ -66,6 +66,18 @@ SAUCER_BOMB_GAP equ 28                        ; frames between its bomb drops
 SAUCER_SLOT     equ 17                        ; the saucer's own palette (high slot)
 SAUCER_SCORE    equ 200
 
+; ---- rare spinning mine the saucer sometimes drops (slow drift; threat + shoot-for-bonus) ----
+MINE_MAX        equ 6
+MINE_STRIDE     equ 16                        ; {x, y, active, anim}
+MIN_X           equ 0
+MIN_Y           equ 4
+MIN_ACTIVE      equ 8
+MIN_ANIM        equ 12
+MINE_W          equ 16
+MINE_H          equ 16
+MINE_SLOT       equ 9                         ; its own palette (aliens own 1..8)
+MINE_SCORE      equ 150                       ; the "treat" — bonus for shooting one
+
 ; ---- game lifecycle states + the triumphal spiral dance ----
 STATE_PLAYING  equ 0
 STATE_GAMEOVER equ 1
@@ -163,6 +175,8 @@ saucerSndT   DWORD 0                            ; countdown to re-trigger the lo
 enemies    BYTE  1760 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*44)
 bullets    BYTE  64  dup(0)                   ; BULLET_MAX * BULLET_STRIDE (4*16)
 bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
+.balign 16
+mines      BYTE  96  dup(0)                   ; MINE_MAX * MINE_STRIDE (6*16)
 
 ; sprite frame ids (set by BuildSprAssets)
 fPlayer    DWORD ?                            ; (legacy 8x8 placeholder, unused)
@@ -212,6 +226,7 @@ fUp        DWORD 8 dup(0)
 fUp2       DWORD 8 dup(0)
 fBankL     DWORD 8 dup(0)
 fBankR     DWORD 8 dup(0)
+fMine      DWORD 8 dup(0)                    ; the spinning mine's 8 rotation frames
 
 ; ship palette (slot 6 indices 1..15) — steel-blue hull, cyan cockpit, orange engine glow
 .balign 16
@@ -243,6 +258,9 @@ beetlePal  DWORD 0x00103018, 0x00184828, 0x00206038, 0x00308048, 0x0040A058   ; 
 .balign 16
 stingPal   DWORD 0x00102838, 0x00184050, 0x00205868, 0x00287888, 0x003898A8   ; stingray: steel-teal
            DWORD 0x0048B8C8, 0x0068D0E0, 0x0098E8F0, 0x00C8F4FF, 0x00FFFFFF
+.balign 16
+minePal    DWORD 0x00181820, 0x00303840, 0x00505868, 0x00788090, 0x00B0B8C8   ; mine: dark metal -> sheen,
+           DWORD 0x00606878, 0x00802018, 0x00FF4030                            ;   spike grey, red trigger light
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
