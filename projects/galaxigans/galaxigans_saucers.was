@@ -1,0 +1,213 @@
+; galaxigans_saucers.was — PRIME SAUCER boss-flyby aliens (levels 1-3).
+; Big horizontal capital-ship aliens that slowly cross the TOP of the screen as a
+; bonus/menace flyby (Galaga bonus-saucer idea, scaled up). Each is a 32x16 indexed
+; hex bitmap (EVERY "row" is EXACTLY 32 chars; rows pack contiguously) with a 2-frame
+; animation so it shimmers as it drifts. Each has its own 16-colour shaded palette.
+;
+; SPRITE CONVENTION: each char is a palette index '0'-'9' -> 0-9, 'A'-'F' -> 10-15,
+; '.' -> 0 = TRANSPARENT. Index 0 transparent, index 1 = dark outline.
+;
+; =====================================================================================
+; INTENDED BEHAVIOUR (I'll wire SprAddFrame / SprSetPalette + movement)
+; -------------------------------------------------------------------------------------
+;   - The prime saucer is a single off-formation craft, NOT part of the 8x5 grid.
+;   - It enters fully OFF-SCREEN on one side, drifts SLOWLY straight across the TOP
+;     band of the play-field, then exits the far side and despawns.
+;   - Drift band  : y = 24  (above the formation, which starts at GRID_Y0 = 56).
+;   - Direction   : alternate each spawn (L->R, then R->L, ...). Start x = -32 going
+;     right (vx = +PRIME_VX) or x = FIELD_W (640) going left (vx = -PRIME_VX).
+;   - Speed (slow, menacing — slower than a diver's 3 px/frame):
+;       Level 1 SCOUT       PRIME_VX = 2   (fast-LOOKING but still a slow crawl)
+;       Level 2 CRUISER     PRIME_VX = 1   (heavier)
+;       Level 3 DREADNOUGHT PRIME_VX = 1   (slowest / heaviest; ~every 2nd frame ok too)
+;   - Animation   : flip frame0/frame1 every ~10 frames (6 Hz shimmer) — running lights
+;     cycle, engine glow pulses, dish/eye rotates. Independent of x-movement.
+;   - Bonus       : if a player bullet hits it, it dies in a flash and awards bonus pts:
+;       Level 1 = 300, Level 2 = 600, Level 3 = 1000 (scale as you like). It does NOT
+;     drop bombs and does NOT collide-kill the player (pure bonus menace).
+;   - Spawn timing (per level — a flyby is an occasional event, not constant):
+;       Level 1 : first at ~6 s, then every ~14 s while the wave is alive.
+;       Level 2 : first at ~5 s, then every ~12 s.
+;       Level 3 : first at ~4 s, then every ~10 s (dread shows up sooner / more often).
+;     (Frames @60fps: L1 360/840, L2 300/720, L3 240/600.) Only one prime alive at once.
+; =====================================================================================
+
+module Galaxigans
+
+.balign 16
+.DATA
+.balign 16
+
+; -------------------------------------------------------------------------------------
+; SAUCER 1 — "VESPER SCOUT"  (LEVEL 1) : sleek, fast-looking recon dart.
+;   A narrow swept hull with a glowing forward sensor eye and a twin ion trail. Frame
+;   anim = the two running-light strakes + the tail flame cycle (dart looks like it's
+;   streaking). Palette (slot, index -> 0x00RRGGBB):
+;     0 transparent
+;     1 0x00081018  dark outline / shadow
+;     2 0x00123A52  hull shadow (teal-steel)
+;     3 0x001E5E80  hull mid
+;     4 0x002E86AE  hull light
+;     5 0x0055B8D6  hull highlight (cyan edge)
+;     6 0x0000E0FF  running light A (bright cyan) — lit in frame0
+;     7 0x00007088  running light A dim — shown in frame1
+;     8 0x00FFE14A  sensor eye core (amber)
+;     9 0x00FF7A1E  sensor eye ring / ion flame mid (orange)
+;     A 0x00FFD080  ion flame hot tip (pale gold)
+;     B 0x00B02050  flame tail dim (deep rose) — engine-pulse low
+;     C 0x00FFFFFF  spark highlight
+; -------------------------------------------------------------------------------------
+.balign 16
+; frame 0 — running lights LIT (6), flame long/hot. Nose at RIGHT, ion trail at LEFT.
+saucer1Art   BYTE "................................"
+             BYTE "...............234432..........."
+             BYTE "BA9..........234566654322......."
+             BYTE ".BA9.......2345666CC66543222...."
+             BYTE "..BA9....2345668888866654322...."
+             BYTE "AAAA9...23456889888866654322...."
+             BYTE "..BA9....2345668888866654322...."
+             BYTE ".BA9.......2345666CC66543222...."
+             BYTE "BA9..........234566654322......."
+             BYTE "...............234432..........."
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+; frame 1 — running lights DIM (7), flame short/pulsed (B/rose), sensor flicker.
+saucer1Art2  BYTE "................................"
+             BYTE "...............234432..........."
+             BYTE ".B9..........234577754322......."
+             BYTE "..B9.......2345777CC77543222...."
+             BYTE "...B9....2345778888877754322...."
+             BYTE "BBBB9...23457789888877754322...."
+             BYTE "...B9....2345778888877754322...."
+             BYTE "..B9.......2345777CC77543222...."
+             BYTE ".B9..........234577754322......."
+             BYTE "...............234432..........."
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+             BYTE "................................"
+
+; -------------------------------------------------------------------------------------
+; SAUCER 2 — "MAROON CRUISER"  (LEVEL 2) : bigger armoured disc-cruiser.
+;   A broad lenticular saucer hull with a rotating central dome/dish, three running
+;   lights along each rim and twin under-slung pods. Frame anim = the dome spin (the
+;   bright quadrant of the dish jumps) + rim lights chase. Palette:
+;     0 transparent
+;     1 0x00100408  dark outline
+;     2 0x00401018  hull shadow (oxblood)
+;     3 0x00702028  hull mid-dark
+;     4 0x009A3038  hull mid (crimson)
+;     5 0x00C85048  hull light
+;     6 0x00E88060  hull highlight (warm copper)
+;     7 0x00FFC890  rim bevel / metal sheen
+;     8 0x002A2238  dome shadow (violet-steel)
+;     9 0x006A4FA8  dome mid (amethyst)
+;     A 0x00B08CF0  dome light
+;     B 0x00E6D2FF  dome glint (rotating highlight)
+;     C 0x0030FF9A  rim running light (toxic green) — chase
+;     D 0x00126040  rim light dim
+;     E 0x00FFE45A  pod thruster glow (amber)
+; -------------------------------------------------------------------------------------
+.balign 16
+; frame 0 — dome glint upper-LEFT (B), rim corner-lights (C), pods lit (E).
+saucer2Art   BYTE "........11111111111111.........."
+             BYTE ".....11177777777777777111......."
+             BYTE "...117666666666666666666671....."
+             BYTE "..1766555555BB55555555556671...."
+             BYTE ".176555444AABBA4455555555556671."
+             BYTE "17655544449BA9444455555555556671"
+             BYTE "C7654443339999944443344555556C71"
+             BYTE "17654433348888843344333445556671"
+             BYTE "C7654333333333333333334445566C71"
+             BYTE "176555D4333222222223334445566661"
+             BYTE ".176554432221111111222333445667."
+             BYTE "..1765443.E........E.34556671..."
+             BYTE "...11765.EEE......EEE.567111...."
+             BYTE ".....111.E..........E.111......."
+             BYTE "..........E........E............"
+             BYTE "................................"
+; frame 1 — dome glint upper-RIGHT (B), corner-lights swapped to mid-rim, pods brighter.
+saucer2Art2  BYTE "........11111111111111.........."
+             BYTE ".....11177777777777777111......."
+             BYTE "...117666666666666666666671....."
+             BYTE "..1766555555BB55555555556671...."
+             BYTE ".176555444ABBA44455555555556671."
+             BYTE "17655544449AB9444455555555556671"
+             BYTE "77654443339999944443344555556671"
+             BYTE "C7654433348888843344333445556C71"
+             BYTE "77654333333333333333334445566671"
+             BYTE "176555D4333222222223334445566661"
+             BYTE ".176554432221111111222333445667."
+             BYTE "..1765443EE........E.34556671..."
+             BYTE "...11765EEE......E.E.5671111...."
+             BYTE ".....111.E..........E.111......."
+             BYTE ".........E........E............."
+             BYTE "................................"
+
+; -------------------------------------------------------------------------------------
+; SAUCER 3 — "OBSIDIAN DREADNOUGHT"  (LEVEL 3) : heaviest, most ornate capital ship.
+;   A long armoured wedge with layered green hull plating, a forward command spike, twin
+;   spinal cannons, a row of viewport lights, and a quad-engine bank that pulses. Frame
+;   anim = the engine bank flares (red->white) + the cannon charge glow + viewport blink.
+;   Palette:
+;     0 transparent
+;     1 0x00040A06  dark outline
+;     2 0x000F2A18  hull shadow (deep jade)
+;     3 0x00184A28  hull mid-dark
+;     4 0x00266A38  hull mid (jade)
+;     5 0x00389A50  hull light
+;     6 0x0058C878  hull highlight (acid green edge)
+;     7 0x00A8F0B0  plating sheen / bevel
+;     8 0x00C0C0C0  steel cannon / spike (silver)
+;     9 0x00FFF0A0  viewport light (pale gold)
+;     A 0x00FF3020  engine flame core (red) — low pulse
+;     B 0x00FF9A20  engine flame mid (orange)
+;     C 0x00FFE060  engine flame hot (yellow) — high pulse
+;     D 0x00FFFFFF  spark / cannon charge glint
+;     E 0x009030C0  energy halo (violet) — cannon charge ring
+;     F 0x0040FFE0  forward sensor beam (cyan)
+; -------------------------------------------------------------------------------------
+.balign 16
+; frame 0 — engines low (A/B) at LEFT, cannons charged (E ring + D glint), viewports LIT (9).
+;           Command spike + cyan sensor beam (F) point RIGHT.
+saucer3Art   BYTE "..............8F8..............."
+             BYTE "..............888....1111111...."
+             BYTE "..AB.......111887711177666667111"
+             BYTE ".AABB...11776655555776655555671."
+             BYTE "AAABB117766554444446654444446671"
+             BYTE "BAAB17665544499444556644E8E44667"
+             BYTE "AAAB16655444999444566D88D6445667"
+             BYTE "AABB17665544499444556644E8E44667"
+             BYTE "AAABB117766554444446654444446671"
+             BYTE ".AABB...11776655555776655555671."
+             BYTE "..AB.......111887711177666667111"
+             BYTE "..............888....1111111...."
+             BYTE "..............8F8..............."
+             BYTE "..............8................."
+             BYTE "................................"
+             BYTE "................................"
+; frame 1 — engines flaring (C/D), cannon charge swelled (E->D core), viewports DIM (8).
+saucer3Art2  BYTE "..............8F8..............."
+             BYTE "..............888....1111111...."
+             BYTE ".BCD.......111887711177666667111"
+             BYTE "BBCCD...11776655555776655555671."
+             BYTE "CBBCD117766554444446654444446671"
+             BYTE "DCBC17665544488444556644EDE44667"
+             BYTE "CCCD16655444888444566D88D6445667"
+             BYTE "DCBC17665544488444556644EDE44667"
+             BYTE "CBBCD117766554444446654444446671"
+             BYTE "BBCCD...11776655555776655555671."
+             BYTE ".BCD.......111887711177666667111"
+             BYTE "..............888....1111111...."
+             BYTE "..............8F8..............."
+             BYTE "..............8................."
+             BYTE "................................"
+             BYTE "................................"
+
+endmodule

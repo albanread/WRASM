@@ -1,0 +1,517 @@
+module Galaxigans
+
+; galaxigans_aliens2.was — a LIBRARY of distinct animated alien creatures for later
+; levels. Each is 16x16 with TWO animation frames (<name>Art = frame 0,
+; <name>Art2 = frame 1) and carries its own dedicated 16-colour shaded palette.
+; EVERY BYTE row is EXACTLY 16 chars — rows pack contiguously, so any off-width
+; row corrupts the whole image. Palette convention: idx 0 = transparent,
+; idx 1 = dark outline, then shade ramps + a highlight.
+; Wiring (SprAddFrame / SprSetPalette) is added separately.
+
+.DATA
+.balign 16
+
+; ============================================================================
+; 1) GRUNT — the GALAXIAN GRUNT. The classic insectoid that fills a formation
+;    row: domed red carapace, stubby wings, twin antennae, glowing eyes, legs.
+;    Animation: wings flap UP (frame 0) / DOWN (frame 1) + antennae twitch.
+; idx 0 = transparent
+; idx 1 = 0x00200810  dark outline
+; idx 2 = 0x00C42030  carapace shadow (red)
+; idx 3 = 0x00E84038  carapace mid
+; idx 4 = 0x00FF6850  carapace light
+; idx 5 = 0x00FFB088  carapace highlight
+; idx 6 = 0x00803010  wing shadow (amber)
+; idx 7 = 0x00C86820  wing mid
+; idx 8 = 0x00F0A840  wing light
+; idx 9 = 0x0030E0FF  eye glow (cyan)
+; idx A = 0x00FFFFFF  eye core / antenna tip
+; ============================================================================
+.balign 16
+gruntArt   BYTE "................"
+           BYTE "..A........A...."
+           BYTE "...1......1....."
+           BYTE "....122222......"
+           BYTE "...12333321....."
+           BYTE "..1234443321...."
+           BYTE "8.123454432.8..."
+           BYTE "8.234595432.8..."
+           BYTE "7.2349A9432.7..."
+           BYTE "7.123454321.7..."
+           BYTE "6..1233321..6..."
+           BYTE "...12.22.21....."
+           BYTE "..1..1..1..1...."
+           BYTE ".1...1..1...1..."
+           BYTE "................"
+           BYTE "................"
+; GRUNT frame 1 — wings DOWN, antennae twitch inward
+gruntArt2  BYTE "................"
+           BYTE "...A......A....."
+           BYTE "....1....1......"
+           BYTE "....122222......"
+           BYTE "...12333321....."
+           BYTE "..1234443321...."
+           BYTE "6.123454432.6..."
+           BYTE "7.234595432.7..."
+           BYTE "8.2349A9432.8..."
+           BYTE "8.123454321.8..."
+           BYTE "7..1233321..7..."
+           BYTE "...12.22.21....."
+           BYTE "..1..1..1..1...."
+           BYTE ".1...1..1...1..."
+           BYTE "................"
+           BYTE "................"
+
+; ============================================================================
+; 2) MOTH — broad dusty wings with eyespots, feathery antennae, fuzzy body.
+;    Animation: wings SPREAD wide (frame 0) / FOLDED narrower (frame 1).
+; idx 0 = transparent
+; idx 1 = 0x00201808  dark outline
+; idx 2 = 0x00604828  wing shadow (tan)
+; idx 3 = 0x00907040  wing mid
+; idx 4 = 0x00C0A068  wing light
+; idx 5 = 0x00E8D8A8  wing highlight
+; idx 6 = 0x00482810  body shadow (brown)
+; idx 7 = 0x00805030  body mid
+; idx 8 = 0x00B88858  body light
+; idx 9 = 0x00FF4020  eyespot ring (orange)
+; idx A = 0x00FFE060  eyespot core (yellow)
+; ============================================================================
+.balign 16
+mothArt    BYTE "..1.1666.1.1...."
+           BYTE "...1.676.1......"
+           BYTE ".1234167614321.."
+           BYTE "12345168651432.."
+           BYTE "1239A1686193A21."
+           BYTE "12345167651432.."
+           BYTE "1234516861432..."
+           BYTE ".1234168614321.."
+           BYTE "..123416861432.."
+           BYTE "...1231676132..."
+           BYTE "....123676321..."
+           BYTE ".....12676321..."
+           BYTE "......1676.1...."
+           BYTE ".......171......"
+           BYTE "................"
+           BYTE "................"
+; MOTH frame 1 — wings folded back, narrower span, body lifts
+mothArt2   BYTE "....1666.1......"
+           BYTE "...1.676.1......"
+           BYTE "...1234674321..."
+           BYTE "...1235685321..."
+           BYTE "..1239A6A9321..."
+           BYTE "..12341686143..."
+           BYTE "...1234686431..."
+           BYTE "...12341686431.."
+           BYTE "....123168631..."
+           BYTE "....1231676321.."
+           BYTE ".....123676321.."
+           BYTE "......1267631..."
+           BYTE "......1.676.1..."
+           BYTE ".......171......"
+           BYTE "................"
+           BYTE "................"
+
+; ============================================================================
+; 3) BEETLE — armoured purple scarab, hard domed shell with a central seam,
+;    six clawed legs, short horn. Animation: legs scuttle out (0) / in (1)
+;    and the shell highlight pulses.
+; idx 0 = transparent
+; idx 1 = 0x00100818  dark outline
+; idx 2 = 0x00382060  shell shadow (violet)
+; idx 3 = 0x00583098  shell mid
+; idx 4 = 0x007848C8  shell light
+; idx 5 = 0x00A878F0  shell highlight
+; idx 6 = 0x00201040  seam shadow
+; idx 7 = 0x0020C0A0  carapace sheen (teal)
+; idx 8 = 0x0010A088  leg dark
+; idx 9 = 0x00FFC020  horn / mandible (gold)
+; idx A = 0x00FF3060  eye (crimson)
+; ============================================================================
+.balign 16
+beetleArt  BYTE "......9..9......"
+           BYTE ".8....19.91....8"
+           BYTE "..8..1A6A.1..8.."
+           BYTE "...112344211...."
+           BYTE "..1234545432.1.."
+           BYTE "8.1234565432.18."
+           BYTE ".1123476743211.."
+           BYTE ".1234565654321.."
+           BYTE ".1234545454321.."
+           BYTE "8.12344544321.8."
+           BYTE "..1123443211...."
+           BYTE "8..1123321..8..."
+           BYTE ".8...12.21...8.."
+           BYTE "..8..1..1..8...."
+           BYTE "...8.8..8.8....."
+           BYTE "................"
+; BEETLE frame 1 — legs tuck in, sheen pulses brighter (7->5 swap on seam)
+beetleArt2 BYTE "......9..9......"
+           BYTE "..8...19.91...8."
+           BYTE "...8.1A6A.1.8..."
+           BYTE "...112344211...."
+           BYTE "...1234545432.1."
+           BYTE ".8.1234565432.8."
+           BYTE ".1123455543211.."
+           BYTE ".1234575754321.."
+           BYTE ".1234545454321.."
+           BYTE ".8.12344544321.8"
+           BYTE "...1123443211..."
+           BYTE "...81123321.8..."
+           BYTE "....812.218....."
+           BYTE "...8.1..1.8....."
+           BYTE "....8.8..8.8...."
+           BYTE "................"
+
+; ============================================================================
+; 4) SCORPION — armoured crab/scorpion with two big claws, raised stinger tail.
+;    Animation: pincers OPEN (frame 0) / CLOSED (frame 1), tail flicks.
+; idx 0 = transparent
+; idx 1 = 0x00180400  dark outline
+; idx 2 = 0x00803010  carapace shadow (rust)
+; idx 3 = 0x00B05818  carapace mid
+; idx 4 = 0x00E08828  carapace light
+; idx 5 = 0x00FFC050  carapace highlight
+; idx 6 = 0x00601808  claw shadow
+; idx 7 = 0x00A03810  claw mid
+; idx 8 = 0x00D86828  claw light
+; idx 9 = 0x0040FF80  venom stinger (toxic green)
+; idx A = 0x00FF2020  eyes (red)
+; ============================================================================
+.balign 16
+scorpionArt BYTE "8......99......8"
+           BYTE "78....1991....87"
+           BYTE ".67..167761..76."
+           BYTE "..1..16776.1..1."
+           BYTE "...1234554321..."
+           BYTE "..123445544321.."
+           BYTE ".12344A55A44321."
+           BYTE ".12344555554321."
+           BYTE ".12344544454321."
+           BYTE "..1234454432.1.."
+           BYTE "...12344432....."
+           BYTE "....123321..199."
+           BYTE "....1.221..1991."
+           BYTE "...1...1...1991."
+           BYTE "..1.........199."
+           BYTE "................"
+; SCORPION frame 1 — claws clench shut, tail curls higher
+scorpionArt2 BYTE "..8.......199..."
+           BYTE "..78.....1991..."
+           BYTE "...671..19910..."
+           BYTE "....16.16991...."
+           BYTE "...1234554321..."
+           BYTE "..123445544321.."
+           BYTE ".12344A55A44321."
+           BYTE ".12344555554321."
+           BYTE ".12344544454321."
+           BYTE "..1234454432.1.."
+           BYTE "...12344432....."
+           BYTE "....123321......"
+           BYTE "....1.221.1.1..."
+           BYTE "...1...1.1.1...."
+           BYTE "..1.....1......."
+           BYTE "................"
+
+; ============================================================================
+; 5) MANTIS — slender green praying mantis, triangular head, big eyes,
+;    raptorial forearms held up. Animation: arms RAISED (0) / STRIKE down (1).
+; idx 0 = transparent
+; idx 1 = 0x00081800  dark outline
+; idx 2 = 0x00206018  body shadow (green)
+; idx 3 = 0x00388828  body mid
+; idx 4 = 0x0058B840  body light
+; idx 5 = 0x0090E868  body highlight
+; idx 6 = 0x00104010  arm shadow
+; idx 7 = 0x002C7820  arm mid
+; idx 8 = 0x004CA838  arm light
+; idx 9 = 0x00FFE020  compound eye (yellow)
+; idx A = 0x00100800  eye pupil
+; ============================================================================
+.balign 16
+mantisArt  BYTE "..8..........8.."
+           BYTE "..78........87.."
+           BYTE "...7.19.91.7...."
+           BYTE "...8.9A.A9.8...."
+           BYTE "..87.149941.78.."
+           BYTE ".87...1331...78."
+           BYTE ".8.1112442111.8."
+           BYTE "..712345543217.."
+           BYTE "..7.1234543.17.."
+           BYTE "...8.123432.8..."
+           BYTE "....1234321....."
+           BYTE "....1234321....."
+           BYTE ".....12321......"
+           BYTE ".....12321......"
+           BYTE "....1.2.21.1...."
+           BYTE "...1.......1...."
+; MANTIS frame 1 — forearms strike forward/down, head dips
+mantisArt2 BYTE "................"
+           BYTE "....19.91......."
+           BYTE "....9A.A9......."
+           BYTE "...149941......."
+           BYTE "....1331........"
+           BYTE ".8.1112442111.8."
+           BYTE ".78.12345543.87."
+           BYTE "..7.1234543.17.."
+           BYTE "..87.123432.78.."
+           BYTE "...8.1234321.8.."
+           BYTE "...87.12321.78.."
+           BYTE "....1.12321.1..."
+           BYTE ".....12321......"
+           BYTE ".....12321......"
+           BYTE "....1.2.21.1...."
+           BYTE "...1.......1...."
+
+; ============================================================================
+; 6) HORNET — angular yellow/black hornet, narrow waist, swept wings,
+;    long abdomen with venom stinger. Animation: wings UP (0) / DOWN (1).
+; idx 0 = transparent
+; idx 1 = 0x00180800  dark outline
+; idx 2 = 0x00805000  band dark (amber)
+; idx 3 = 0x00C08800  band mid
+; idx 4 = 0x00F0C020  band light
+; idx 5 = 0x00FFF080  band highlight
+; idx 6 = 0x00100000  stripe (near-black)
+; idx 7 = 0x00504030  wing membrane shadow
+; idx 8 = 0x00C0B0A0  wing membrane light
+; idx 9 = 0x00FF3010  eyes (red)
+; idx A = 0x00E0E0FF  stinger glint
+; ============================================================================
+.balign 16
+hornetArt  BYTE "88...1991...88.."
+           BYTE ".88.1923291.88.."
+           BYTE "..8.19A6A91.8..."
+           BYTE "78..1234321..87."
+           BYTE "78..1634361..87."
+           BYTE "78..1234321..87."
+           BYTE ".8..1645461..8.."
+           BYTE "....1234321....."
+           BYTE ".....16461......"
+           BYTE ".....12321......"
+           BYTE ".....16461......"
+           BYTE "......1231......"
+           BYTE "......16461....."
+           BYTE ".......121A....."
+           BYTE "........1A......"
+           BYTE "................"
+; HORNET frame 1 — wings sweep down, abdomen recoils up
+hornetArt2 BYTE "................"
+           BYTE "....1991........"
+           BYTE "..8.1923291.8..."
+           BYTE ".88.19A6A91.88.."
+           BYTE "788.1234321.887."
+           BYTE "78..1634361..87."
+           BYTE "78..1234321..87."
+           BYTE ".8..1645461..8.."
+           BYTE "....1234321....."
+           BYTE ".....16461......"
+           BYTE ".....12321......"
+           BYTE ".....16461......"
+           BYTE "......1231......"
+           BYTE "......16A1......"
+           BYTE ".......1A......."
+           BYTE "................"
+
+; ============================================================================
+; 7) JELLYFISH — translucent floating bell with trailing tentacles, glowing
+;    core. Animation: bell EXPANDED + tentacles loose (0) / bell CONTRACTED +
+;    tentacles drawn up (1) — a pulse.
+; idx 0 = transparent
+; idx 1 = 0x00100828  dark outline
+; idx 2 = 0x00302C70  bell shadow (indigo)
+; idx 3 = 0x004848A8  bell mid
+; idx 4 = 0x006870D8  bell light
+; idx 5 = 0x009CB0FF  bell highlight
+; idx 6 = 0x00FF40C0  core glow (magenta)
+; idx 7 = 0x00FF90E0  core bright
+; idx 8 = 0x0050E0E0  tentacle (cyan)
+; idx 9 = 0x00A0FFFF  tentacle tip
+; idx A = 0x00FFFFFF  sparkle
+; ============================================================================
+.balign 16
+jellyfishArt BYTE "....1A....A1...."
+           BYTE "...1234334321..."
+           BYTE "..123455554321.."
+           BYTE ".12345566554321."
+           BYTE ".12455677654421."
+           BYTE "1234556776554321"
+           BYTE "1234556666554321"
+           BYTE "1234455555544321"
+           BYTE ".112344554431121"
+           BYTE ".8.18.18.18.18.."
+           BYTE "..8.8..8..8.8..."
+           BYTE "...9..8..8..9..."
+           BYTE "...8..9..9..8..."
+           BYTE "..9...8..8...9.."
+           BYTE "..8...9..9...8.."
+           BYTE "...9...9.9...9.."
+; JELLYFISH frame 1 — bell pulses narrower/taller, tentacles pull together
+jellyfishArt2 BYTE ".....1AA1......."
+           BYTE "....123321......"
+           BYTE "...12455421....."
+           BYTE "..1234566432...."
+           BYTE "..1245677542...."
+           BYTE ".123456776543..."
+           BYTE ".123456666543..."
+           BYTE ".123445555443..."
+           BYTE ".112344444321..."
+           BYTE "..1123443211...."
+           BYTE "...8.8.8.8......"
+           BYTE "....8.9.8.9....."
+           BYTE "....9.8.9.8....."
+           BYTE ".....989.89....."
+           BYTE "......898.9....."
+           BYTE ".......99......."
+
+; ============================================================================
+; 8) SPIDER — bulbous abdomen, eight jointed legs, cluster of eyes.
+;    Animation: legs SPLAYED wide (0) / CROUCHED in (1).
+; idx 0 = transparent
+; idx 1 = 0x00100404  dark outline
+; idx 2 = 0x00481414  abdomen shadow (maroon)
+; idx 3 = 0x00782020  abdomen mid
+; idx 4 = 0x00A83838  abdomen light
+; idx 5 = 0x00D86858  abdomen highlight
+; idx 6 = 0x00301010  leg dark
+; idx 7 = 0x00603030  leg mid
+; idx 8 = 0x00906058  leg light
+; idx 9 = 0x00FFE040  eyes (yellow)
+; idx A = 0x00FFFFFF  fang glint
+; ============================================================================
+.balign 16
+spiderArt  BYTE "6............6.."
+           BYTE ".7..6....6..7..."
+           BYTE "..8.7....7.8...."
+           BYTE "8..87.99.78..8.."
+           BYTE ".8..1.99.1..8..."
+           BYTE "..8.1234321.8..."
+           BYTE "...1234543210..."
+           BYTE "8.12345554321.8."
+           BYTE "7.12345554321.7."
+           BYTE "8.12345554321.8."
+           BYTE "..1234543210...."
+           BYTE "...12343210....."
+           BYTE "..8.123210.8...."
+           BYTE ".8.7.1AA1.7.8..."
+           BYTE "8..7..AA..7..8.."
+           BYTE "..6........6...."
+; SPIDER frame 1 — legs crouch inward, abdomen lifts
+spiderArt2 BYTE "................"
+           BYTE "..6........6...."
+           BYTE "...7.6..6.7....."
+           BYTE "....87.78......."
+           BYTE "8..8.99.8..8...."
+           BYTE ".8..1.99.1.8...."
+           BYTE "..8.1234321.8..."
+           BYTE "...1234543210..."
+           BYTE ".7.12345554321.7"
+           BYTE ".8.12345554321.8"
+           BYTE "...1234543210..."
+           BYTE "....12343210...."
+           BYTE "...87123218....."
+           BYTE "..8..1AA1..8...."
+           BYTE ".8..7.AA.7..8..."
+           BYTE "..6..8..8..6...."
+
+; ============================================================================
+; 9) STINGRAY — flat diamond-winged ray gliding head-on, long barbed tail,
+;    twin dorsal eyes. Animation: wings FLAP UP (0) / DOWN (1), tail sways.
+; idx 0 = transparent
+; idx 1 = 0x00041018  dark outline
+; idx 2 = 0x00184058  wing shadow (steel blue)
+; idx 3 = 0x00286888  wing mid
+; idx 4 = 0x004098B8  wing light
+; idx 5 = 0x0070C8E0  wing highlight
+; idx 6 = 0x000C2838  body shadow
+; idx 7 = 0x00C0D8E0  belly / underside
+; idx 8 = 0x00FF8020  barb (orange)
+; idx 9 = 0x0020FFB0  eyes (mint)
+; idx A = 0x00FFFFFF  spot highlight
+; ============================================================================
+.balign 16
+stingrayArt BYTE "......1221......"
+           BYTE ".....123321....."
+           BYTE "...112344211...."
+           BYTE "..1234999432...."
+           BYTE ".123459A95432..."
+           BYTE "1234556665432..1"
+           BYTE "123456777654321."
+           BYTE "12345677A7654321"
+           BYTE ".123456777654321"
+           BYTE "..1234567654321."
+           BYTE "...12345654321.."
+           BYTE "....123443218..."
+           BYTE ".....1232.18...."
+           BYTE "......121.8....."
+           BYTE ".......1.8......"
+           BYTE "........8......."
+; STINGRAY frame 1 — wing tips flap down, tail sweeps the other way
+stingrayArt2 BYTE "1..........1...."
+           BYTE ".12......21....."
+           BYTE "..1234..4321...."
+           BYTE "..1234999432...."
+           BYTE ".123459A95432..."
+           BYTE ".123455666543..."
+           BYTE "12345677765432.."
+           BYTE "12345677A765432."
+           BYTE "123456777654321."
+           BYTE ".12345677654321."
+           BYTE "..123456654321.."
+           BYTE "...8123443210..."
+           BYTE "....81232.1....."
+           BYTE ".....81.121....."
+           BYTE "......8.1......."
+           BYTE ".......8........"
+
+; ============================================================================
+; 10) SQUID — bulbous mantle, two big eyes, crown of writhing tentacles +
+;     two long feeding arms. Animation: tentacles SPREAD (0) / CURLED (1).
+; idx 0 = transparent
+; idx 1 = 0x00180420  dark outline
+; idx 2 = 0x00702058  mantle shadow (purple)
+; idx 3 = 0x00A03080  mantle mid
+; idx 4 = 0x00D050A8  mantle light
+; idx 5 = 0x00FF88D0  mantle highlight
+; idx 6 = 0x00601848  tentacle dark
+; idx 7 = 0x00C03888  tentacle mid
+; idx 8 = 0x00FF70C0  tentacle light
+; idx 9 = 0x0020F0F0  eye (cyan)
+; idx A = 0x00102030  pupil
+; ============================================================================
+.balign 16
+squidArt   BYTE "......1221......"
+           BYTE ".....123321....."
+           BYTE "....12344321...."
+           BYTE "...1234554321..."
+           BYTE "...1239AA9321..."
+           BYTE "...123A99A321..."
+           BYTE "...1234554321..."
+           BYTE "...1234554321..."
+           BYTE "....12333221...."
+           BYTE ".6..1234421..6.."
+           BYTE "76.16788761.67.."
+           BYTE "87.7.6776.7.78.."
+           BYTE ".8.8.6.6.8.8...."
+           BYTE "..7.7.6.6.7.7..."
+           BYTE ".8.8...6...8.8.."
+           BYTE "8.8....6....8.8."
+; SQUID frame 1 — tentacles curl inward, feeding arms draw up, mantle jets
+squidArt2  BYTE "......1221......"
+           BYTE ".....123321....."
+           BYTE "....12344321...."
+           BYTE "...1234554321..."
+           BYTE "...1239AA9321..."
+           BYTE "...123A99A321..."
+           BYTE "...1234554321..."
+           BYTE "...1234554321..."
+           BYTE "....12333221...."
+           BYTE "....12344321...."
+           BYTE "...167887761...."
+           BYTE "..76.67876.67..."
+           BYTE ".87.8.676.8.78.."
+           BYTE ".8.7.86.68.7.8.."
+           BYTE "..8.8.7.7.8.8..."
+           BYTE "...87.....78...."
+
+endmodule

@@ -66,6 +66,16 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fWasp], eax
 
+    lea     rcx, [rip + gruntArt]            ; Galaxian Grunt 16x16 (slot 5) — replaces the diamond
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fDrone], eax
+
     lea     rcx, [rip + bulletArt]           ; bullet 2x6
     mov     edx, 2
     mov     r8d, 6
@@ -145,6 +155,52 @@ proc SetupSprPalettes
     call    SetupButterflyPalette
     call    SetupBossPalette
     call    SetupWaspPalette
+    call    SetupDronePalette
+endproc
+
+; ---- SetupDronePalette: slot 5 — GALAXIAN GRUNT: red carapace (2-5), amber wings (6-8),
+;      cyan eye glow (9), white core/antenna (A). (Replaces the rejected diamond.) ----
+proc SetupDronePalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 1
+    mov     r8d, 0x00200810
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 2
+    mov     r8d, 0x00C42030
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 3
+    mov     r8d, 0x00E84038
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 4
+    mov     r8d, 0x00FF6850
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 5
+    mov     r8d, 0x00FFB088
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 6
+    mov     r8d, 0x00803010
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 7
+    mov     r8d, 0x00C86820
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 8
+    mov     r8d, 0x00F0A840
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 9
+    mov     r8d, 0x0030E0FF
+    call    SprSetPalette
+    mov     ecx, DRONE_SLOT
+    mov     edx, 10
+    mov     r8d, 0x00FFFFFF
+    call    SprSetPalette
 endproc
 
 ; ---- SetupWaspPalette: slot 4 — teal body (2-5), lime wings (6-8), yellow sting (9), magenta eyes (A) ----

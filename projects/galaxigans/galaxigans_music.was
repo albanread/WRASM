@@ -1,0 +1,53 @@
+; galaxigans_music.was — the game's discrete music cues as inline-ABC tunes.
+;
+; Each tune is a NUL-terminated ABC BYTE string in the EXACT format ParseTune
+; expects (see `soundtrack` in galaxigans_audio.was): X:/M:/L:/Q: headers, then
+; `%%MIDI program <voice> <gm#>` instrument selects (GM programs are 1-based,
+; one per V:), a K: key, and V:1.. voices of ABC notes (a-g/A-G, octave marks
+; ' and , , digit durations, | bars, z rests, [..] chords).
+;
+; Source: the FreeBASIC game E:/NewFB/bas/demo/16_galaxigans.bas, SUB InitSounds
+; (MUSIC LOAD slots 10-17). Transcribed from each slot's MML; the "L:1/16" base
+; of the source is preserved by keeping the same note-letter sequences and
+; scaling durations to this file's "L:1/8" eighth-note base (a 1/16 note = "/2").
+; Percussion slots use channel 10 via `%%MIDI percussion`; pitch letters there
+; pick drum sounds (B,,=bass drum, D,=snare, ^C=crash, A=crash2).
+
+module Galaxigans
+.balign 16
+.DATA
+.balign 16
+
+; ---- tuneTitle — slot 14 "Stage Alert": ominous choir build (GM 52 = Choir Aahs).
+;      Plays on the TITLE / intro screen ("PLAYER 1 READY"), .bas line 1339.
+tuneTitle BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=84", 10, "%%MIDI program 1 52", 10, "K:Am", 10, "V:1", 10, "z4 A,2 E2 | A2 c2 e2 d2 | c4 B4 | A8 |", 10, 0
+
+; ---- tuneVictory — slot 13 "You Win!": bright glockenspiel fanfare (GM 9 = Glockenspiel).
+;      Plays on STAGE CLEAR / win (all aliens dead), .bas line 1391.
+tuneVictory BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=234", 10, "%%MIDI program 1 9", 10, "K:C", 10, "V:1", 10, "ceg c' e'c'ba | gecG c2 z2 | fac'f' e'd'c'b | c'4 |", 10, 0
+
+; ---- tuneGameOver — slot 10 "Alien Victory": square-lead alien triumph (GM 80 = Lead 1 square).
+;      Plays on GAME OVER (ships exhausted), .bas line 1387.
+tuneGameOver BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=210", 10, "%%MIDI program 1 80", 10, "K:Cm", 10, "V:1", 10, "G,4 _B,4 | c4 _e4 | _e2d2c2_B2 | G,8 | G,2G,2_A,2_B,2 | c2_e2g2_e2 | c4_B4 | G,8 | _E2F2G2_A2 | _B2c2_e2g2 | f/e/d/c/_B/A/_A/G/ | _E8 |", 10, 0
+
+; ---- tuneSaucer — slot 12 "Saucer Wooh": pad swell warning sting (GM 91 = Pad 3 Polysynth).
+;      Plays when the bonus SAUCER appears, .bas line 432.
+tuneSaucer BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=160", 10, "%%MIDI program 1 91", 10, "K:C", 10, "V:1", 10, "G z G z | GABc cBAG |", 10, 0
+
+; ---- tuneShoot — slot 11 "Perc Boom": bass-drum + snare + crash on the player's shot.
+;      Channel-10 percussion; plays each time the player FIRES, .bas line 798.
+tuneShoot BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=200", 10, "%%MIDI percussion", 10, "K:C", 10, "V:1", 10, "[B,,D,^CA] z [B,,D,]/ z/ z5 |", 10, 0
+
+; ---- tunePlayerExplode — slot 15 "Player Explodes": massive multi-drum impact + crash ring.
+;      Channel-10 percussion; plays when the PLAYER ship is destroyed, .bas lines 960, 1125.
+tunePlayerExplode BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=180", 10, "%%MIDI percussion", 10, "K:C", 10, "V:1", 10, "[B,,D,^CA]4 [B,,D,] [^C]2 z |", 10, 0
+
+; ---- tuneAlienBoom — slot 16 "Alien Boom": short deep bass boom (bass drums + low floor tom).
+;      Channel-10 percussion; plays when an ALIEN is destroyed, .bas lines 1138, 1206.
+tuneAlienBoom BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=200", 10, "%%MIDI percussion", 10, "K:C", 10, "V:1", 10, "[B,,C,E]2 z6 |", 10, 0
+
+; ---- tuneSaucerDeath — slot 17 "Saucer Death": sustained rolling crash + bass cascade.
+;      Channel-10 percussion; plays when the SAUCER is destroyed, .bas line 1224.
+tuneSaucerDeath BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=160", 10, "%%MIDI percussion", 10, "K:C", 10, "V:1", 10, "[B,,^CA]4 [B,,D,]2 ^C2 | [B,,D,]2 ^C2 [B,,]2 ^C2 | ^C4 z4 |", 10, 0
+
+endmodule

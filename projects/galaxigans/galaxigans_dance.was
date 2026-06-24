@@ -1,0 +1,83 @@
+; galaxigans_dance.was — the alien TRIUMPHAL SPIRAL DANCE (game-over celebration).
+; Ported from the .bas UpdateEnemiesCelebration: when the player is out of lives, every
+; surviving alien leaves the formation and orbits screen-centre on a breathing-radius
+; pinwheel. Trig-free via a 256-entry sine LUT (sineLUT[i]=round(sin(i*2pi/256)*256);
+; cos(i)=sineLUT[(i+64)&255]). The .bas used angle=frame*0.04+i*0.2,
+; radius=120+sin(frame*0.02+i*0.1)*100 — same shape, integer/LUT here.
+
+module Galaxigans
+.balign 16
+.DATA
+.balign 16
+sineLUT:
+           WORD     0,     6,    13,    19,    25,    31,    38,    44,    50,    56,    62,    68,    74,    80,    86,    92
+           WORD    98,   104,   109,   115,   121,   126,   132,   137,   142,   147,   152,   157,   162,   167,   172,   177
+           WORD   181,   185,   190,   194,   198,   202,   206,   209,   213,   216,   220,   223,   226,   229,   231,   234
+           WORD   237,   239,   241,   243,   245,   247,   248,   250,   251,   252,   253,   254,   255,   255,   256,   256
+           WORD   256,   256,   256,   255,   255,   254,   253,   252,   251,   250,   248,   247,   245,   243,   241,   239
+           WORD   237,   234,   231,   229,   226,   223,   220,   216,   213,   209,   206,   202,   198,   194,   190,   185
+           WORD   181,   177,   172,   167,   162,   157,   152,   147,   142,   137,   132,   126,   121,   115,   109,   104
+           WORD    98,    92,    86,    80,    74,    68,    62,    56,    50,    44,    38,    31,    25,    19,    13,     6
+           WORD     0,    -6,   -13,   -19,   -25,   -31,   -38,   -44,   -50,   -56,   -62,   -68,   -74,   -80,   -86,   -92
+           WORD   -98,  -104,  -109,  -115,  -121,  -126,  -132,  -137,  -142,  -147,  -152,  -157,  -162,  -167,  -172,  -177
+           WORD  -181,  -185,  -190,  -194,  -198,  -202,  -206,  -209,  -213,  -216,  -220,  -223,  -226,  -229,  -231,  -234
+           WORD  -237,  -239,  -241,  -243,  -245,  -247,  -248,  -250,  -251,  -252,  -253,  -254,  -255,  -255,  -256,  -256
+           WORD  -256,  -256,  -256,  -255,  -255,  -254,  -253,  -252,  -251,  -250,  -248,  -247,  -245,  -243,  -241,  -239
+           WORD  -237,  -234,  -231,  -229,  -226,  -223,  -220,  -216,  -213,  -209,  -206,  -202,  -198,  -194,  -190,  -185
+           WORD  -181,  -177,  -172,  -167,  -162,  -157,  -152,  -147,  -142,  -137,  -132,  -126,  -121,  -115,  -109,  -104
+           WORD   -98,   -92,   -86,   -80,   -74,   -68,   -62,   -56,   -50,   -44,   -38,   -31,   -25,   -19,   -13,    -6
+
+.balign 16
+.CODE
+; ---- AlienDance: orbit every alive enemy around (DANCE_CX,DANCE_CY). angleIdx steps
+;      1/frame (+ i*ANGLE_STEP pinwheel), radius breathes at half rate. ----
+proc AlienDance uses rbx rsi rdi r12 r13 r14 frame
+    mov     r12d, [rip + danceFrame]
+    lea     r14, [rip + sineLUT]
+    lea     rdi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+    xor     esi, esi                          ; i (enemy index)
+ad_loop:
+    cmp     dword ptr [rdi + EN_ALIVE], 0
+    je      ad_next
+    ; radius = DANCE_R0 + sineLUT[(danceFrame/2 + i*RAD_STEP)&255]*DANCE_R1/256
+    mov     eax, r12d
+    shr     eax, 1
+    mov     ecx, esi
+    imul    ecx, ecx, RAD_STEP
+    add     eax, ecx
+    and     eax, 255
+    movsx   eax, word ptr [r14 + rax*2]
+    imul    eax, eax, DANCE_R1
+    sar     eax, 8
+    add     eax, DANCE_R0
+    mov     r13d, eax                         ; radius
+    ; angleIdx = (danceFrame + i*ANGLE_STEP)&255
+    mov     eax, r12d
+    mov     ecx, esi
+    imul    ecx, ecx, ANGLE_STEP
+    add     eax, ecx
+    and     eax, 255
+    mov     ecx, eax                          ; angleIdx
+    ; ex = DANCE_CX + cos(angle)*radius/256
+    mov     eax, ecx
+    add     eax, 64
+    and     eax, 255
+    movsx   eax, word ptr [r14 + rax*2]
+    imul    eax, r13d
+    sar     eax, 8
+    add     eax, DANCE_CX
+    mov     [rdi + EN_X], eax
+    ; ey = DANCE_CY + sin(angle)*radius/256
+    movsx   eax, word ptr [r14 + rcx*2]
+    imul    eax, r13d
+    sar     eax, 8
+    add     eax, DANCE_CY
+    mov     [rdi + EN_Y], eax
+ad_next:
+    add     rdi, ENEMY_STRIDE
+    inc     esi
+    dec     ebx
+    jnz     ad_loop
+endproc
+endmodule

@@ -10,8 +10,8 @@ PLAYER_Y       equ 330                       ; ship sits near the bottom
 
 ; ---- enemy formation: an 8x4 grid (32 slots) ----
 ENEMY_COLS     equ 8
-ENEMY_ROWS     equ 4
-ENEMY_MAX      equ 32                        ; COLS*ROWS
+ENEMY_ROWS     equ 5
+ENEMY_MAX      equ 40                        ; COLS*ROWS
 ENEMY_STRIDE   equ 40                        ; 10 i32 fields (see EN_* below)
 EN_X           equ 0                         ; live SCREEN x (sway already folded in)
 EN_Y           equ 4                         ; live SCREEN y
@@ -25,6 +25,8 @@ EN_ANIM        equ 32                        ; wing-flap phase counter
 EN_TYPE        equ 36                        ; TYPE_BEE / TYPE_BUTTERFLY / TYPE_BOSS
 ST_FORM        equ 0
 ST_DIVE        equ 1
+ST_RETURN      equ 2                         ; surviving diver gliding back from the top to its slot
+RETURN_SPEED   equ 4                         ; px/frame descent during the return
 ENEMY_W        equ 16                        ; the new 16x16 shaded aliens (was 8x8)
 ENEMY_H        equ 16
 DIVE_PERIOD    equ 60                        ; frames between dive launches
@@ -48,6 +50,17 @@ BOMB_STRIDE    equ 12                        ; { x:i32, y:i32, active:i32 }
 BOMB_DY        equ 4                         ; pixels/frame down
 BOMB_PERIOD    equ 22                        ; frames between drops (the lowest diver drops)
 
+; ---- triumphal spiral dance (the aliens' game-over celebration) ----
+STATE_PLAYING  equ 0
+STATE_GAMEOVER equ 1
+DANCE_CX       equ 320                       ; orbit centre (640x360 middle)
+DANCE_CY       equ 180
+DANCE_R0       equ 95                        ; base orbit radius
+DANCE_R1       equ 70                        ; breathing amplitude
+ANGLE_STEP     equ 6                         ; per-enemy angle offset (pinwheel spread)
+RAD_STEP       equ 10                        ; per-enemy radius phase
+DANCE_LEN      equ 420                       ; frames the dance runs before the restart
+
 ; ---- sprite palette slot + colour indices (one shared 16-colour bank) ----
 PAL_SLOT       equ 0
 IDX_PLAYER     equ 1                         ; -> white
@@ -58,10 +71,12 @@ BEE_SLOT       equ 1                         ; the Bee's own 16-colour shaded pa
 BUT_SLOT       equ 2                         ; Butterfly palette (slot 2)
 BOSS_SLOT      equ 3                         ; Boss palette (slot 3)
 WASP_SLOT      equ 4                         ; Wasp palette (slot 4)
+DRONE_SLOT     equ 5                         ; Drone palette (slot 5)
 TYPE_BEE       equ 0
 TYPE_BUTTERFLY equ 1
 TYPE_BOSS      equ 2
 TYPE_WASP      equ 3
+TYPE_DRONE     equ 4
 
 .balign 16
 .DATA
@@ -79,6 +94,12 @@ lives      DWORD 3
 score      DWORD 0
 scoreStr   BYTE  "SCORE 000000", 0
 livesStr   BYTE  "LIVES 3", 0
+gameOverStr BYTE "GAME OVER", 0
+
+; game state + the dance clocks
+gameState  DWORD 0                            ; STATE_PLAYING / STATE_GAMEOVER
+danceFrame DWORD 0
+danceTimer DWORD 0
 
 ; formation sway + dive scheduling
 formX      DWORD 0                           ; horizontal sway offset
@@ -88,7 +109,7 @@ diveScan   DWORD 0                            ; rotating start index for picking
 bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
-enemies    BYTE  1280 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (32*40)
+enemies    BYTE  1600 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*40)
 bullets    BYTE  48  dup(0)                   ; BULLET_MAX * BULLET_STRIDE
 bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
 
@@ -99,12 +120,13 @@ fEnemyFlap DWORD ?                            ; Bee wings-down frame
 fButterfly DWORD ?                            ; Butterfly (single frame)
 fBoss      DWORD ?                            ; Boss (single frame)
 fWasp      DWORD ?                            ; Wasp (single frame)
+fDrone     DWORD ?                            ; Drone (single frame)
 fBullet    DWORD ?
 fBomb      DWORD ?
 
 ; formation row -> alien type (one species per row)
 .balign 16
-rowType    DWORD TYPE_BOSS, TYPE_BUTTERFLY, TYPE_WASP, TYPE_BEE
+rowType    DWORD TYPE_BOSS, TYPE_BUTTERFLY, TYPE_WASP, TYPE_DRONE, TYPE_BEE
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
@@ -214,6 +236,24 @@ waspArt    BYTE "................"
            BYTE ".......9........"
            BYTE ".......9........"
            BYTE "................"
+           BYTE "................"
+; DRONE (crystal) 16x16, slot 5: grey hull ramp (2-5), cyan glow core (6-8), red sensor (9).
+.balign 16
+droneArt   BYTE "................"
+           BYTE ".......11......."
+           BYTE "......1221......"
+           BYTE ".....123321....."
+           BYTE "....12344321...."
+           BYTE "...1234554321..."
+           BYTE "..123457754321.."
+           BYTE ".12345688654321."
+           BYTE ".12345689654321."
+           BYTE "..123457754321.."
+           BYTE "...1234554321..."
+           BYTE "....12344321...."
+           BYTE ".....123321....."
+           BYTE "......1221......"
+           BYTE ".......11......."
            BYTE "................"
 bulletArt  BYTE "33"
            BYTE "33"

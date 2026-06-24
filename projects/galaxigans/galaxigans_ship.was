@@ -1,0 +1,86 @@
+module Galaxigans
+
+; galaxigans_ship.was — the HERO player fighter, three lean frames so the ship
+; banks as it moves. Same indexed-hex-bitmap convention as galaxigans_data.inc:
+; each char is a palette index ('0'-'9'->0-9, 'A'-'F'->10-15, '.'=0=TRANSPARENT).
+; Each BYTE "row" packs contiguously, so EVERY row is EXACTLY 16 chars (16x16).
+;
+; SIZE: 16x16 (matches the shaded 16x16 alien bugs).
+;
+; PALETTE (16 entries, 0x00RRGGBB; load into the ship's own slot via SprSetPalette):
+;   0  0x00000000  TRANSPARENT
+;   1  0x00101826  dark outline (near-black blue)
+;   2  0x002B5C8A  steel-blue hull, shadow
+;   3  0x00407FB5  steel-blue hull, mid
+;   4  0x005CA8DA  steel-blue hull, light
+;   5  0x0091D2F2  pale cyan-steel, lit edge
+;   6  0x00FFFFFF  white highlight (nose tip / wing glints)
+;   7  0x000E3A66  cockpit canopy, deep
+;   8  0x0033C9FF  cockpit canopy, cyan glass
+;   9  0x00BFF2FF  cockpit glint (near-white cyan)
+;   A  0x00FF7A18  engine glow, outer (orange)
+;   B  0x00FFC23D  engine glow, inner (amber)
+;   C  0x00FFF38A  engine core (hot yellow)
+;   D  0x00A8C4D8  wing trim / panel line (cool grey-steel)
+;   E  0x001C8FD6  intake accent (mid cyan-blue)
+;   F  0x00E8F6FF  highlight sparkle (icy white)
+
+.balign 16
+.DATA
+.balign 16
+
+; ---- CENTRE: upright, symmetric, nose UP (neutral pose) ----
+shipArtC   BYTE "................"
+           BYTE ".......11......."
+           BYTE "......1651......"
+           BYTE "......1551......"
+           BYTE "......1781......"
+           BYTE "......1891......"
+           BYTE "....1.1541.1...."
+           BYTE "...151154511151."
+           BYTE "..15431455113451"
+           BYTE "..15431D55D13451"
+           BYTE "...143145541341."
+           BYTE "....1.14541.1..."
+           BYTE ".....145541....."
+           BYTE ".....1A11A1....."
+           BYTE ".....ABCBA1....."
+           BYTE ".....1CC.C1....."
+
+; ---- LEFT-bank: banking LEFT, nose canted left, near (left) wing dipped ----
+shipArtL   BYTE "................"
+           BYTE ".....11........."
+           BYTE "....1651........"
+           BYTE "....1551........"
+           BYTE "...15781........"
+           BYTE "...18910........"
+           BYTE "..1145410......."
+           BYTE ".15115451101...."
+           BYTE "1543145511134511"
+           BYTE ".154313D5D113451"
+           BYTE "..143145541134.."
+           BYTE "...11145410.1..."
+           BYTE "....1455410....."
+           BYTE "...1A11A1......."
+           BYTE "...ABCBA1......."
+           BYTE "....CC.C........"
+
+; ---- RIGHT-bank: banking RIGHT, nose canted right, near (right) wing dipped ----
+shipArtR   BYTE "................"
+           BYTE ".........11....."
+           BYTE "........1561...."
+           BYTE "........1551...."
+           BYTE "........18751..."
+           BYTE "........01981..."
+           BYTE ".......0145411.."
+           BYTE "....10115451151."
+           BYTE "1154311155413451"
+           BYTE "154311D5D313451."
+           BYTE "..431145541341.."
+           BYTE "...1.01454111..."
+           BYTE ".....0145541...."
+           BYTE ".......1A11A1..."
+           BYTE ".......1ABCBA..."
+           BYTE "........C.CC...."
+
+endmodule

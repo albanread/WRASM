@@ -10,9 +10,11 @@ proc PlayerStep uses rbx frame
     jne     ps_alive
     dec     dword ptr [rip + pDeathT]         ; exploding -> count down to respawn
     jg      ps_done
-    cmp     dword ptr [rip + lives], 0        ; out of lives -> full restart
+    cmp     dword ptr [rip + lives], 0        ; out of lives -> the aliens' victory dance
     jg      ps_respawn
-    call    ResetGame
+    mov     dword ptr [rip + gameState], STATE_GAMEOVER
+    mov     dword ptr [rip + danceFrame], 0
+    mov     dword ptr [rip + danceTimer], DANCE_LEN
     jmp     ps_done
 ps_respawn:
     mov     dword ptr [rip + pAlive], 1

@@ -1,0 +1,208 @@
+module Galaxigans
+
+; galaxigans_bombs.was — enemy projectile sprite art (the things aliens DROP at the player).
+; Each bomb is a 2-frame animation so it spins / pulses / flickers / tumbles as it falls.
+; Convention: INDEXED HEX bitmaps, one char per pixel = palette index ('0'-'9','A'-'F';
+; '.' = 0 = TRANSPARENT). Rows pack CONTIGUOUSLY, so EVERY BYTE row must be EXACTLY W chars.
+; Palettes are 16-colour (0x00RRGGBB); index 0 transparent, index 1 = dark outline, then a
+; shade ramp up to a hot glowing core/highlight. Sizes are noted per bomb. The host wires
+; SprAddFrame (frame0 = <name>Art, frame1 = <name>Art2) + SprSetPalette.
+
+.balign 16
+.DATA
+.balign 16
+
+; ============================================================================
+; 1) PLASMA ORB  —  6x8  —  a pulsing magenta/violet energy ball, electric core.
+;    Frame0 small tight core, Frame1 swollen brighter core (it breathes as it falls).
+;    Palette:  1 #200826 outline   2 #4a0d63 dark violet   3 #7a18a6 violet
+;              4 #b020e0 magenta   5 #e84cff bright magenta 6 #ffb0ff pink-white
+;              7 #ffffff white core 8 #b8e0ff electric cyan rim
+; ============================================================================
+plasmaOrbArt   BYTE ".1221."
+               BYTE "123421"
+               BYTE "234542"
+               BYTE "245752"
+               BYTE "234542"
+               BYTE "123421"
+               BYTE ".1221."
+               BYTE "..11.."
+plasmaOrbArt2  BYTE ".1331."
+               BYTE "134531"
+               BYTE "345654"
+               BYTE "457874"
+               BYTE "345654"
+               BYTE "134531"
+               BYTE ".1331."
+               BYTE ".1331."
+
+; ============================================================================
+; 2) FIREBALL  —  8x8  —  a falling ball of flame with a flickering trailing tail.
+;    Frame0 tail flickers left, Frame1 tail flickers right + hotter core (animated burn).
+;    Palette:  1 #2a0a00 char outline  2 #7a1500 dark red  3 #c43200 red
+;              4 #ff5a00 orange        5 #ff9a1a amber     6 #ffd84a yellow
+;              7 #fff4b0 pale yellow    8 #ffffff white core 9 #ff2a00 spark
+; ============================================================================
+fireballArt    BYTE "...33..."
+               BYTE "..3443.."
+               BYTE ".345543."
+               BYTE "34567643"
+               BYTE "34578643"
+               BYTE ".345543."
+               BYTE "9.3443.9"
+               BYTE ".9.99.9."
+fireballArt2   BYTE "..33...."
+               BYTE ".3443..."
+               BYTE "345543.."
+               BYTE "34678643"
+               BYTE "34587643"
+               BYTE ".345543."
+               BYTE "9.3443.9"
+               BYTE "9.99.9.."
+
+; ============================================================================
+; 3) ENERGY SHURIKEN  —  8x8  —  a spinning cyan/white energy blade (4 points).
+;    Frame0 = upright X, Frame1 = rotated 45deg (+ plus), so it spins as it falls.
+;    Palette:  1 #001a26 outline    2 #044b66 dark teal    3 #0a86b0 teal
+;              4 #18c4e0 cyan        5 #6cf0ff bright cyan  6 #c8ffff pale cyan
+;              7 #ffffff white edge  8 #b0fff0 mint glow
+; ============================================================================
+shurikenArt    BYTE "7......7"
+               BYTE ".54..45."
+               BYTE "..43.34."
+               BYTE "...454.."
+               BYTE "..454..."
+               BYTE ".43.34.."
+               BYTE ".54..45."
+               BYTE "7......7"
+shurikenArt2   BYTE "...77..."
+               BYTE "...54..."
+               BYTE "..3443.."
+               BYTE "7543457."
+               BYTE "7543457."
+               BYTE "..3443.."
+               BYTE "...45..."
+               BYTE "...77..."
+
+; ============================================================================
+; 4) GUIDED DART  —  6x8  —  a sleek homing missile/dart, nose down, with a flame tail.
+;    Frame0 steady flame, Frame1 flickering/longer flame (thrust pulse).
+;    Palette:  1 #101418 outline   2 #3a4450 dark steel   3 #6b7886 steel
+;              4 #a6b4c2 light steel 5 #e6eef6 highlight   6 #ff7a00 orange flame
+;              7 #ffd23a yellow flame 8 #ff2a2a red fin    9 #fff4c0 flame core
+; ============================================================================
+dartArt        BYTE "..45.."
+               BYTE ".2345."
+               BYTE "823458"
+               BYTE ".2345."
+               BYTE ".2345."
+               BYTE ".2345."
+               BYTE "..67.."
+               BYTE "...6.."
+dartArt2       BYTE "..45.."
+               BYTE ".2345."
+               BYTE "823458"
+               BYTE ".2345."
+               BYTE ".2345."
+               BYTE "..67.."
+               BYTE ".6996."
+               BYTE "..6..."
+
+; ============================================================================
+; 5) FORKED LIGHTNING  —  6x8  —  a jagged electric bolt that crackles as it drops.
+;    Frame0 bolt forks left at the base, Frame1 forks right (the arc flickers/jitters).
+;    Palette:  1 #0a0a2a outline    2 #2a2a8a indigo glow  3 #4a6aff blue
+;              4 #7aa0ff sky blue    5 #b8d8ff pale blue    6 #ffffff white core
+;              7 #e0f0ff white-blue  8 #fffbd0 spark yellow
+; ============================================================================
+lightningArt   BYTE "...63."
+               BYTE "..463."
+               BYTE "..36.."
+               BYTE ".364.."
+               BYTE "..463."
+               BYTE ".36.6."
+               BYTE "34..38"
+               BYTE "2....2"
+lightningArt2  BYTE ".36..."
+               BYTE ".364.."
+               BYTE "..63.."
+               BYTE "..463."
+               BYTE ".364.."
+               BYTE ".6.63."
+               BYTE "83..43"
+               BYTE "2....2"
+
+; ============================================================================
+; 6) SPIKED MINE  —  8x8  —  a round naval-style mine, spikes out, blinking red eye.
+;    Frame0 eye dim, Frame1 eye flares bright (warning blink) + spikes shimmer.
+;    Palette:  1 #0a0c10 outline    2 #20262e dark hull    3 #3a4450 hull
+;              4 #5a6676 light hull  5 #8694a4 highlight    6 #c0c0c0 spike steel
+;              7 #ffffff spike tip   8 #ff3020 red eye      9 #ffd060 eye flare
+; ============================================================================
+mineArt        BYTE "7..6..7."
+               BYTE ".23442.."
+               BYTE "63445346"
+               BYTE ".45824.."
+               BYTE ".45284.."
+               BYTE "63445346"
+               BYTE ".23442.."
+               BYTE "7..6..7."
+mineArt2       BYTE "6..7..6."
+               BYTE ".23442.."
+               BYTE "73445347"
+               BYTE ".45924.."
+               BYTE ".45294.."
+               BYTE "73445347"
+               BYTE ".23442.."
+               BYTE "6..7..6."
+
+; ============================================================================
+; 7) ACID GLOB  —  6x8  —  a writhing toxic-green blob with a dripping tail.
+;    Frame0 drip on the left, Frame1 drip on the right (it wobbles/oozes as it falls).
+;    Palette:  1 #0a1a00 outline    2 #1e3a00 dark green   3 #3a6e00 green
+;              4 #6aa800 lime        5 #a6e000 bright lime  6 #d8ff60 pale lime
+;              7 #ffffff hot speck   8 #2aff80 toxic glow
+; ============================================================================
+acidGlobArt    BYTE ".2332."
+               BYTE "234432"
+               BYTE "345643"
+               BYTE "345753"
+               BYTE "234432"
+               BYTE ".2332."
+               BYTE "82...."
+               BYTE ".2...."
+acidGlobArt2   BYTE ".2332."
+               BYTE "234432"
+               BYTE "345643"
+               BYTE "357543"
+               BYTE "234432"
+               BYTE ".2332."
+               BYTE "....28"
+               BYTE "....2."
+
+; ============================================================================
+; 8) CRYSTAL SHARD  —  6x8  —  a spinning frozen dagger of ice that glints as it tumbles.
+;    Frame0 highlight on the left facet, Frame1 highlight jumps to the right (the glint
+;    travels as it rotates).
+;    Palette:  1 #081826 outline    2 #123a52 deep ice     3 #1f6e96 ice blue
+;              4 #3aa6d0 cyan ice    5 #8fe0f4 pale ice     6 #ffffff white glint
+;              7 #d0f8ff frost       8 #aef0ff glow rim
+; ============================================================================
+crystalArt     BYTE "..67.."
+               BYTE ".1551."
+               BYTE ".1431."
+               BYTE "16431."
+               BYTE ".1341."
+               BYTE ".1431."
+               BYTE ".1331."
+               BYTE "..21.."
+crystalArt2    BYTE "..76.."
+               BYTE ".1551."
+               BYTE ".1341."
+               BYTE ".13461"
+               BYTE ".1431."
+               BYTE ".1341."
+               BYTE ".1331."
+               BYTE "..12.."
+
+endmodule

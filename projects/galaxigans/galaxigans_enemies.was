@@ -11,6 +11,7 @@ module Galaxigans
 
 ; ---- ResetGame: reset player/score + lay out the 8x4 formation (home + live), all alive ----
 proc ResetGame uses rbx rsi rdi frame
+    mov     dword ptr [rip + gameState], STATE_PLAYING
     mov     dword ptr [rip + playerX], 312
     mov     dword ptr [rip + fireCool], 0
     mov     dword ptr [rip + pAlive], 1
@@ -108,14 +109,29 @@ fs_e:
     cmp     dword ptr [rdi + EN_ALIVE], 0
     je      fs_enext
     inc     dword ptr [rdi + EN_ANIM]         ; advance the wing-flap
-    cmp     dword ptr [rdi + EN_STATE], ST_DIVE
+    mov     eax, [rdi + EN_STATE]
+    cmp     eax, ST_DIVE
     je      fs_dive
+    cmp     eax, ST_RETURN
+    je      fs_return
     ; --- formation: live pos = home + sway ---
     mov     eax, [rdi + EN_HX]
     add     eax, [rip + formX]
     mov     [rdi + EN_X], eax
     mov     eax, [rdi + EN_HY]
     mov     [rdi + EN_Y], eax
+    jmp     fs_enext
+fs_return:
+    ; --- glide down from the top to the OWN home slot (own row = own species) ---
+    add     dword ptr [rdi + EN_Y], RETURN_SPEED
+    mov     eax, [rdi + EN_HX]
+    add     eax, [rip + formX]               ; track the swaying column on the way in
+    mov     [rdi + EN_X], eax
+    mov     eax, [rdi + EN_HY]
+    cmp     [rdi + EN_Y], eax
+    jl      fs_enext                          ; still descending
+    mov     [rdi + EN_Y], eax                 ; dock into the slot, ready to dive again
+    mov     dword ptr [rdi + EN_STATE], ST_FORM
     jmp     fs_enext
 fs_dive:
     ; --- diver: vy = 2 + dt/4 (cap 8) downward; vx peels out, then homes on player ---
@@ -143,15 +159,14 @@ fs_peel:
     mov     ecx, [rdi + EN_VX]               ; early outward peel
     add     [rdi + EN_X], ecx
 fs_offcheck:
-    cmp     dword ptr [rdi + EN_Y], FIELD_H + 8   ; exited the bottom -> rejoin slot
+    cmp     dword ptr [rdi + EN_Y], FIELD_H + 8   ; exited the bottom -> re-enter from the top
     jl      fs_enext
-    mov     dword ptr [rdi + EN_STATE], ST_FORM
+    mov     dword ptr [rdi + EN_STATE], ST_RETURN
     mov     dword ptr [rdi + EN_DT], 0
     mov     eax, [rdi + EN_HX]
     add     eax, [rip + formX]
     mov     [rdi + EN_X], eax
-    mov     eax, [rdi + EN_HY]
-    mov     [rdi + EN_Y], eax
+    mov     dword ptr [rdi + EN_Y], -20           ; appear above the screen, glide back down
 fs_enext:
     add     rdi, ENEMY_STRIDE
     dec     ebx
@@ -165,8 +180,10 @@ proc TriggerDive uses rbx rsi rdi frame
     mov     ebx, ENEMY_MAX                   ; bounded scan
 td_loop:
     mov     eax, esi
-    and     eax, 31                          ; wrap to 0..ENEMY_MAX-1
-    imul    ecx, eax, ENEMY_STRIDE
+    xor     edx, edx
+    mov     ecx, ENEMY_MAX                   ; wrap esi -> 0..ENEMY_MAX-1 (40 isn't a power of 2)
+    div     ecx
+    imul    ecx, edx, ENEMY_STRIDE
     lea     rdi, [rip + enemies]
     add     rdi, rcx
     cmp     dword ptr [rdi + EN_ALIVE], 0
