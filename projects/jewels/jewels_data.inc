@@ -27,6 +27,7 @@ GRAVFAST equ 3                  ; soft-drop interval while DOWN is held
 ; ---- game states ----
 ST_FALL  equ 0                  ; a triple is falling, player has control
 ST_OVER  equ 2                  ; spawn blocked -> game over
+ST_TITLE equ 3                  ; attract screen, waiting for FIRE to start
 
 ; ---- palette indices (default CGA-16) ----
 PAL_BG   equ 8                  ; dark grey background
@@ -53,5 +54,11 @@ jwNext0    DWORD 0             ; forced next-piece colours (deterministic TCL te
 jwNext1    DWORD 0             ;   0,0,0 = pick at random
 jwNext2    DWORD 0
 jwMarked   BYTE 72 dup(0)      ; match-scan scratch (1 = part of a >=3 run)
+jwLevel    DWORD 1             ; difficulty level (gravity speeds up with it)
+jwProbe    DWORD 0             ; last `probe x y` pixel read (rendered-board assertions)
 jwScoreStr BYTE "SCORE 00000", 0
+jwLevelStr BYTE "LEVEL 00", 0
+jwTitleStr BYTE "RASM JEWELS", 0
+jwStartStr BYTE "PRESS FIRE", 0
+jwOverStr  BYTE "GAME OVER", 0
 .balign 16

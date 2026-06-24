@@ -9,6 +9,7 @@ vnRight    BYTE "right", 0
 vnDrop     BYTE "drop", 0
 vnStep     BYTE "step", 0
 vnNew      BYTE "newgame", 0
+vnProbe    BYTE "probe", 0
 .balign 16
 
 .CODE
@@ -26,8 +27,7 @@ main:
 GameInit:
     call    SeedLinePalette            ; per-line palette = the global CGA-16
     call    ClearGrid
-    mov     dword ptr [rip + jwState], ST_FALL
-    call    SpawnPiece
+    mov     dword ptr [rip + jwState], ST_TITLE   ; open on the attract screen
     call    TclInit                    ; control verbs (intro/free/cont)
     call    TclStdVerbs                ; documented canvas/input/introspect verbs
     lea     rcx, [rip + vnSetPiece]    ; the game's OWN verbs (deterministic testing)
@@ -47,6 +47,9 @@ GameInit:
     call    TclAddVerb
     lea     rcx, [rip + vnNew]
     lea     rdx, [rip + NewGameVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnProbe]
+    lea     rdx, [rip + ProbeVerb]
     call    TclAddVerb
     call    TclChannelInit             ; \\.\pipe\nanotcl + reader thread (dev build)
     ret

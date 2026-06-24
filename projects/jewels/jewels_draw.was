@@ -113,4 +113,41 @@ db_rows_done:
     call    DrawJewel
 db_score:
     call    DrawScore
+    ; ---- state overlays: title / game over ----
+    mov     eax, [rip + jwState]
+    cmp     eax, ST_TITLE
+    je      db_title
+    cmp     eax, ST_OVER
+    je      db_over
+    jmp     db_end
+db_title:
+    mov     ecx, 127                          ; "RASM JEWELS" centred (11 chars)
+    mov     edx, 80
+    mov     r8b, 14
+    lea     r9, [rip + jwTitleStr]
+    call    Text
+    mov     ecx, 130                          ; "PRESS FIRE" (10 chars)
+    mov     edx, 96
+    mov     r8b, 15
+    lea     r9, [rip + jwStartStr]
+    call    Text
+    jmp     db_end
+db_over:
+    mov     ecx, WELLX                         ; dark panel behind the text
+    mov     edx, 76
+    mov     r8d, WELLW
+    mov     r9d, 30
+    mov     r10b, PAL_WELL
+    call    FillRect
+    mov     ecx, 133                           ; "GAME OVER" (9 chars)
+    mov     edx, 80
+    mov     r8b, 12
+    lea     r9, [rip + jwOverStr]
+    call    Text
+    mov     ecx, 130                           ; "PRESS FIRE"
+    mov     edx, 96
+    mov     r8b, 15
+    lea     r9, [rip + jwStartStr]
+    call    Text
+db_end:
 endproc

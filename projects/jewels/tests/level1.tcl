@@ -62,4 +62,29 @@ set st [lindex $r 1]
 puts "game over      : state=$st (2 = over)"
 assert [expr {$st == 2}]  "a full spawn column should be game over (state 2)"
 
+# ---- 5. restart: at game over (from test 4), FIRE starts a fresh round.
+#         drives the REAL input path: SimAction injects ACT_FIRE (=4) ----
+send "SimAction rcx=4 rdx=1"
+set r [regs]
+set r [regs]
+send "SimAction rcx=4 rdx=0"
+set st [lindex $r 1]
+puts "FIRE restart   : state=$st score=[lindex $r 0]"
+assert [expr {$st == 0}]   "FIRE at game over should restart to play (state 0), got $st"
+
+# ---- 6. rendered-board assertion: probe an actual drawn pixel.
+#         drop blue/green/red into col 2 (no match); the red jewel is at cell
+#         (2,11), centre pixel (153,177). `probe` reads the framebuffer Pget — so
+#         we assert what was DRAWN, not just logical state (beats an eyeballed snapshot) ----
+send "newgame"
+send "setpiece rcx=9 rdx=10 r8=12"
+send "drop"
+set r [regs]
+send "probe rcx=153 rdx=177"
+set r [regs]
+set r [regs]
+set px [lindex $r 5]
+puts "probe jewel    : pixel=$px (expect 12 = red)"
+assert [expr {$px == 12}]  "rendered jewel at cell (2,11) should be red (12), got $px"
+
 puts "RASM Jewels level 1: all checks passed"

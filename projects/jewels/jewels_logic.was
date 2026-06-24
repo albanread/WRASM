@@ -387,12 +387,36 @@ proc ExposeState frame
     mov     ecx, 4
     mov     edx, [rip + jwClears]
     call    TclReg
+    mov     ecx, 5
+    mov     edx, [rip + jwProbe]       ; last rendered-pixel read (probe verb)
+    call    TclReg
+    mov     ecx, 6
+    mov     edx, [rip + jwLevel]
+    call    TclReg
+endproc
+
+; ---- StartGame: (re)start a fresh round ----
+proc StartGame frame
+    call    ClearGrid
+    mov     dword ptr [rip + jwScore], 0
+    mov     dword ptr [rip + jwClears], 0
+    mov     dword ptr [rip + jwLevel], 1
+    mov     dword ptr [rip + jwState], ST_FALL
+    call    SpawnPiece
 endproc
 
 ; ---- AdvanceFrame: one frame of game logic ----
 proc AdvanceFrame frame
     cmp     dword ptr [rip + jwState], ST_FALL
-    jne     af_expose
+    je      af_play
+    ; title or game-over: FIRE (re)starts the round
+    mov     ecx, ACT_FIRE
+    call    ActionHit
+    test    eax, eax
+    jz      af_expose
+    call    StartGame
+    jmp     af_expose
+af_play:
     call    ReadInput
     call    GravityStep
 af_expose:
@@ -443,11 +467,13 @@ proc StepVerb frame
     call    AdvanceFrame
 endproc
 
-; newgame — reset the board and score
+; newgame — reset the board and start a round
 proc NewGameVerb frame
-    call    ClearGrid
-    mov     dword ptr [rip + jwScore], 0
-    mov     dword ptr [rip + jwClears], 0
-    mov     dword ptr [rip + jwState], ST_FALL
-    call    SpawnPiece
+    call    StartGame
+endproc
+
+; probe rcx=x, rdx=y — read a rendered framebuffer pixel into slot 5 (visual asserts)
+proc ProbeVerb frame in rcx rdx
+    call    Pget                       ; rcx=x rdx=y -> eax = palette index at (x,y)
+    mov     [rip + jwProbe], eax
 endproc
