@@ -7,6 +7,14 @@
 ; main + the three game procs; the library owns the window/loop/present.
 ; Verifies headlessly: GameSelfTest films snap_*.bmp every few frames.
 
+; nano-TCL — expose the documented verbs of the modules this game links
+; (generated stdverbs.was IFDEF-gates each subsystem behind its NTV_ flag):
+NTV_canvas     equ 1
+NTV_blit       equ 1
+NTV_sprite     equ 1
+NTV_input      equ 1
+NTV_introspect equ 1
+
 .DATA
 titleW  WCHAR "RASM - Spinning Gems", 0
 ; a gem = a diamond that "spins" by squashing horizontally over 3 frames (B = cyan 11)
@@ -70,7 +78,7 @@ GameInit:
     mov     cl, 1                      ; fill fb with the sky field (index 1, resolved per line)
     call    Cls
     call    TclInit                    ; the always-present control verbs (intro/free/cont)
-    call    TclStdVerbs                ; the WHOLE standard library API as verbs
+    call    TclStdVerbs                ; the documented verbs of the enabled subsystems
     lea     rcx, [rip + vnStar]        ; the app hooks in its OWN verbs
     lea     rdx, [rip + Star]
     call    TclAddVerb
@@ -227,4 +235,4 @@ endproc
 .include "../../library/harness.was"
 .include "../../library/introspect.was"
 .include "../../library/tcl/tcl.was"
-.include "../../library/tcl/stdverbs.was"   ; generated: the whole std library API as verbs
+.include "../../library/tcl/stdverbs.was"   ; generated per-subsystem table (gated by NTV_ flags above)

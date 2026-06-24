@@ -4,7 +4,12 @@
 ; against the gpu/ backend, the GPU conditional-import path is sound. It is not
 ; meant to run (no GpuInit/window) — assembly is what validates the verb wiring.
 
-NANOTCL_GPU equ 1
+NANOTCL_GPU    equ 1
+NTV_canvas     equ 1
+NTV_blit       equ 1
+NTV_sprite     equ 1
+NTV_input      equ 1
+NTV_introspect equ 1
 
 .DATA
 .balign 16
