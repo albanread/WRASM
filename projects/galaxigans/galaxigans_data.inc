@@ -57,9 +57,11 @@ IDX_BOMB       equ 4                         ; -> magenta
 BEE_SLOT       equ 1                         ; the Bee's own 16-colour shaded palette (slot 1)
 BUT_SLOT       equ 2                         ; Butterfly palette (slot 2)
 BOSS_SLOT      equ 3                         ; Boss palette (slot 3)
+WASP_SLOT      equ 4                         ; Wasp palette (slot 4)
 TYPE_BEE       equ 0
 TYPE_BUTTERFLY equ 1
 TYPE_BOSS      equ 2
+TYPE_WASP      equ 3
 
 .balign 16
 .DATA
@@ -96,8 +98,13 @@ fEnemy     DWORD ?                            ; Bee wings-up
 fEnemyFlap DWORD ?                            ; Bee wings-down frame
 fButterfly DWORD ?                            ; Butterfly (single frame)
 fBoss      DWORD ?                            ; Boss (single frame)
+fWasp      DWORD ?                            ; Wasp (single frame)
 fBullet    DWORD ?
 fBomb      DWORD ?
+
+; formation row -> alien type (one species per row)
+.balign 16
+rowType    DWORD TYPE_BOSS, TYPE_BUTTERFLY, TYPE_WASP, TYPE_BEE
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----
@@ -188,6 +195,24 @@ bossArt    BYTE "................"
            BYTE ".....2.22.2....."
            BYTE "................"
            BYTE "................"
+           BYTE "................"
+           BYTE "................"
+; WASP (weaver) 16x16, slot 4: teal body (2-5), lime wings (6-8), yellow stinger (9), magenta eyes (A).
+.balign 16
+waspArt    BYTE "................"
+           BYTE "......1AA1......"
+           BYTE ".....123321....."
+           BYTE ".8...123321...8."
+           BYTE ".78.12333321.87."
+           BYTE "678.12344321.876"
+           BYTE ".78.12344321.87."
+           BYTE "..8.123321.8...."
+           BYTE "....123321......"
+           BYTE ".....12321......"
+           BYTE "......121......."
+           BYTE "......121......."
+           BYTE ".......9........"
+           BYTE ".......9........"
            BYTE "................"
            BYTE "................"
 bulletArt  BYTE "33"

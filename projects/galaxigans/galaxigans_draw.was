@@ -51,9 +51,15 @@ dsc_e_beeslot:
     jmp     dsc_e_draw
 dsc_e_nb:
     cmp     eax, TYPE_BUTTERFLY
-    jne     dsc_e_boss
+    jne     dsc_e_nw
     mov     ecx, [rip + fButterfly]
     mov     r8d, BUT_SLOT
+    jmp     dsc_e_draw
+dsc_e_nw:
+    cmp     eax, TYPE_WASP
+    jne     dsc_e_boss
+    mov     ecx, [rip + fWasp]
+    mov     r8d, WASP_SLOT
     jmp     dsc_e_draw
 dsc_e_boss:
     mov     ecx, [rip + fBoss]

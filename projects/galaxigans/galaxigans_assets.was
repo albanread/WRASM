@@ -56,6 +56,16 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fBoss], eax
 
+    lea     rcx, [rip + waspArt]             ; Wasp 16x16 (slot 4)
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
+    mov     [rip + fWasp], eax
+
     lea     rcx, [rip + bulletArt]           ; bullet 2x6
     mov     edx, 2
     mov     r8d, 6
@@ -134,6 +144,51 @@ proc SetupSprPalettes
     call    SetupBeePalette
     call    SetupButterflyPalette
     call    SetupBossPalette
+    call    SetupWaspPalette
+endproc
+
+; ---- SetupWaspPalette: slot 4 — teal body (2-5), lime wings (6-8), yellow sting (9), magenta eyes (A) ----
+proc SetupWaspPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 1
+    mov     r8d, 0x00081810
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 2
+    mov     r8d, 0x00134838
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 3
+    mov     r8d, 0x001E7A5C
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 4
+    mov     r8d, 0x002FB484
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 5
+    mov     r8d, 0x0058E6B0
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 6
+    mov     r8d, 0x00567A10
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 7
+    mov     r8d, 0x008FBE20
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 8
+    mov     r8d, 0x00CDF050
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 9
+    mov     r8d, 0x00FFE040
+    call    SprSetPalette
+    mov     ecx, WASP_SLOT
+    mov     edx, 10
+    mov     r8d, 0x00FF40C0
+    call    SprSetPalette
 endproc
 
 ; ---- SetupButterflyPalette: slot 2 — magenta wings (2-5), white body (6-8), cyan eyes (9) ----
