@@ -190,6 +190,21 @@ rowTypes   DWORD TYPE_BOSS,  TYPE_BUTTERFLY, TYPE_WASP,   TYPE_DRONE,  TYPE_BEE 
            DWORD TYPE_JELLY, TYPE_BOSS,      TYPE_STING,  TYPE_BEETLE, TYPE_WASP    ; 4: full mix
 rowTypePtr QWORD 0                            ; -> the selected theme's 5 entries (set by ResetGame)
 
+; ---- LEVEL TABLE: one row per level = {cosmos scene 0..8, formation theme 0..3}. To add a
+;      level, append a row; difficulty (dive cadence / bombs / speed) scales with stage on top.
+;      Levels past the last row wrap the table but keep getting more aggressive. ----
+.balign 16
+levelTable DWORD 0, 0      ; L1  nebula       / classic
+           DWORD 1, 1      ; L2  galaxy       / +ray,beetle
+           DWORD 2, 2      ; L3  black hole   / new-heavy
+           DWORD 3, 3      ; L4  alien world  / full mix
+           DWORD 4, 0      ; L5  moon         / classic
+           DWORD 5, 1      ; L6  supernova    / +ray,beetle
+           DWORD 6, 2      ; L7  wormhole     / new-heavy
+           DWORD 7, 3      ; L8  gas giant    / full mix
+           DWORD 8, 0      ; L9  aurora       / classic
+NUM_LEVELS equ 9
+
 ; per-type frame tables, indexed by EN_TYPE (0..7): upright + left/right bank (for divers)
 ; fUp2 = the optional 2nd "flap" frame (0 = none); alternated in formation by EN_ANIM.
 .balign 16

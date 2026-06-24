@@ -21,23 +21,22 @@ proc ResetGame uses rbx rsi rdi frame
     ; --- per-stage difficulty ramp (clamped); score/lives carry across stages ---
     mov     eax, [rip + stage]
     dec     eax                              ; s = stage-1
-    mov     ecx, eax                         ; gDivePeriod = max(24, 60 - s*6)
-    imul    ecx, ecx, 6
+    mov     ecx, eax                         ; gDivePeriod = max(18, 60 - s*8) — steeper
+    imul    ecx, ecx, 8
     mov     edx, DIVE_PERIOD
     sub     edx, ecx
-    cmp     edx, 24
+    cmp     edx, 18
     jge     rg_dp
-    mov     edx, 24
+    mov     edx, 18
 rg_dp:
     mov     [rip + gDivePeriod], edx
     mov     [rip + diveTimer], edx
-    mov     ecx, eax                         ; gBombPeriod = max(10, 22 - s*2)
-    add     ecx, ecx
+    imul    ecx, eax, 3                       ; gBombPeriod = max(7, 22 - s*3) — more bombs
     mov     edx, BOMB_PERIOD
     sub     edx, ecx
-    cmp     edx, 10
+    cmp     edx, 7
     jge     rg_bp
-    mov     edx, 10
+    mov     edx, 7
 rg_bp:
     mov     [rip + gBombPeriod], edx
     mov     [rip + bombTimer], edx
@@ -52,18 +51,11 @@ rg_vx:
     add     ecx, ecx
     mov     edx, SAUCER_BOMB_GAP
     sub     edx, ecx
-    cmp     edx, 14
+    cmp     edx, 12
     jge     rg_sg
-    mov     edx, 14
+    mov     edx, 12
 rg_sg:
     mov     [rip + gSaucerGap], edx
-    ; pick the per-stage formation theme: rowTypePtr = &rowTypes[(s mod NUM_THEMES)*5]
-    mov     ecx, eax                         ; (NUM_THEMES is a power of 2 -> mask)
-    and     ecx, NUM_THEMES - 1
-    imul    ecx, ecx, 20                      ; 5 species * 4 bytes per theme
-    lea     rdx, [rip + rowTypes]
-    add     rdx, rcx
-    mov     [rip + rowTypePtr], rdx
     xor     edx, edx                         ; gStageOff = (stage-1) mod 5 (saucer dome tint)
     mov     ecx, 5
     div     ecx
@@ -85,7 +77,22 @@ rg_sg:
     mov     r8d, [rsi + 8]
     call    SprSetPalette
     call    SprUploadPalette
-    mov     ecx, [rip + gStageOff]           ; background cosmos for this stage (0..4)
+    ; --- level look-up: {cosmos scene, formation theme} = levelTable[(stage-1) mod NUM_LEVELS] ---
+    mov     eax, [rip + stage]
+    dec     eax
+    xor     edx, edx
+    mov     ecx, NUM_LEVELS
+    div     ecx                              ; edx = level index
+    imul    edx, edx, 8                       ; 2 dwords per level row
+    lea     rcx, [rip + levelTable]
+    add     rcx, rdx
+    mov     r8d, [rcx]                        ; cosmos scene
+    mov     r9d, [rcx + 4]                    ; formation theme
+    imul    r9d, r9d, 20                      ; -> rowTypes offset (5 species * 4 bytes)
+    lea     rax, [rip + rowTypes]
+    add     rax, r9
+    mov     [rip + rowTypePtr], rax
+    mov     ecx, r8d
     call    StarSetScene
 
     lea     rdi, [rip + bullets]             ; all bullets inactive

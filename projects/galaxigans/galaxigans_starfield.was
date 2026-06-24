@@ -92,12 +92,71 @@ float cr=craterH(uvp);
 float fine=h21(floor(uv*float2(320.0,180.0)))*0.05;
 float3 col=float3(0.22,0.22,0.24)+cr*float3(0.55,0.54,0.58)+fine;
 return saturate(col);}
+float3 scNova(float2 uv,float t){
+float2 c=uv-0.5;c.x*=1.7778;
+float r=length(c);float a=atan2(c.y,c.x);
+float ph=frac(t*0.12);
+float er=(r-ph*0.75)*7.0;float ring=exp(-er*er);
+float core=exp(-r*r*26.0)*(1.3-ph);
+float rays=0.6+0.4*sin(a*20.0+t);
+float3 col=float3(0.05,0.02,0.05);
+col+=core*float3(1.0,0.92,0.7);
+col+=ring*float3(1.0,0.55,0.25)*rays;
+float st=h21(floor(c*55.0));
+col+=(st>0.95?1.0:0.0)*0.35*saturate(1.3-r);
+return col;}
+float3 scWormhole(float2 uv,float t){
+float2 c=uv-0.5;c.x*=1.7778;
+float r=length(c)+0.05;float a=atan2(c.y,c.x);
+float depth=0.32/r+t*0.6;
+float ring=0.5+0.5*sin(depth*9.0);
+float twist=0.5+0.5*sin(a*6.0+depth*2.5);
+float3 col=lerp(float3(0.02,0.04,0.10),float3(0.20,0.55,0.95),ring*twist);
+col*=saturate(r*2.6);
+col+=exp(-r*r*55.0)*float3(0.7,0.85,1.0);
+return col;}
+float3 scGasGiant(float2 uv,float t){
+float2 c=uv-float2(0.5,0.44);c.x*=1.7778;
+float r=length(c);float planet=smoothstep(0.32,0.31,r);
+float lat=c.y/0.33;
+float bands=0.5+0.5*sin(lat*15.0+sin(lat*4.0+t*0.1)*1.4);
+float3 surf=lerp(float3(0.55,0.42,0.24),float3(0.85,0.72,0.46),bands);
+float2 sp=c-float2(0.11,-0.04);float spot=smoothstep(0.06,0.0,length(sp*float2(1.0,1.7)));
+surf=lerp(surf,float3(0.82,0.32,0.20),spot*0.7);
+float z=sqrt(saturate(0.105-r*r));
+float lit=saturate(dot(normalize(float3(c.x,c.y,z*3.0)),normalize(float3(-0.5,-0.3,0.8))));
+surf*=0.30+0.9*lit;
+float2 rc=c*float2(1.0,3.4);float rr=length(rc);
+float ring=smoothstep(0.40,0.43,rr)*smoothstep(0.60,0.57,rr)*(0.55+0.45*sin(rr*90.0));
+float3 col=float3(0.02,0.02,0.05);
+float st=h21(floor(uv*float2(220.0,130.0)));
+col+=(st>0.985?1.0:0.0)*0.7;
+col=lerp(col,float3(0.75,0.68,0.52),ring*(1.0-planet));
+col=lerp(col,surf,planet);
+return col;}
+float3 scAurora(float2 uv,float t){
+float3 col=float3(0.01,0.02,0.05);
+float st=h21(floor(uv*float2(200.0,120.0)));
+col+=(st>0.98?1.0:0.0)*0.6*smoothstep(0.55,0.0,uv.y);
+float fil=0.62+0.38*sin(uv.x*140.0+sin(uv.y*8.0)*2.0+t*1.5);
+for(int i=0;i<4;i++){
+float fi=float(i);
+float cx=0.18+fi*0.22+0.13*sin(uv.y*3.0+t*0.4+fi*1.7);
+float fx=(uv.x-cx)*11.0;float band=exp(-fx*fx);
+float hh=smoothstep(0.04,0.42,uv.y)*(1.0-smoothstep(0.50,0.96,uv.y));
+float3 ac=lerp(float3(0.1,0.95,0.45),float3(0.45,0.2,0.9),frac(fi*0.37));
+col+=band*hh*fil*ac*0.75;}
+return col;}
 float4 SPS(VO v):SV_Target{
 float t=tparm.x;int sc=(int)(tparm.y+0.5);float2 uv=v.uv;float3 col;
 if(sc==1)col=scGalaxy(uv,t);
 else if(sc==2)col=scBlack(uv,t);
 else if(sc==3)col=scAlien(uv,t);
 else if(sc==4)col=scMoon(uv,t);
+else if(sc==5)col=scNova(uv,t);
+else if(sc==6)col=scWormhole(uv,t);
+else if(sc==7)col=scGasGiant(uv,t);
+else if(sc==8)col=scAurora(uv,t);
 else col=scNebula(uv,t);
 return float4(col,1.0);}
 .ENDASCIISTRING
