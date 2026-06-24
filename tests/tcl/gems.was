@@ -35,7 +35,8 @@ nanoScript:
     BYTE "Pset rcx=300, rdx=70, r8=15", 10
     BYTE "Pset rcx=12, rdx=52, r8=15", 10
     BYTE "Star rcx=205, rdx=22, r8=14", 10           ; <- an APP-defined verb, via TCL
-    BYTE "Star rcx=120, rdx=44, r8=14", 10, 0
+    BYTE "Star rcx=120, rdx=44, r8=14", 10
+    BYTE "Rect rcx=116, rdx=170, r8=88, r9=22, r10=14", 10, 0   ; Rect: a NEW std verb
 .balign 16
 
 .CODE
@@ -68,7 +69,8 @@ GameInit:
     call    set_sky                    ; deep-blue gradient sky into the per-line palette
     mov     cl, 1                      ; fill fb with the sky field (index 1, resolved per line)
     call    Cls
-    call    TclInit                    ; the library's standard verbs (Pset, Disc, …)
+    call    TclInit                    ; the always-present control verbs (intro/free/cont)
+    call    TclStdVerbs                ; the WHOLE standard library API as verbs
     lea     rcx, [rip + vnStar]        ; the app hooks in its OWN verbs
     lea     rdx, [rip + Star]
     call    TclAddVerb
@@ -225,3 +227,4 @@ endproc
 .include "../../library/harness.was"
 .include "../../library/introspect.was"
 .include "../../library/tcl/tcl.was"
+.include "../../library/tcl/stdverbs.was"   ; generated: the whole std library API as verbs
