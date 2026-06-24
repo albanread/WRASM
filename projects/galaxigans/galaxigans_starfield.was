@@ -21,25 +21,84 @@ starSrc:
 cbuffer SCB:register(b0){float4 tparm;};
 struct VO{float4 p:SV_Position;float2 uv:TEXCOORD0;};
 VO SVS(uint i:SV_VertexID){VO o;float2 u=float2((i<<1)&2,i&2);o.p=float4(u.x*2-1,1-u.y*2,0,1);o.uv=u;return o;}
-float4 SPS(VO v):SV_Target{
-float t=tparm.x;
-float px=v.uv.x*640.0;
-float py=v.uv.y*360.0;
+float h21(float2 p){return frac(sin(dot(p,float2(127.1,311.7)))*43758.5453);}
+float3 scNebula(float2 uv,float t){
+float px=uv.x*640.0,py=uv.y*360.0;
 float n=sin(px*0.011+t*0.30)+sin(py*0.014-t*0.20)+sin((px+py)*0.007+t*0.15)+sin((px-py)*0.009-t*0.10);
 float neb=(n+4.0)*0.125;
-float3 col=float3(0.015+neb*0.05, 0.010+neb*0.03, 0.055+neb*0.20);
+float3 col=float3(0.015+neb*0.05,0.010+neb*0.03,0.055+neb*0.20);
 for(int L=0;L<3;L++){
-float sp=16.0+L*30.0;
-float cell=13.0+L*6.0;
-float2 cp=float2(px, py-t*sp)/cell;
-float2 gi=floor(cp);
-float h=frac(sin(dot(gi,float2(127.1,311.7)))*43758.5453);
-if(h>0.90){
-float2 sub=frac(cp)-0.5;
-float d=dot(sub,sub);
-float tw=0.55+0.45*sin(t*3.0+h*50.0);
-float star=saturate(1.0-d*55.0)*tw;
-col+=star*(0.45+0.5*float(L));}}
+float sp=16.0+L*30.0,cell=13.0+L*6.0;
+float2 cp=float2(px,py-t*sp)/cell;float2 gi=floor(cp);float h=h21(gi);
+if(h>0.90){float2 sub=frac(cp)-0.5;float d=dot(sub,sub);float tw=0.55+0.45*sin(t*3.0+h*50.0);col+=saturate(1.0-d*55.0)*tw*(0.45+0.5*float(L));}}
+return col;}
+float3 scGalaxy(float2 uv,float t){
+float2 c=uv-0.5;c.x*=1.7778;
+float r=length(c);float a=atan2(c.y,c.x);
+float spiral=sin(2.0*(a+t*0.15)+6.5*log(r+0.06));
+float arm=smoothstep(0.0,0.7,spiral)*exp(-r*2.6);
+float core=exp(-r*r*38.0);
+float3 col=float3(0.04,0.02,0.09);
+col+=arm*float3(0.45,0.40,0.85)*0.7;
+col+=core*float3(1.0,0.9,0.7);
+col+=arm*0.35*float3(0.8,0.5,0.95)*(0.5+0.5*sin(r*60.0-t));
+float2 sg=c*70.0;float2 sgi=floor(sg);float sh=h21(sgi);float2 ssb=frac(sg)-0.5;float sd=dot(ssb,ssb);
+col+=(sh>0.93?1.0:0.0)*saturate(1.0-sd*55.0)*0.6*saturate(1.4-r*2.0);
+return col;}
+float3 scBlack(float2 uv,float t){
+float2 c=uv-0.5;c.x*=1.7778;
+float r=length(c);float a=atan2(c.y,c.x);
+float horizon=smoothstep(0.12,0.105,r);
+float rr=(r-0.19)*8.5;float ring=exp(-rr*rr);
+float swirl=0.55+0.45*sin(a*3.0-t*2.2+22.0*r);
+float3 disk=ring*swirl*float3(1.0,0.55,0.18);
+float2 lp=c*(1.0+0.04/(r*r+0.02));
+float2 sg=lp*72.0;float2 sgi=floor(sg);float sh=h21(sgi);float2 ssb=frac(sg)-0.5;float sd=dot(ssb,ssb);
+float stars=(sh>0.95?1.0:0.0)*saturate(1.0-sd*45.0)*smoothstep(0.11,0.15,r);
+float3 col=disk+stars*0.7+float3(0.02,0.01,0.03);
+col*=(1.0-horizon);
+return col;}
+float3 scAlien(float2 uv,float t){
+float3 sky=lerp(float3(0.02,0.05,0.08),float3(0.10,0.03,0.13),uv.y);
+float2 pc=uv-float2(0.5,1.18);pc.x*=1.7778;
+float pr=length(pc);float planet=smoothstep(0.63,0.62,pr);
+float bands=0.5+0.5*sin(pc.y*34.0+sin(pc.x*7.0+t*0.2)*2.2);
+float3 psurf=lerp(float3(0.20,0.45,0.18),float3(0.55,0.70,0.30),bands);
+float z=sqrt(saturate(0.40-pr*pr));
+float lit=saturate(dot(normalize(float3(pc.x,pc.y,z*1.5)),normalize(float3(-0.5,-0.6,0.6))));
+psurf*=0.25+0.95*lit;
+float3 col=lerp(sky,psurf,planet);
+float st=h21(floor(uv*float2(220.0,130.0)));
+col+=(st>0.985?1.0:0.0)*(1.0-planet)*0.8;
+float2 mc=uv-float2(0.80,0.22);mc.x*=1.7778;float mr=length(mc);
+float moon=smoothstep(0.05,0.045,mr);
+float ml=saturate(dot(normalize(float3(mc.x,mc.y,0.05)),normalize(float3(-0.4,-0.5,0.7))));
+col=lerp(col,float3(0.55,0.52,0.48)*(0.4+0.7*ml),moon);
+return col;}
+float craterH(float2 uv){
+float h=0.0;
+for(int k=0;k<3;k++){
+float sc=5.0*pow(1.8,float(k));
+float2 p=uv*sc;float2 gi=floor(p),gf=frac(p)-0.5;
+float2 off=float2(h21(gi)-0.5,h21(gi+3.3)-0.5)*0.5;
+float d=length(gf-off);float rad=0.16+0.16*h21(gi+7.7);
+float rim=smoothstep(rad+0.05,rad,d)*smoothstep(rad-0.06,rad,d);
+float bowl=smoothstep(rad,0.0,d);
+h+=(rim*0.6-bowl*0.35)/(float(k)+1.0);}
+return h;}
+float3 scMoon(float2 uv,float t){
+float2 uvp=uv+float2(t*0.008,0.0);uvp.x*=1.7778;
+float cr=craterH(uvp);
+float fine=h21(floor(uv*float2(320.0,180.0)))*0.05;
+float3 col=float3(0.22,0.22,0.24)+cr*float3(0.55,0.54,0.58)+fine;
+return saturate(col);}
+float4 SPS(VO v):SV_Target{
+float t=tparm.x;int sc=(int)(tparm.y+0.5);float2 uv=v.uv;float3 col;
+if(sc==1)col=scGalaxy(uv,t);
+else if(sc==2)col=scBlack(uv,t);
+else if(sc==3)col=scAlien(uv,t);
+else if(sc==4)col=scMoon(uv,t);
+else col=scNebula(uv,t);
 return float4(col,1.0);}
 .ENDASCIISTRING
 starEnd:
@@ -124,6 +183,14 @@ StarSetTime:
     addss   xmm0, [rip + starStep]
     movss   [rip + starTime], xmm0
     movss   [rip + starCB + 0], xmm0
+    ret
+
+; ---- StarSetScene(ecx = scene id 0..4) — select which cosmos the bg shader renders
+;      (0 nebula / 1 galaxy / 2 black hole / 3 alien world / 4 moon). Call per stage. ----
+.globl StarSetScene
+StarSetScene:
+    cvtsi2ss xmm0, ecx
+    movss   [rip + starCB + 4], xmm0          ; tparm.y = scene
     ret
 
 ; ---- StarRender(rcx=dstRTV) — draw the starfield full-screen into dstRTV, FIRST/opaque. ----

@@ -85,6 +85,8 @@ rg_sg:
     mov     r8d, [rsi + 8]
     call    SprSetPalette
     call    SprUploadPalette
+    mov     ecx, [rip + gStageOff]           ; background cosmos for this stage (0..4)
+    call    StarSetScene
 
     lea     rdi, [rip + bullets]             ; all bullets inactive
     mov     ecx, BULLET_MAX
