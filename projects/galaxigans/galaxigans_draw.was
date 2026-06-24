@@ -46,39 +46,29 @@ dsc_fleet:
 dsc_e:
     cmp     dword ptr [rsi + EN_ALIVE], 0
     je      dsc_enext
-    mov     eax, [rsi + EN_TYPE]             ; pick frame + palette slot by type
-    cmp     eax, TYPE_BEE
-    jne     dsc_e_nb
-    mov     ecx, [rip + fEnemy]              ; Bee: flap fEnemy/fEnemyFlap every 16 ticks
+    mov     eax, [rsi + EN_TYPE]             ; t (0..4); palette slot = t+1
+    lea     r8d, [rax + 1]
+    mov     ecx, [rsi + EN_BANK]             ; banking? -> rotated frame
+    test    ecx, ecx
+    jz      dsc_e_upright
+    js      dsc_e_bankL
+    lea     rdx, [rip + fBankR]
+    mov     ecx, [rdx + rax*4]
+    jmp     dsc_e_draw
+dsc_e_bankL:
+    lea     rdx, [rip + fBankL]
+    mov     ecx, [rdx + rax*4]
+    jmp     dsc_e_draw
+dsc_e_upright:
+    lea     rdx, [rip + fUp]                 ; upright frame for this type
+    mov     ecx, [rdx + rax*4]
+    cmp     eax, TYPE_BEE                     ; the Bee flaps while upright
+    jne     dsc_e_draw
     mov     edx, [rsi + EN_ANIM]
     shr     edx, 4
     test    edx, 1
-    jz      dsc_e_beeslot
+    jz      dsc_e_draw
     mov     ecx, [rip + fEnemyFlap]
-dsc_e_beeslot:
-    mov     r8d, BEE_SLOT
-    jmp     dsc_e_draw
-dsc_e_nb:
-    cmp     eax, TYPE_BUTTERFLY
-    jne     dsc_e_nw
-    mov     ecx, [rip + fButterfly]
-    mov     r8d, BUT_SLOT
-    jmp     dsc_e_draw
-dsc_e_nw:
-    cmp     eax, TYPE_WASP
-    jne     dsc_e_nd
-    mov     ecx, [rip + fWasp]
-    mov     r8d, WASP_SLOT
-    jmp     dsc_e_draw
-dsc_e_nd:
-    cmp     eax, TYPE_DRONE
-    jne     dsc_e_boss
-    mov     ecx, [rip + fDrone]
-    mov     r8d, DRONE_SLOT
-    jmp     dsc_e_draw
-dsc_e_boss:
-    mov     ecx, [rip + fBoss]
-    mov     r8d, BOSS_SLOT
 dsc_e_draw:
     cvtsi2ss xmm1, dword ptr [rsi + EN_X]    ; live screen pos (sway/dive already folded in)
     cvtsi2ss xmm2, dword ptr [rsi + EN_Y]

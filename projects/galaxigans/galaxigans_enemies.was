@@ -119,6 +119,7 @@ fs_e:
     mov     [rdi + EN_X], eax
     mov     eax, [rdi + EN_HY]
     mov     [rdi + EN_Y], eax
+    mov     dword ptr [rdi + EN_BANK], 0     ; level in formation
     jmp     fs_enext
 fs_return:
     ; --- glide down from the top to the OWN home slot (own row = own species) ---
@@ -126,6 +127,7 @@ fs_return:
     mov     eax, [rdi + EN_HX]
     add     eax, [rip + formX]               ; track the swaying column on the way in
     mov     [rdi + EN_X], eax
+    mov     dword ptr [rdi + EN_BANK], 0     ; level on the way home
     mov     eax, [rdi + EN_HY]
     cmp     [rdi + EN_Y], eax
     jl      fs_enext                          ; still descending
@@ -150,13 +152,19 @@ fs_vy:
     cmp     [rdi + EN_X], ecx
     jge     fs_homeL
     add     dword ptr [rdi + EN_X], DIVE_VX
+    mov     dword ptr [rdi + EN_BANK], 1     ; banking right toward the player
     jmp     fs_offcheck
 fs_homeL:
     sub     dword ptr [rdi + EN_X], DIVE_VX
+    mov     dword ptr [rdi + EN_BANK], -1    ; banking left
     jmp     fs_offcheck
 fs_peel:
     mov     ecx, [rdi + EN_VX]               ; early outward peel
     add     [rdi + EN_X], ecx
+    mov     dword ptr [rdi + EN_BANK], 1     ; bank toward the peel direction
+    cmp     ecx, 0
+    jge     fs_offcheck
+    mov     dword ptr [rdi + EN_BANK], -1
 fs_offcheck:
     cmp     dword ptr [rdi + EN_Y], FIELD_H + 8   ; exited the bottom -> re-enter from the top
     jl      fs_enext

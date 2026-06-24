@@ -116,9 +116,62 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fBomb], eax
 
+    ; --- per-type frame tables: upright (fUp) + the rotated bank frames (fBankL/R) ---
+    mov     eax, [rip + fEnemy]
+    mov     [rip + fUp + 0], eax
+    mov     eax, [rip + fButterfly]
+    mov     [rip + fUp + 4], eax
+    mov     eax, [rip + fBoss]
+    mov     [rip + fUp + 8], eax
+    mov     eax, [rip + fWasp]
+    mov     [rip + fUp + 12], eax
+    mov     eax, [rip + fDrone]
+    mov     [rip + fUp + 16], eax
+    lea     rcx, [rip + fBeeBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 0], eax
+    lea     rcx, [rip + fBeeBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 0], eax
+    lea     rcx, [rip + fButBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 4], eax
+    lea     rcx, [rip + fButBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 4], eax
+    lea     rcx, [rip + fBossBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 8], eax
+    lea     rcx, [rip + fBossBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 8], eax
+    lea     rcx, [rip + fWaspBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 12], eax
+    lea     rcx, [rip + fWaspBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 12], eax
+    lea     rcx, [rip + fGruntBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 16], eax
+    lea     rcx, [rip + fGruntBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 16], eax
+
     call    SprUploadAtlas
     call    SetupSprPalettes
     call    SprUploadPalette
+endproc
+
+; ---- DecAdd16(rcx=art) -> eax = frame id: decode a 16x16 hex sprite + add an atlas frame ----
+proc DecAdd16 frame in rcx
+    mov     edx, 16
+    mov     r8d, 16
+    call    DecodeSprite
+    lea     rcx, [rip + sprScratch]
+    mov     edx, 16
+    mov     r8d, 16
+    call    SprAddFrame
 endproc
 
 ; ---- DecodeSprite(rcx=textPtr, edx=w, r8d=h): hex-digit chars -> index bytes in

@@ -12,7 +12,7 @@ PLAYER_Y       equ 330                       ; ship sits near the bottom
 ENEMY_COLS     equ 8
 ENEMY_ROWS     equ 5
 ENEMY_MAX      equ 40                        ; COLS*ROWS
-ENEMY_STRIDE   equ 40                        ; 10 i32 fields (see EN_* below)
+ENEMY_STRIDE   equ 44                        ; 11 i32 fields (see EN_* below)
 EN_X           equ 0                         ; live SCREEN x (sway already folded in)
 EN_Y           equ 4                         ; live SCREEN y
 EN_ALIVE       equ 8
@@ -23,6 +23,7 @@ EN_VX          equ 24                        ; peel velocity during the early di
 EN_DT          equ 28                        ; dive step counter
 EN_ANIM        equ 32                        ; wing-flap phase counter
 EN_TYPE        equ 36                        ; TYPE_BEE / TYPE_BUTTERFLY / TYPE_BOSS
+EN_BANK        equ 40                        ; -1 banking left / 0 level / +1 right (while diving)
 ST_FORM        equ 0
 ST_DIVE        equ 1
 ST_RETURN      equ 2                         ; surviving diver gliding back from the top to its slot
@@ -123,7 +124,7 @@ diveScan   DWORD 0                            ; rotating start index for picking
 bombTimer  DWORD 22                           ; countdown to the next bomb drop
 
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
-enemies    BYTE  1600 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*40)
+enemies    BYTE  1760 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*44)
 bullets    BYTE  64  dup(0)                   ; BULLET_MAX * BULLET_STRIDE (4*16)
 bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
 
@@ -144,6 +145,12 @@ fBomb      DWORD ?
 ; formation row -> alien type (one species per row)
 .balign 16
 rowType    DWORD TYPE_BOSS, TYPE_BUTTERFLY, TYPE_WASP, TYPE_DRONE, TYPE_BEE
+
+; per-type frame tables, indexed by EN_TYPE (0..4): upright + left/right bank (for divers)
+.balign 16
+fUp        DWORD 5 dup(0)
+fBankL     DWORD 5 dup(0)
+fBankR     DWORD 5 dup(0)
 
 ; ship palette (slot 6 indices 1..15) — steel-blue hull, cyan cockpit, orange engine glow
 .balign 16
