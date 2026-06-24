@@ -1,0 +1,318 @@
+; ============================================================================
+; library/nanotcl/exec.was — the nano-TCL Tier-1 executor.
+;
+; A shadow register file + a clobber-free `nanoCall` trampoline + a bare-line
+; parser that dispatches  `Verb reg=val, reg=val, …`  to the *library's own*
+; global procs (Pset, Disc, Circle, Cls, Line, FillRect, Text, DrawSprite).
+; The whole point: script the canvas live with no per-verb code — the verb table
+; maps a name to an existing exported proc address.
+;
+; Include AFTER the library (canvas/sprite/…) so those procs exist. The host:
+;     call NanoTclInit              ; once, builds the verb table
+;     RunTcl(rcx = asciiz script)   ; run one or more `\n`-separated statements
+;
+; nanoCall addresses the shadow file RIP-relative (no base register) — an earlier
+; version used rbp as the base and corrupted the frame epilogue on return.
+; ============================================================================
+
+module Nanotcl
+
+.DATA
+.balign 16
+shadowGP    QWORD 16 dup(0)        ; ModRM order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+gVerbPtr    QWORD 0
+verbTbl     QWORD 32 dup(0)        ; up to 16 rows of { nameptr, procaddr }
+verbCount   QWORD 0
+nameBuf     BYTE  32 dup(0)
+regBuf      BYTE  16 dup(0)
+vn_Pset       BYTE "Pset", 0
+vn_Disc       BYTE "Disc", 0
+vn_Circle     BYTE "Circle", 0
+vn_Cls        BYTE "Cls", 0
+vn_Line       BYTE "Line", 0
+vn_FillRect   BYTE "FillRect", 0
+vn_Text       BYTE "Text", 0
+vn_DrawSprite BYTE "DrawSprite", 0
+.balign 16
+
+.CODE
+
+; ---- NanoTclInit: build the verb table (name -> library proc) at runtime ----
+proc NanoTclInit uses rbx frame
+    lea     rbx, [rip + verbTbl]
+    lea     rax, [rip + vn_Pset]
+    mov     [rbx + 0], rax
+    lea     rax, [rip + Pset]
+    mov     [rbx + 8], rax
+    lea     rax, [rip + vn_Disc]
+    mov     [rbx + 16], rax
+    lea     rax, [rip + Disc]
+    mov     [rbx + 24], rax
+    lea     rax, [rip + vn_Circle]
+    mov     [rbx + 32], rax
+    lea     rax, [rip + Circle]
+    mov     [rbx + 40], rax
+    lea     rax, [rip + vn_Cls]
+    mov     [rbx + 48], rax
+    lea     rax, [rip + Cls]
+    mov     [rbx + 56], rax
+    lea     rax, [rip + vn_Line]
+    mov     [rbx + 64], rax
+    lea     rax, [rip + Line]
+    mov     [rbx + 72], rax
+    lea     rax, [rip + vn_FillRect]
+    mov     [rbx + 80], rax
+    lea     rax, [rip + FillRect]
+    mov     [rbx + 88], rax
+    lea     rax, [rip + vn_Text]
+    mov     [rbx + 96], rax
+    lea     rax, [rip + Text]
+    mov     [rbx + 104], rax
+    lea     rax, [rip + vn_DrawSprite]
+    mov     [rbx + 112], rax
+    lea     rax, [rip + DrawSprite]
+    mov     [rbx + 120], rax
+    mov     qword ptr [rip + verbCount], 8
+endproc
+
+; ---- nanoCall: load shadow GP -> call the parked verb -> capture rax ----
+proc nanoCall frame
+    mov     rax, [rip + shadowGP + 0]
+    mov     rcx, [rip + shadowGP + 8]
+    mov     rdx, [rip + shadowGP + 16]
+    mov     rbx, [rip + shadowGP + 24]
+    ; rsp(+32)/rbp(+40) skipped — RIP-relative, no base register to clobber
+    mov     rsi, [rip + shadowGP + 48]
+    mov     rdi, [rip + shadowGP + 56]
+    mov     r8,  [rip + shadowGP + 64]
+    mov     r9,  [rip + shadowGP + 72]
+    mov     r10, [rip + shadowGP + 80]
+    mov     r11, [rip + shadowGP + 88]
+    mov     r12, [rip + shadowGP + 96]
+    mov     r13, [rip + shadowGP + 104]
+    mov     r14, [rip + shadowGP + 112]
+    mov     r15, [rip + shadowGP + 120]
+    call    qword ptr [rip + gVerbPtr]
+    mov     [rip + shadowGP + 0], rax      ; capture the return value
+endproc
+
+; ---- regToSlot: regBuf -> shadow slot index in eax, or 0xFF if unknown ----
+proc regToSlot
+    lea     r10, [rip + regBuf]
+    movzx   ecx, word ptr [r10]
+    movzx   edx, byte ptr [r10 + 2]
+    cmp     cx, 0x3872               ; "r8"
+    je      rs_8
+    cmp     cx, 0x3972               ; "r9"
+    je      rs_9
+    cmp     cx, 0x6172               ; "ra" -> rax
+    je      rs_a
+    cmp     cx, 0x6372               ; "rc" -> rcx
+    je      rs_c
+    cmp     cx, 0x6272               ; "rb" -> rbx
+    je      rs_b
+    cmp     cx, 0x7372               ; "rs" -> rsi
+    je      rs_s
+    cmp     cx, 0x3172               ; "r1" -> r10
+    je      rs_10
+    cmp     cx, 0x6472               ; "rd" -> rdx / rdi
+    je      rs_d
+    mov     eax, 0xFF
+    ret
+rs_8:
+    mov     eax, 8
+    ret
+rs_9:
+    mov     eax, 9
+    ret
+rs_a:
+    mov     eax, 0
+    ret
+rs_c:
+    mov     eax, 1
+    ret
+rs_b:
+    mov     eax, 3
+    ret
+rs_s:
+    mov     eax, 6
+    ret
+rs_10:
+    mov     eax, 10
+    ret
+rs_d:
+    cmp     dl, 'i'
+    je      rs_di
+    mov     eax, 2
+    ret
+rs_di:
+    mov     eax, 7
+    ret
+endproc
+
+; ---- findVerb: nameBuf -> set gVerbPtr; eax = 1 found / 0 not ----
+proc findVerb uses rbx rsi rdi
+    xor     ebx, ebx                 ; row index
+fv_loop:
+    cmp     rbx, [rip + verbCount]
+    jge     fv_none
+    mov     r10, rbx
+    shl     r10, 4                   ; row * 16 bytes
+    lea     rax, [rip + verbTbl]
+    mov     rsi, [rax + r10]         ; name ptr
+    lea     rdi, [rip + nameBuf]
+fv_cmp:
+    mov     cl, [rsi]
+    mov     dl, [rdi]
+    cmp     cl, dl
+    jne     fv_next
+    test    cl, cl
+    jz      fv_found
+    inc     rsi
+    inc     rdi
+    jmp     fv_cmp
+fv_found:
+    lea     rax, [rip + verbTbl]
+    mov     rax, [rax + r10 + 8]     ; proc addr
+    mov     [rip + gVerbPtr], rax
+    mov     eax, 1
+    jmp     fv_done
+fv_next:
+    inc     rbx
+    jmp     fv_loop
+fv_none:
+    xor     eax, eax
+fv_done:
+endproc
+
+; ---- parseOne(rcx = line ptr): parse one statement (to \0 or \n), dispatch, run ----
+proc parseOne uses rsi rdi rbx frame
+    mov     rsi, rcx
+po_sp:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 32
+    jne     po_sp_done
+    inc     rsi
+    jmp     po_sp
+po_sp_done:
+    ; read verb name -> nameBuf
+    lea     rdi, [rip + nameBuf]
+po_nm:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      po_nm_done
+    cmp     al, 10
+    je      po_nm_done
+    cmp     al, 32
+    je      po_nm_done
+    mov     [rdi], al
+    inc     rsi
+    inc     rdi
+    jmp     po_nm
+po_nm_done:
+    mov     byte ptr [rdi], 0
+    call    findVerb                 ; preserves rsi/rdi/rbx
+    test    eax, eax
+    jz      po_done                  ; unknown verb -> bail
+po_arg:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 32
+    je      po_arg_adv
+    cmp     al, 44                   ; ','
+    je      po_arg_adv
+    jmp     po_arg_chk
+po_arg_adv:
+    inc     rsi
+    jmp     po_arg
+po_arg_chk:
+    test    al, al
+    jz      po_call
+    cmp     al, 10
+    je      po_call
+    lea     rdi, [rip + regBuf]
+po_reg:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      po_reg_done
+    cmp     al, 10
+    je      po_reg_done
+    cmp     al, 32
+    je      po_reg_done
+    cmp     al, 61                   ; '='
+    je      po_reg_done
+    mov     [rdi], al
+    inc     rsi
+    inc     rdi
+    jmp     po_reg
+po_reg_done:
+    mov     byte ptr [rdi], 0
+po_eq_sp:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 32
+    jne     po_eq
+    inc     rsi
+    jmp     po_eq_sp
+po_eq:
+    cmp     al, 61                   ; '='
+    jne     po_done                  ; malformed
+    inc     rsi
+po_val_sp:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 32
+    jne     po_val
+    inc     rsi
+    jmp     po_val_sp
+po_val:
+    xor     r9, r9
+po_num:
+    movzx   eax, byte ptr [rsi]
+    cmp     al, 48
+    jb      po_num_done
+    cmp     al, 57
+    ja      po_num_done
+    sub     al, 48
+    imul    r9, r9, 10
+    movzx   eax, al
+    add     r9, rax
+    inc     rsi
+    jmp     po_num
+po_num_done:
+    call    regToSlot                ; volatiles only; rsi/rdi/rbx/r9 survive
+    cmp     eax, 0xFF
+    je      po_done
+    lea     r11, [rip + shadowGP]
+    mov     [r11 + rax*8], r9
+    jmp     po_arg
+po_call:
+    call    nanoCall
+po_done:
+endproc
+
+; ---- RunTcl(rcx = asciiz script): run each `\n`-separated statement ----
+proc RunTcl uses rsi frame
+    mov     rsi, rcx
+rt_loop:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      rt_done
+    cmp     al, 10                   ; skip blank lines / separators
+    je      rt_adv
+    cmp     al, 13
+    je      rt_adv
+    mov     rcx, rsi                 ; start of a statement
+    call    parseOne                 ; parses to \n or \0 (preserves rsi)
+rt_scan:
+    movzx   eax, byte ptr [rsi]      ; advance past this line
+    test    al, al
+    jz      rt_done
+    cmp     al, 10
+    je      rt_adv
+    inc     rsi
+    jmp     rt_scan
+rt_adv:
+    inc     rsi
+    jmp     rt_loop
+rt_done:
+endproc
+
+endmodule

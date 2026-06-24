@@ -1,0 +1,149 @@
+; gems.was — spinning gems + an orbiting spaceship on a deep-blue sky, on the
+; GamesCanvas library, with the nano-TCL executor drawing a moon + stars (proving
+; `Verb reg=val` dispatches to the library's own global procs).
+;
+;   was tests\tcl\gems.was -o tests\tcl\gems.exe
+;
+; main + the three game procs; the library owns the window/loop/present.
+; Verifies headlessly: GameSelfTest films snap_*.bmp every few frames.
+
+.DATA
+titleW  WCHAR "RASM - Spinning Gems", 0
+; a gem = a diamond that "spins" by squashing horizontally over 3 frames (B = cyan 11)
+gemF0   BYTE  "..B../.BBB./BBBBB/.BBB./..B..", 0    ; face-on (fat)
+gemF1   BYTE  "..B../..B../.BBB./..B../..B..", 0    ; three-quarter
+gemF2   BYTE  "..B../..B../..B../..B../..B..", 0    ; edge-on (sliver)
+; the spaceship (F = white 15 hull, B = cyan 11 cockpit, C = red 12 engines)
+shipSprite BYTE "...F.../..FFF../.FBBBF./FFFFFFF/.C.F.C.", 0
+tick    DWORD 0
+orbitX  DWORD 14336                ; 56 << 8  (fixed-point orbit offset, starts at right)
+orbitY  DWORD 0
+gemX    DWORD 40, 110, 180, 250, 90, 220
+gemY    DWORD 60, 60, 60, 60, 130, 130
+; a baked nano-TCL script: every line dispatches to a real library proc
+nanoScript:
+    BYTE "Disc rcx=270, rdx=30, r8=12, r9=15", 10       ; a pale moon, top-right
+    BYTE "Circle rcx=270, rdx=30, r8=17, r9=11", 10     ; cyan halo around it
+    BYTE "Pset rcx=30, rdx=18, r8=15", 10               ; a few white stars
+    BYTE "Pset rcx=64, rdx=10, r8=15", 10
+    BYTE "Pset rcx=300, rdx=70, r8=15", 10
+    BYTE "Pset rcx=12, rdx=52, r8=15", 10, 0
+.balign 16
+
+.CODE
+.globl main
+main:
+    lea     rcx, [rip + titleW]
+    lea     rdx, [rip + GameInit]
+    lea     r8,  [rip + GameStep]
+    lea     r9,  [rip + GameSprites]
+    call    GameStart                  ; window + init (the library owns the rest)
+    mov     ecx, 48                    ; headless self-test: film 48 frames…
+    mov     edx, 8                     ; …snapshot every 8 -> 6 BMPs (gems spin, ship orbits)
+    call    GameSelfTest
+    invoke  ExitProcess, 0
+
+; ---- init: gem sprite (3 spin frames) + ship sprite, the sky, the nano-TCL scene ----
+GameInit:
+    xor     ecx, ecx                   ; sprite id 0, gem frame 0
+    lea     rdx, [rip + gemF0]
+    call    DefineSprite
+    xor     ecx, ecx                   ; gem frame 1
+    lea     rdx, [rip + gemF1]
+    call    AddFrame
+    xor     ecx, ecx                   ; gem frame 2
+    lea     rdx, [rip + gemF2]
+    call    AddFrame
+    mov     ecx, 1                     ; sprite id 1: the spaceship
+    lea     rdx, [rip + shipSprite]
+    call    DefineSprite
+    call    SeedLinePalette            ; per-line palette defaults to the global palette
+    xor     ecx, ecx
+    call    set_sky                    ; deep-blue gradient sky into the per-line palette
+    mov     cl, 1                      ; fill fb with the sky field (index 1, resolved per line)
+    call    Cls
+    call    NanoTclInit                ; build the nano-TCL verb table (name -> library proc)
+    lea     rcx, [rip + nanoScript]    ; …then let TCL draw the moon + stars into fb
+    call    RunTcl
+    ret
+
+; ---- step: advance the spin clock; orbit the ship (Minsky circle, 2 shifts) ----
+GameStep:
+    inc     dword ptr [rip + tick]
+    mov     eax, [rip + orbitY]
+    sar     eax, 5
+    sub     [rip + orbitX], eax        ; orbitX -= orbitY >> 5
+    mov     eax, [rip + orbitX]
+    sar     eax, 5
+    add     [rip + orbitY], eax        ; orbitY += orbitX >> 5
+    ret
+
+; ---- sprites: the 6 spinning gems, then the orbiting ship ----
+GameSprites:
+    xor     ebx, ebx                   ; gem index (rbx survives SetFrame/DrawSprite)
+gs_loop:
+    cmp     ebx, 6
+    jge     gs_ship
+    mov     eax, [rip + tick]          ; frame = pingpong((tick>>2)+i) over 0,1,2,1
+    shr     eax, 2
+    add     eax, ebx
+    and     eax, 3
+    cmp     eax, 3
+    jne     gs_setf
+    mov     eax, 1
+gs_setf:
+    xor     ecx, ecx                   ; sprite id 0
+    mov     edx, eax
+    call    SetFrame
+    xor     ecx, ecx
+    lea     r10, [rip + gemX]
+    mov     edx, [r10 + rbx*4]
+    lea     r10, [rip + gemY]
+    mov     r8d, [r10 + rbx*4]
+    call    DrawSprite
+    inc     ebx
+    jmp     gs_loop
+gs_ship:
+    mov     ecx, 1                     ; sprite id 1: the ship at the orbit point
+    mov     eax, [rip + orbitX]
+    sar     eax, 8
+    add     eax, 157                   ; 160 - 3 (centre the 7-wide ship)
+    mov     edx, eax
+    mov     eax, [rip + orbitY]
+    sar     eax, 8
+    add     eax, 98                    ; 100 - 2 (centre the 5-tall ship)
+    mov     r8d, eax
+    call    DrawSprite
+    ret
+
+; ---- set_sky: a deep-blue vertical gradient straight into the per-line palette ----
+; one index (1), 200 different blues — darker at the top, lighter (faint teal) low down.
+proc set_sky uses rbx
+    lea     r8, [rip + linePal]
+    xor     edx, edx                   ; y = 0
+sky_row:
+    mov     eax, edx
+    imul    eax, eax, 3
+    shr     eax, 2                     ; B = y * 3/4 …
+    add     eax, 0x30                  ; … 0x30 .. ~0xBD (blue ramp)
+    mov     r9d, edx
+    shr     r9d, 3
+    shl     r9d, 8                     ; G = (y/8) << 8 — a faint horizon tint
+    or      eax, r9d                   ; linePal value 0x0000_GGBB
+    mov     ebx, edx
+    shl     ebx, 4                     ; y*16
+    inc     ebx                        ; + index 1
+    mov     [r8 + rbx*4], eax          ; linePal[y][1]
+    inc     edx
+    cmp     edx, 200
+    jl      sky_row
+endproc
+
+; ---- the GamesCanvas library + the nano-TCL executor ----
+.include "../../library/canvas.was"
+.include "../../library/blit.was"
+.include "../../library/sprite.was"
+.include "../../library/input.was"
+.include "../../library/harness.was"
+.include "../../library/introspect.was"
+.include "../../library/nanotcl/exec.was"
