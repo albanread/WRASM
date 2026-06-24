@@ -1,5 +1,8 @@
 /target
 
+# packaged release folder (binaries + 86 MB knowledge DB + zip; output, not source)
+/release/
+
 # studio --shot / F12 offscreen review captures
 studio_shot_*.png
 # generated binaries are output, never source (studio F5, was CLI, demos)
