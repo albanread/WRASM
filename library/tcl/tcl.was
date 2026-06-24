@@ -25,7 +25,7 @@ module Tcl
 .balign 16
 shadowGP    QWORD 16 dup(0)        ; ModRM order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15
 gVerbPtr    QWORD 0
-verbTbl     QWORD 32 dup(0)        ; up to 16 rows of { nameptr, procaddr }
+verbTbl     QWORD 64 dup(0)        ; up to 32 rows of { nameptr, procaddr } (built-in + app)
 verbCount   QWORD 0
 nameBuf     BYTE  32 dup(0)
 regBuf      BYTE  16 dup(0)
@@ -41,42 +41,51 @@ vn_DrawSprite BYTE "DrawSprite", 0
 
 .CODE
 
-; ---- TclInit: build the verb table (name -> library proc) at runtime ----
-proc TclInit uses rbx frame
-    lea     rbx, [rip + verbTbl]
-    lea     rax, [rip + vn_Pset]
-    mov     [rbx + 0], rax
-    lea     rax, [rip + Pset]
-    mov     [rbx + 8], rax
-    lea     rax, [rip + vn_Disc]
-    mov     [rbx + 16], rax
-    lea     rax, [rip + Disc]
-    mov     [rbx + 24], rax
-    lea     rax, [rip + vn_Circle]
-    mov     [rbx + 32], rax
-    lea     rax, [rip + Circle]
-    mov     [rbx + 40], rax
-    lea     rax, [rip + vn_Cls]
-    mov     [rbx + 48], rax
-    lea     rax, [rip + Cls]
-    mov     [rbx + 56], rax
-    lea     rax, [rip + vn_Line]
-    mov     [rbx + 64], rax
-    lea     rax, [rip + Line]
-    mov     [rbx + 72], rax
-    lea     rax, [rip + vn_FillRect]
-    mov     [rbx + 80], rax
-    lea     rax, [rip + FillRect]
-    mov     [rbx + 88], rax
-    lea     rax, [rip + vn_Text]
-    mov     [rbx + 96], rax
-    lea     rax, [rip + Text]
-    mov     [rbx + 104], rax
-    lea     rax, [rip + vn_DrawSprite]
-    mov     [rbx + 112], rax
-    lea     rax, [rip + DrawSprite]
-    mov     [rbx + 120], rax
-    mov     qword ptr [rip + verbCount], 8
+; ---- TclAddVerb(rcx = name asciz, rdx = proc addr): append one verb ----
+; The hook a TCL-enabled app uses to register its OWN procs as verbs, on top of
+; the standard library verbs TclInit seeds. Silently ignored once the table fills.
+proc TclAddVerb in rcx rdx
+    mov     rax, [rip + verbCount]
+    cmp     rax, 32                  ; verbTbl holds 32 rows
+    jge     tav_full
+    mov     r10, rax
+    shl     r10, 4                   ; row * 16 bytes
+    lea     r11, [rip + verbTbl]
+    mov     [r11 + r10], rcx         ; name ptr
+    mov     [r11 + r10 + 8], rdx     ; proc addr
+    inc     rax
+    mov     [rip + verbCount], rax
+tav_full:
+    ret
+endproc
+
+; ---- TclInit: seed the standard library verbs up front (via TclAddVerb) ----
+proc TclInit frame
+    mov     qword ptr [rip + verbCount], 0
+    lea     rcx, [rip + vn_Pset]
+    lea     rdx, [rip + Pset]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_Disc]
+    lea     rdx, [rip + Disc]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_Circle]
+    lea     rdx, [rip + Circle]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_Cls]
+    lea     rdx, [rip + Cls]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_Line]
+    lea     rdx, [rip + Line]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_FillRect]
+    lea     rdx, [rip + FillRect]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_Text]
+    lea     rdx, [rip + Text]
+    call    TclAddVerb
+    lea     rcx, [rip + vn_DrawSprite]
+    lea     rdx, [rip + DrawSprite]
+    call    TclAddVerb
 endproc
 
 ; ---- nanoCall: load shadow GP -> call the parked verb -> capture rax ----
