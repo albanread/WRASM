@@ -57,7 +57,14 @@ rg_vx:
     mov     edx, 14
 rg_sg:
     mov     [rip + gSaucerGap], edx
-    xor     edx, edx                         ; gStageOff = (stage-1) mod 5
+    ; pick the per-stage formation theme: rowTypePtr = &rowTypes[(s mod NUM_THEMES)*5]
+    mov     ecx, eax                         ; (NUM_THEMES is a power of 2 -> mask)
+    and     ecx, NUM_THEMES - 1
+    imul    ecx, ecx, 20                      ; 5 species * 4 bytes per theme
+    lea     rdx, [rip + rowTypes]
+    add     rdx, rcx
+    mov     [rip + rowTypePtr], rdx
+    xor     edx, edx                         ; gStageOff = (stage-1) mod 5 (saucer dome tint)
     mov     ecx, 5
     div     ecx
     mov     [rip + gStageOff], edx
@@ -120,14 +127,8 @@ rg_col:
     imul    ecx, ecx, 5
     add     eax, ecx
     mov     [rdi + EN_ANIM], eax
-    mov     eax, esi                          ; species rotates per stage: rowType[(row+off) mod 5]
-    add     eax, [rip + gStageOff]
-    cmp     eax, 5
-    jl      rg_rt
-    sub     eax, 5
-rg_rt:
-    lea     rdx, [rip + rowType]
-    mov     eax, [rdx + rax*4]
+    mov     rdx, [rip + rowTypePtr]           ; this stage's theme: species for grid row `rsi`
+    mov     eax, [rdx + rsi*4]
     mov     [rdi + EN_TYPE], eax
     add     rdi, ENEMY_STRIDE
     inc     ebx

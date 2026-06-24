@@ -46,7 +46,7 @@ BULLET_DY      equ 7                         ; pixels/frame up
 BULLET_LEAN    equ 3                         ; bullet dx when the ship is banking L/R
 FIRE_COOLDOWN  equ 8                         ; frames between shots
 PLAYER_W       equ 24                        ; the 24x24 hero ship
-SHIP_SLOT      equ 6                          ; the ship's own 16-colour palette
+SHIP_SLOT      equ 16                         ; the ship's own palette (high slot: aliens own 1..8)
 RESPAWN_FRAMES equ 90                        ; death pause before the ship comes back
 
 ; ---- enemy bombs (divers drop them straight down) ----
@@ -62,7 +62,7 @@ SAUCER_H        equ 16
 SAUCER_VX       equ 2                         ; drift speed
 SAUCER_PERIOD   equ 420                       ; frames between appearances
 SAUCER_BOMB_GAP equ 28                        ; frames between its bomb drops
-SAUCER_SLOT     equ 7                         ; the saucer's own palette
+SAUCER_SLOT     equ 17                        ; the saucer's own palette (high slot)
 SAUCER_SCORE    equ 200
 
 ; ---- game lifecycle states + the triumphal spiral dance ----
@@ -89,12 +89,20 @@ BEE_SLOT       equ 1                         ; the Bee's own 16-colour shaded pa
 BUT_SLOT       equ 2                         ; Butterfly palette (slot 2)
 BOSS_SLOT      equ 3                         ; Boss palette (slot 3)
 WASP_SLOT      equ 4                         ; Wasp palette (slot 4)
-DRONE_SLOT     equ 5                         ; Drone palette (slot 5)
+DRONE_SLOT     equ 5                         ; Drone/Grunt palette (slot 5)
+JELLY_SLOT     equ 6                         ; Jellyfish (slot 6 = TYPE_JELLY+1) — later waves
+BEETLE_SLOT    equ 7                         ; Beetle (slot 7)
+STING_SLOT     equ 8                         ; Stingray (slot 8)
 TYPE_BEE       equ 0
 TYPE_BUTTERFLY equ 1
 TYPE_BOSS      equ 2
 TYPE_WASP      equ 3
 TYPE_DRONE     equ 4
+TYPE_JELLY     equ 5                         ; the three new later-wave species:
+TYPE_BEETLE    equ 6                         ;   slot = TYPE+1 (the DrawScene convention)
+TYPE_STING     equ 7
+NUM_TYPES      equ 8
+NUM_THEMES     equ 4                          ; per-stage formation themes (rowTypes table)
 
 .balign 16
 .DATA
@@ -171,14 +179,20 @@ fBullet    DWORD ?
 fBomb      DWORD ?
 
 ; formation row -> alien type (one species per row)
+; per-stage formation themes — each row of 5 = the species for grid rows 0..4 (top..bottom).
+; ResetGame picks theme (stage-1) mod NUM_THEMES, so later waves bring in the new species.
 .balign 16
-rowType    DWORD TYPE_BOSS, TYPE_BUTTERFLY, TYPE_WASP, TYPE_DRONE, TYPE_BEE
+rowTypes   DWORD TYPE_BOSS,  TYPE_BUTTERFLY, TYPE_WASP,   TYPE_DRONE,  TYPE_BEE     ; 1: classic
+           DWORD TYPE_BOSS,  TYPE_STING,     TYPE_WASP,   TYPE_BEETLE, TYPE_BEE     ; 2: + ray/beetle
+           DWORD TYPE_STING, TYPE_JELLY,     TYPE_BEETLE, TYPE_DRONE,  TYPE_BUTTERFLY ; 3: new-heavy
+           DWORD TYPE_JELLY, TYPE_BOSS,      TYPE_STING,  TYPE_BEETLE, TYPE_WASP    ; 4: full mix
+rowTypePtr QWORD 0                            ; -> the selected theme's 5 entries (set by ResetGame)
 
-; per-type frame tables, indexed by EN_TYPE (0..4): upright + left/right bank (for divers)
+; per-type frame tables, indexed by EN_TYPE (0..7): upright + left/right bank (for divers)
 .balign 16
-fUp        DWORD 5 dup(0)
-fBankL     DWORD 5 dup(0)
-fBankR     DWORD 5 dup(0)
+fUp        DWORD 8 dup(0)
+fBankL     DWORD 8 dup(0)
+fBankR     DWORD 8 dup(0)
 
 ; ship palette (slot 6 indices 1..15) — steel-blue hull, cyan cockpit, orange engine glow
 .balign 16
@@ -199,6 +213,17 @@ saucerDome DWORD 0x002080B0, 0x0040C8FF, 0x00C0F0FF    ; cyan   (stage 1)
            DWORD 0x0020A030, 0x0050E060, 0x00C0FFC0    ; green  (stage 3)
            DWORD 0x007030B0, 0x00B060F0, 0x00E0C0FF    ; violet (stage 4)
            DWORD 0x00B08010, 0x00FFC828, 0x00FFF0A0    ; gold   (stage 5)
+
+; new-species palettes — indices 1..10, "shades of a hue" (dark outline -> bright highlight)
+.balign 16
+jellyPal   DWORD 0x00301840, 0x00482860, 0x00603880, 0x007850A0, 0x009068C0   ; jellyfish: purple
+           DWORD 0x00A884D8, 0x00C0A0E8, 0x00D8C0F0, 0x0070E0FF, 0x00FFFFFF    ;   body -> cyan glow
+.balign 16
+beetlePal  DWORD 0x00103018, 0x00184828, 0x00206038, 0x00308048, 0x0040A058   ; beetle: emerald
+           DWORD 0x0058C068, 0x0078D880, 0x00A0E8A0, 0x00D0F0C0, 0x00FFFFFF    ;   carapace
+.balign 16
+stingPal   DWORD 0x00102838, 0x00184050, 0x00205868, 0x00287888, 0x003898A8   ; stingray: steel-teal
+           DWORD 0x0048B8C8, 0x0068D0E0, 0x0098E8F0, 0x00C8F4FF, 0x00FFFFFF
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
 ;      Each BYTE "row" packs contiguously, so the label spans the whole w*h grid. ----

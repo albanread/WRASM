@@ -157,6 +157,34 @@ proc BuildSprAssets uses rbx frame
     lea     rcx, [rip + fGruntBankRArt]
     call    DecAdd16
     mov     [rip + fBankR + 16], eax
+    ; --- the three new later-wave species (TYPE_JELLY=5 / BEETLE=6 / STING=7) ---
+    lea     rcx, [rip + jellyfishArt]
+    call    DecAdd16
+    mov     [rip + fUp + 20], eax
+    lea     rcx, [rip + beetleArt]
+    call    DecAdd16
+    mov     [rip + fUp + 24], eax
+    lea     rcx, [rip + stingrayArt]
+    call    DecAdd16
+    mov     [rip + fUp + 28], eax
+    lea     rcx, [rip + fJellyBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 20], eax
+    lea     rcx, [rip + fJellyBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 20], eax
+    lea     rcx, [rip + fBeetleBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 24], eax
+    lea     rcx, [rip + fBeetleBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 24], eax
+    lea     rcx, [rip + fStingBankLArt]
+    call    DecAdd16
+    mov     [rip + fBankL + 28], eax
+    lea     rcx, [rip + fStingBankRArt]
+    call    DecAdd16
+    mov     [rip + fBankR + 28], eax
 
     lea     rcx, [rip + saucerArt]           ; bonus saucer 32x16 (slot 7)
     mov     edx, 32
@@ -250,6 +278,37 @@ proc SetupSprPalettes
     call    SetupDronePalette
     call    SetupShipPalette
     call    SetupSaucerPalette
+    mov     ecx, JELLY_SLOT                   ; the three new species (10-shade hue ramps)
+    lea     rdx, [rip + jellyPal]
+    mov     r8d, 10
+    call    SetSlotPal
+    mov     ecx, BEETLE_SLOT
+    lea     rdx, [rip + beetlePal]
+    mov     r8d, 10
+    call    SetSlotPal
+    mov     ecx, STING_SLOT
+    lea     rdx, [rip + stingPal]
+    mov     r8d, 10
+    call    SetSlotPal
+endproc
+
+; ---- SetSlotPal(rcx=slot, rdx=palPtr, r8d=count): set palette indices 1..count of `slot`
+;      from palPtr[0..count-1] (each 0x00RRGGBB). ----
+proc SetSlotPal uses rbx rsi r12 r13 frame in rcx rdx r8
+    mov     r12d, ecx                         ; slot
+    mov     r13, rdx                          ; palette table
+    mov     ebx, r8d                          ; count
+    mov     esi, 1                            ; palette index 1..count
+ssl_loop:
+    mov     ecx, r12d
+    mov     edx, esi
+    mov     eax, esi
+    dec     eax
+    mov     r8d, [r13 + rax*4]                ; rgb = palPtr[index-1]
+    call    SprSetPalette
+    inc     esi
+    cmp     esi, ebx
+    jle     ssl_loop
 endproc
 
 ; ---- SetupSaucerPalette: slot 7 (silver hull / cyan dome / rim lights) ----
