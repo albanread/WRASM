@@ -1224,6 +1224,9 @@ pub struct Expansion {
     pub files: Vec<std::path::PathBuf>,
     /// For each 0-based line of `text`, the id of the file that line came from.
     pub line_file: Vec<u32>,
+    /// For each 0-based line of `text`, its 1-based line number within its own
+    /// file — so a diagnostic on the expanded text maps back to the editor.
+    pub line_no: Vec<u32>,
     /// One per `.include`: `(parent file id, child file id, 1-based line in parent)`.
     pub edges: Vec<(u32, u32, u32)>,
 }
@@ -1250,6 +1253,7 @@ pub fn expand_includes_graph(src: &str, from: &std::path::Path) -> Result<Expans
         text: String::new(),
         files: Vec::new(),
         line_file: Vec::new(),
+        line_no: Vec::new(),
         edges: Vec::new(),
     };
     let root = e.intern(from);
@@ -1286,6 +1290,7 @@ fn expand_includes_rec(
             e.text.push_str(line);
             e.text.push('\n');
             e.line_file.push(file);
+            e.line_no.push((idx + 1) as u32);
         }
     }
     Ok(())

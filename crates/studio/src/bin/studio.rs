@@ -467,6 +467,10 @@ main:
         /// The lowered listing per source line — a [`ListingRow`] for each
         /// expanded instruction (re-fetched on every edit).
         line_listing: Vec<Vec<ListingRow>>,
+        /// Maps each expanded-source line (what the live check runs on) back to a
+        /// 1-based buffer line, or 0 for a line from an `.include`d file. `None`
+        /// when the buffer is checked raw (unsaved / no includes).
+        check_map: Option<Vec<u32>>,
         /// A short status line for the output pane (build result, snapshot path…).
         notice: String,
         /// Vertical scroll of the editor pane, in DIPs (0 = top).
@@ -646,6 +650,7 @@ main:
                 doc: Doc::from_str(STARTER.trim_end()),
                 diags: Vec::new(),
                 line_listing: Vec::new(),
+                check_map: None,
                 notice,
                 search: String::new(),
                 search_active: false,
@@ -796,13 +801,17 @@ main:
         /// asynchronously, then update the caret-driven card. Replies arrive on
         /// the poll timer; superseded ones are dropped by id.
         fn after_edit(&mut self) {
+            // Check + listing run on the include-expanded, module-scoped program
+            // (what F5 builds), so symbols from `.include`d files are visible; diags
+            // + listing are mapped back to buffer lines via `check_map`.
+            let (src, map) = self.check_source();
+            self.check_map = map;
             if let Some(lang) = self.lang.as_ref() {
-                let text = self.doc.text();
-                self.pending_check = lang.post_check(&text);
-                self.pending_listing = lang.post_listing(&text);
+                self.pending_check = lang.post_check(&src);
+                self.pending_listing = lang.post_listing(&src);
                 // The equate table needs a `Kb` to fold values, so it's computed
                 // on the worker; cache the reply for hover + go-to-definition.
-                self.pending_equates = lang.post_equates(&text);
+                self.pending_equates = lang.post_equates(&self.doc.text());
             }
             self.com_binds = was::com_bindings(&self.doc.text());
             self.after_caret();
@@ -920,17 +929,28 @@ main:
         /// Synchronous one-time population for the first paint (before the poll
         /// timer runs); all runtime updates go through the async path above.
         fn seed(&mut self) {
+            let (src, map) = self.check_source();
+            self.check_map = map;
+            let (mut diags, mut rows, mut eqs) = (None, None, None);
             if let Some(lang) = self.lang.as_ref() {
-                let text = self.doc.text();
-                if let Some(Response::Check { diags, .. }) = lang.check_src(&text) {
-                    self.diags = diags;
+                if let Some(Response::Check { diags: d, .. }) = lang.check_src(&src) {
+                    diags = Some(d);
                 }
-                if let Some(Response::Listing { rows, .. }) = lang.listing(&text) {
-                    self.line_listing = rows;
+                if let Some(Response::Listing { rows: r, .. }) = lang.listing(&src) {
+                    rows = Some(r);
                 }
-                if let Some(Response::Equates { equates, .. }) = lang.equates(&text) {
-                    self.equates = equates;
+                if let Some(Response::Equates { equates, .. }) = lang.equates(&self.doc.text()) {
+                    eqs = Some(equates);
                 }
+            }
+            if let Some(d) = diags {
+                self.diags = self.map_diags(d);
+            }
+            if let Some(r) = rows {
+                self.line_listing = self.map_listing(r);
+            }
+            if let Some(e) = eqs {
+                self.equates = e;
             }
             self.com_binds = was::com_bindings(&self.doc.text());
             if !self.search_active {
@@ -960,11 +980,11 @@ main:
             while let Some(resp) = self.lang.as_ref().and_then(Lang::poll) {
                 match resp {
                     Response::Check { id, diags } if id == self.pending_check => {
-                        self.diags = diags;
+                        self.diags = self.map_diags(diags);
                         self.invalidate();
                     }
                     Response::Listing { id, rows } if id == self.pending_listing => {
-                        self.line_listing = rows;
+                        self.line_listing = self.map_listing(rows);
                         self.invalidate();
                     }
                     Response::Card { id, markdown } if id == self.pending_card => {
@@ -1090,6 +1110,67 @@ main:
                     .map_err(|e| e.to_string()),
                 None => Ok(text),
             }
+        }
+
+        /// The source the live check + listing run on, plus a line map back to the
+        /// editor. For a saved buffer it's the include-expanded, module-scoped
+        /// program — exactly what F5 / the `was` CLI assemble, so a symbol from an
+        /// `.include` (a `comobj`, equate, label) is visible and no longer flagged.
+        /// `map[expanded_line]` is the 1-based line in THIS buffer, or 0 for a line
+        /// pulled in from an included file. Unsaved buffer / include error → the raw
+        /// text with no map (checked as-is, as before).
+        fn check_source(&self) -> (String, Option<Vec<u32>>) {
+            let text = self.doc.text();
+            let Some(p) = self.path.as_ref() else { return (text, None) };
+            match was::expand_includes_graph(&text, p) {
+                Ok(exp) => {
+                    let map: Vec<u32> = exp
+                        .line_file
+                        .iter()
+                        .zip(&exp.line_no)
+                        .map(|(&f, &n)| if f == 0 { n } else { 0 })
+                        .collect();
+                    (was::scope_modules_by_file(&exp), Some(map))
+                }
+                Err(_) => (text, None),
+            }
+        }
+
+        /// Map check diagnostics from the expanded source back to this buffer,
+        /// dropping any that belong to an included file (not editable here).
+        fn map_diags(&self, diags: Vec<Diag>) -> Vec<Diag> {
+            let Some(map) = self.check_map.as_ref() else { return diags };
+            diags
+                .into_iter()
+                .filter_map(|mut d| {
+                    if d.line == 0 {
+                        return Some(d); // a whole-file message
+                    }
+                    match map.get(d.line - 1).copied() {
+                        Some(bl) if bl >= 1 => {
+                            d.line = bl as usize;
+                            Some(d)
+                        }
+                        _ => None, // from an included file — not surfaced in this buffer
+                    }
+                })
+                .collect()
+        }
+
+        /// Remap the per-line listing from the expanded source back to this buffer
+        /// (rows from included files drop out; an `.include` line gets none).
+        fn map_listing(&self, rows: Vec<Vec<ListingRow>>) -> Vec<Vec<ListingRow>> {
+            let Some(map) = self.check_map.as_ref() else { return rows };
+            let n = self.doc.line_count();
+            let mut out: Vec<Vec<ListingRow>> = vec![Vec::new(); n];
+            for (i, row) in rows.into_iter().enumerate() {
+                if let Some(&bl) = map.get(i) {
+                    if bl >= 1 && (bl as usize) <= n {
+                        out[bl as usize - 1] = row;
+                    }
+                }
+            }
+            out
         }
 
         /// Assemble the whole buffer to a self-contained exe and report.
@@ -3161,6 +3242,22 @@ main:
         r.register("card-has", Arity::exact(1), |_, a| {
             let needle = a[0].as_str().to_string();
             Ok(boolstr(with_app(|app| app.card_md.contains(&needle))))
+        });
+        r.register("diag-count", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| app.diags.len().to_string())))
+        });
+        r.register("line-insns", Arity::exact(1), |_, a| {
+            let n = uint(a, 0)?;
+            Ok(Value::new(with_app(|app| app.listing(n).len().to_string())))
+        });
+        r.register("diags", Arity::exact(0), |_, _| {
+            Ok(Value::new(with_app(|app| {
+                app.diags
+                    .iter()
+                    .map(|d| format!("{}:{} {}", d.line, d.col, d.message))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })))
         });
         // Simulate one watcher tick: sync the index, then drive the same
         // dirty -> poll_lang -> refresh_card path the live watcher uses.
