@@ -1,0 +1,80 @@
+; galaxigans_tcl.was — nano-TCL state exposure + dev/test verbs. Registered in GameInit;
+; ExposeState publishes game state into the introspector ping each frame. (.CODE + .DATA)
+;
+; Slots (read with `lindex [regs] N`): 0 score, 1 bossState, 2 abducting, 3 lives, 4 gameState.
+
+module Galaxigans
+.DATA
+.balign 8
+vnPlayNow  BYTE "playnow", 0
+vnBossArm  BYTE "bossarm", 0
+vnHitBoss  BYTE "hitboss", 0
+.balign 16
+
+.CODE
+
+; ---- ExposeState: publish state into the introspector ping (TclReg slots) ----
+proc ExposeState frame
+    xor     ecx, ecx
+    mov     edx, [rip + score]
+    call    TclReg
+    mov     ecx, 1
+    mov     edx, [rip + bossState]
+    call    TclReg
+    mov     ecx, 2
+    mov     edx, [rip + abducting]
+    call    TclReg
+    mov     ecx, 3
+    mov     edx, [rip + lives]
+    call    TclReg
+    mov     ecx, 4
+    mov     edx, [rip + gameState]
+    call    TclReg
+endproc
+
+; ---- RegisterTclVerbs: add the game's dev/test verbs (called from GameInit) ----
+proc RegisterTclVerbs frame
+    lea     rcx, [rip + vnPlayNow]
+    lea     rdx, [rip + PlayNowVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnBossArm]
+    lea     rdx, [rip + BossArmVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnHitBoss]
+    lea     rdx, [rip + HitBossVerb]
+    call    TclAddVerb
+endproc
+
+; ---- playnow — jump straight into a fresh PLAYING game (skip the title) ----
+proc PlayNowVerb frame
+    call    NewGame
+    mov     dword ptr [rip + gameState], STATE_PLAYING
+endproc
+
+; ---- bossarm — force the boss into BEAM with a pilot mid-abduction (test setup) ----
+proc BossArmVerb frame
+    mov     dword ptr [rip + bossState], BS_BEAM
+    mov     dword ptr [rip + bossX], 304
+    mov     dword ptr [rip + bossY], BOSS_CAP_Y
+    mov     dword ptr [rip + bossBeamT], 0
+    mov     dword ptr [rip + abducting], 1
+    mov     eax, [rip + bossX]
+    add     eax, 10
+    mov     [rip + abducteeX], eax
+    mov     dword ptr [rip + abducteeY], 220   ; a pilot partway up the beam
+endproc
+
+; ---- hitboss — drop a player bullet inside the boss box (so CheckBossHit fires next frame) ----
+proc HitBossVerb frame
+    lea     r8, [rip + bullets]
+    mov     eax, [rip + bossX]
+    add     eax, 16
+    mov     [r8 + 0], eax
+    mov     eax, [rip + bossY]
+    add     eax, 16
+    mov     [r8 + 4], eax
+    mov     dword ptr [r8 + 8], 1
+    mov     dword ptr [r8 + 12], 0
+endproc
+
+endmodule

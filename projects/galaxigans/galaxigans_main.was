@@ -35,12 +35,18 @@ GameInit:
     call    AudioBoot                        ; mixer + SFX bake + title music
     call    NewGame
     mov     dword ptr [rip + gameState], STATE_INTRO   ; boot to the title screen
+    call    TclInit                          ; nano-TCL: executor + control verbs
+    call    TclStdVerbs                      ; documented GPU verbs (canvas/input/introspect)
+    call    RegisterTclVerbs                 ; the game's dev/test verbs
+    call    TclChannelInit                   ; \\.\pipe\nanotcl + reader thread
     add     rsp, 40
     ret
 
 ; ---- GameStep (callback): input + logic + draw the indexed background + queue HUD text ----
 GameStep:
     sub     rsp, 40
+    call    ExposeState                      ; publish state for the introspector ping
+    call    TclPoll                          ; drain a queued nano-TCL command / frame-sync
     mov     eax, [rip + gameState]
     cmp     eax, STATE_INTRO
     je      gs_intro
@@ -60,7 +66,8 @@ GameStep:
     call    MineStep                         ; the saucer's rare spinning mines
     call    CheckMineHit
     call    CheckMineShot
-    call    BossStep                         ; the capture boss (Phase 1: descend + beam)
+    call    BossStep                         ; the capture boss + pilot abduction
+    call    CheckBossHit                     ; shoot the boss to free an abducted pilot
     call    PtUpdate                         ; advance explosion debris
     call    CountAlive                       ; stage cleared when none remain
     test    eax, eax

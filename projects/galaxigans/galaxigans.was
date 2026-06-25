@@ -28,6 +28,15 @@
 .include "../../library/audio/music/abc.was"   ; the ABC parser + midiOut soundtrack player
 .include "galaxigans_music.was"                 ; named ABC tunes (title/victory/gameover/...)
 
+; ---- nano-TCL dev channel (GPU backend): drive/test the live game over \\.\pipe\nanotcl ----
+NANOTCL_LIVE   equ 1
+NANOTCL_GPU    equ 1
+NTV_canvas     equ 1
+NTV_input      equ 1
+NTV_introspect equ 1
+.include "../../library/tcl/tcl.was"            ; the in-app register-machine executor
+.include "../../library/tcl/stdverbs.was"       ; the documented GPU verb table
+
 ; ---- the game (each fragment opens `module Galaxigans`; data first) ----
 .include "galaxigans_data.inc"        ; .DATA: pools, player, formation, sprite frame-ids
 .include "galaxigans_assets.was"      ; BuildSprAssets: synth sprite frames + palettes
@@ -50,6 +59,7 @@
 .include "galaxigans_boss.was"        ; the capture boss FSM + draw (Phase 1: enter/descend/beam)
 .include "galaxigans_audio.was"       ; SFX bake/playback + the ABC soundtrack
 .include "galaxigans_draw.was"        ; background + queue the fleet
+.include "galaxigans_tcl.was"         ; nano-TCL: ExposeState + dev/test verbs
 .include "galaxigans_harness.was"     ; OUR window/loop/present (layer-0 sky -> board -> fleet)
 .include "galaxigans_main.was"        ; main + the GameInit/GameStep/GameSprites callbacks
 ; TODO: the bonus saucer, dive-arc tuning, a 2nd enemy tier.
