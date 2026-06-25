@@ -160,7 +160,8 @@ scoreStr   BYTE  "SCORE 000000", 0
 livesStr   BYTE  "LIVES 3", 0
 gameOverStr BYTE "GAME OVER", 0
 titleStr   BYTE  "G A L A X I G A N S", 0
-startStr   BYTE  "PRESS FIRE TO START", 0
+startStr   BYTE  "PRESS ANY KEY TO START", 0
+attractTick DWORD 0                            ; attract-mode clock (blink + demo loop)
 clearStr   BYTE  "STAGE CLEAR", 0
 stageStr   BYTE  "STAGE 1", 0
 

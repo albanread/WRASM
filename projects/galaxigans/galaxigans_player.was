@@ -113,4 +113,54 @@ bs_next:
     jnz     bs_loop
 endproc
 
+; ---- DemoShipStep: the attract-mode auto-pilot — slide under the lowest enemy and auto-fire.
+;      Reads/writes the same player state as PlayerStep; no damage is applied in attract. ----
+proc DemoShipStep uses rbx rdi frame
+    lea     rdi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+    mov     r8d, -1                           ; lowest (max-y) alive enemy so far
+    mov     r9d, 320                          ; aim x (default centre)
+ds_scan:
+    cmp     dword ptr [rdi + EN_ALIVE], 0
+    je      ds_next
+    mov     eax, [rdi + EN_Y]
+    cmp     eax, r8d
+    jle     ds_next
+    mov     r8d, eax
+    mov     r9d, [rdi + EN_X]
+ds_next:
+    add     rdi, ENEMY_STRIDE
+    dec     ebx
+    jnz     ds_scan
+    sub     r9d, 12                           ; centre the 24-wide ship on the target
+    mov     eax, [rip + playerX]
+    mov     dword ptr [rip + playerLean], 0
+    cmp     eax, r9d
+    jl      ds_moveR
+    jg      ds_moveL
+    jmp     ds_clamp
+ds_moveR:
+    add     eax, 3
+    mov     dword ptr [rip + playerLean], 1
+    jmp     ds_clamp
+ds_moveL:
+    sub     eax, 3
+    mov     dword ptr [rip + playerLean], -1
+ds_clamp:
+    test    eax, eax
+    jns     ds_hi
+    xor     eax, eax
+ds_hi:
+    cmp     eax, FIELD_W - PLAYER_W
+    jle     ds_setx
+    mov     eax, FIELD_W - PLAYER_W
+ds_setx:
+    mov     [rip + playerX], eax
+    dec     dword ptr [rip + fireCool]        ; auto-fire on the cooldown
+    jg      ds_done
+    call    SpawnBullet
+    mov     dword ptr [rip + fireCool], FIRE_COOLDOWN
+ds_done:
+endproc
+
 endmodule

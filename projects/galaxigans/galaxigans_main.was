@@ -34,6 +34,7 @@ GameInit:
     call    BuildSprAssets
     call    AudioBoot                        ; mixer + SFX bake + title music
     call    NewGame
+    call    AttractReset                     ; open the title on a random self-playing level
     mov     dword ptr [rip + gameState], STATE_INTRO   ; boot to the title screen
     call    TclInit                          ; nano-TCL: executor + control verbs
     call    TclStdVerbs                      ; documented GPU verbs (canvas/input/introspect)
@@ -116,27 +117,60 @@ gs_dance_hud:
     ret
 
 ; ---- INTRO: title screen, waiting for fire to launch the stage ----
+; ---- INTRO = the attract demo: a random level plays itself under the title until a key ----
 gs_intro:
-    mov     ecx, ACT_FIRE
+    inc     dword ptr [rip + attractTick]
+    call    DemoShipStep                     ; auto-pilot (no damage applied in attract)
+    call    BulletsStep
+    call    BombsStep
+    call    FormationStep
+    call    Collide                          ; the demo's shots blow aliens up
+    call    SaucerStep
+    call    MineStep
+    call    PtUpdate
+    call    CountAlive                       ; cleared, or 15 s elapsed -> a new random level
+    test    eax, eax
+    jz      gs_intro_loop
+    cmp     dword ptr [rip + attractTick], 900
+    jl      gs_intro_key
+gs_intro_loop:
+    call    AttractReset
+gs_intro_key:
+    mov     ecx, ACT_FIRE                    ; "press any key" — fire / left / right
+    call    ActionHit
+    test    eax, eax
+    jnz     gs_intro_start
+    mov     ecx, ACT_LEFT
+    call    ActionHit
+    test    eax, eax
+    jnz     gs_intro_start
+    mov     ecx, ACT_RIGHT
     call    ActionHit
     test    eax, eax
     jz      gs_intro_hud
+gs_intro_start:
     call    NewGame                          ; fresh game from the title (stage 1, score 0)
     mov     dword ptr [rip + gameState], STATE_PLAYING
     call    MusicGameplay
+    add     rsp, 40
+    ret
 gs_intro_hud:
-    mov     ecx, 0x0050D0FF                  ; "GALAXIGANS" (cyan), below the formation
+    mov     ecx, 0x0050D0FF                  ; "GALAXIGANS" (cyan)
     call    TxtSetColour
     mov     ecx, 263
     mov     edx, 238
     lea     r8, [rip + titleStr]
     call    DrawText
-    mov     ecx, 0x00FFFFFF                  ; "PRESS FIRE TO START" (white)
+    mov     eax, [rip + attractTick]          ; blink "PRESS ANY KEY TO START"
+    and     eax, 32
+    jz      gs_intro_done
+    mov     ecx, 0x00FFFFFF
     call    TxtSetColour
-    mov     ecx, 263
+    mov     ecx, 250
     mov     edx, 268
     lea     r8, [rip + startStr]
     call    DrawText
+gs_intro_done:
     add     rsp, 40
     ret
 
