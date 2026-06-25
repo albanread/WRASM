@@ -387,27 +387,77 @@ fn written_before_read(lines: &[Line], push_idx: usize, r: &str) -> bool {
     false
 }
 
-/// Redundant-framing cleanup: a `pop R` immediately followed (comments aside) by a
-/// `push R` is stack-neutral, so the pair can go — provided R is dead between them
-/// (overwritten before read after the push). This collapses the save/restore two
-/// adjacent inlined bodies do around a shared `uses` register.
-fn cancel_pop_push(lines: Vec<Line>, origin: Vec<usize>) -> (Vec<Line>, Vec<usize>) {
+/// Is `r` a callee-saved GP register — what a `uses` prologue saves with push/pop?
+fn is_callee_saved(r: &str) -> bool {
+    matches!(
+        crate::gp_reg(r),
+        Some("rbx" | "rbp" | "rsi" | "rdi" | "r12" | "r13" | "r14" | "r15")
+    )
+}
+
+/// The general "elide if proven safe" framing reducer: for each inlined region,
+/// elide a prologue `push R` / epilogue `pop R` pair when R is provably dead after
+/// the restore (written-before-read forward scan). The leading pushes and trailing
+/// pops must form a clean LIFO of callee-saved registers (so they're the frame, not
+/// body stack traffic); each matched pair is then independently stack-balanced to
+/// remove. Catches e.g. an inlined call in tail position whose `pop R` is at once
+/// overwritten by the enclosing proc's own epilogue restore of R.
+fn elide_dead_frames(lines: Vec<Line>, origin: Vec<usize>) -> (Vec<Line>, Vec<usize>) {
     let mut drop = vec![false; lines.len()];
     let mut i = 0;
     while i < lines.len() {
-        if let Some(r) = pop_reg(&lines[i]) {
-            let mut j = i + 1;
-            while j < lines.len() && is_transparent(&lines[j]) {
-                j += 1;
-            }
-            if j < lines.len() && push_reg(&lines[j]) == Some(r) && written_before_read(&lines, j, r) {
-                drop[i] = true;
-                drop[j] = true;
-                i = j + 1;
+        if !lines[i].text.contains("\u{2500}\u{2500} inline") {
+            i += 1;
+            continue;
+        }
+        let Some(end) = (i + 1..lines.len()).find(|&k| lines[k].text.contains("\u{2500}\u{2500} end"))
+        else {
+            i += 1;
+            continue;
+        };
+        // leading prologue pushes (callee-saved), comments allowed between
+        let mut pushes: Vec<(usize, &str)> = Vec::new();
+        let mut k = i + 1;
+        while k < end {
+            if is_transparent(&lines[k]) {
+                k += 1;
                 continue;
             }
+            match push_reg(&lines[k]) {
+                Some(r) if is_callee_saved(r) => {
+                    pushes.push((k, r));
+                    k += 1;
+                }
+                _ => break,
+            }
         }
-        i += 1;
+        // trailing epilogue pops (callee-saved), scanning back from the end marker
+        let mut pops: Vec<(usize, &str)> = Vec::new();
+        let mut m = end;
+        while m > i + 1 {
+            m -= 1;
+            if is_transparent(&lines[m]) {
+                continue;
+            }
+            match pop_reg(&lines[m]) {
+                Some(r) if is_callee_saved(r) => pops.push((m, r)),
+                _ => break,
+            }
+        }
+        // clean LIFO frame? pushes [r0,r1,..]; pops collected end→start are also
+        // [r0,r1,..]; pair pushes[j] with pops[j] (same register) and prove dead.
+        let push_regs: Vec<&str> = pushes.iter().map(|(_, r)| *r).collect();
+        let pop_regs: Vec<&str> = pops.iter().map(|(_, r)| *r).collect();
+        if !push_regs.is_empty() && push_regs == pop_regs {
+            for (j, &(pidx, r)) in pushes.iter().enumerate() {
+                let (qidx, _) = pops[j];
+                if written_before_read(&lines, qidx, r) {
+                    drop[pidx] = true;
+                    drop[qidx] = true;
+                }
+            }
+        }
+        i = end + 1;
     }
     let mut out = Vec::with_capacity(lines.len());
     let mut oorigin = Vec::with_capacity(origin.len());
@@ -486,9 +536,17 @@ pub fn optimize(asm: &str, threshold: usize) -> (String, Vec<usize>) {
         origin.push(i);
         i += 1;
     }
-    let (out, origin) = drop_jmp_to_next(out, origin);
-    let (out, origin) = remove_dead_cont_labels(out, origin);
-    let (out, origin) = cancel_pop_push(out, origin);
+    let (mut out, mut origin) = drop_jmp_to_next(out, origin);
+    (out, origin) = remove_dead_cont_labels(out, origin);
+    // Elide every framing pair we can prove dead, to a fixpoint: eliding one
+    // region's frame can make a neighbour's register provably dead too.
+    for _ in 0..4 {
+        let before = out.len();
+        (out, origin) = elide_dead_frames(out, origin);
+        if out.len() == before {
+            break;
+        }
+    }
     (render(&out), origin)
 }
 
@@ -526,39 +584,40 @@ mod tests {
         // internal label uniquified per site; its backward jump renamed to match
         assert!(out.contains("floop__wfi1:") && out.contains("floop__wfi2:"), "per-site labels:\n{out}");
         assert!(out.contains("jnz floop__wfi1") && out.contains("jnz floop__wfi2"), "renamed jumps:\n{out}");
-        // cleanup: dead continuation labels stripped; the save/restore the two
-        // adjacent inlinings do around their shared `uses rbx` cancels to one pair.
+        // cleanup: dead continuation labels stripped. Both framings stay here —
+        // the elision is conservative: rbx is live across each pop (the next body's
+        // push / Bar's ret), so neither pair is *proven* dead.
         assert!(!out.contains("__wfi_cont"), "dead continuation labels removed:\n{out}");
-        assert_eq!(out.matches("push rbx").count(), 1, "framing reduced to one push:\n{out}");
-        assert_eq!(out.matches("pop rbx").count(), 1, "framing reduced to one pop:\n{out}");
+        assert_eq!(out.matches("push rbx").count(), 2, "both framings kept (rbx live):\n{out}");
+        assert_eq!(out.matches("pop rbx").count(), 2, "both framings kept (rbx live):\n{out}");
         assert!(out.contains("inline Foo") && out.contains("end Foo"), "visible inline markers:\n{out}");
     }
 
     #[test]
-    fn cleanup_cancels_redundant_framing() {
-        // a `pop R` then `push R` (comments between) cancels iff R is dead — i.e.
-        // the next body writes R before reading it.
-        let dead = "  pop rbx\n  ; gap\n  push rbx\n  mov rbx, 7\n  ret\n";
-        let (out, _) = optimize(dead, 8); // no procs → passes run on the buffer directly...
-        // (no @wfi markers → optimize is identity; exercise the pass directly instead)
-        assert_eq!(out, dead, "no markers → identity");
-        let lines = parse(dead);
-        let (c, _) = cancel_pop_push(lines, (0..5).collect());
-        let txt = render(&c);
-        assert!(!txt.contains("pop rbx") && !txt.contains("push rbx"), "cancelled (rbx dead):\n{txt}");
-
-        // must NOT cancel when R is read before written (the value is live)
-        let live = parse("  pop rbx\n  push rbx\n  mov rax, rbx\n  ret\n");
-        let (c2, _) = cancel_pop_push(live, (0..4).collect());
-        let txt2 = render(&c2);
-        assert!(txt2.contains("pop rbx") && txt2.contains("push rbx"), "kept (rbx live):\n{txt2}");
-
-        // dead __wfi_cont labels go; a jumped-to one stays
+    fn dead_continuation_labels_removed() {
+        // a `__wfi_cont` label nothing jumps to is dropped; a jumped-to one stays
         let labs = parse("  jmp __wfi_cont_5\n__wfi_cont_5:\n__wfi_cont_9:\n");
-        let (c3, _) = remove_dead_cont_labels(labs, (0..3).collect());
-        let txt3 = render(&c3);
-        assert!(txt3.contains("__wfi_cont_5:"), "live cont kept:\n{txt3}");
-        assert!(!txt3.contains("__wfi_cont_9:"), "dead cont removed:\n{txt3}");
+        let (c, _) = remove_dead_cont_labels(labs, (0..3).collect());
+        let txt = render(&c);
+        assert!(txt.contains("__wfi_cont_5:"), "live cont kept:\n{txt}");
+        assert!(!txt.contains("__wfi_cont_9:"), "dead cont removed:\n{txt}");
+    }
+
+    #[test]
+    fn elide_dead_frames_when_provably_dead() {
+        // an inlined region whose `pop rbx` is at once overwritten by the enclosing
+        // proc's own epilogue `pop rbx` → the framing pair is dead → elided.
+        let dead = parse("  ; \u{2500}\u{2500} inline Foo\n  push rbx\n  mov rbx, 7\n  pop rbx\n  ; \u{2500}\u{2500} end Foo\n  pop rbx\n  ret\n");
+        let (out, _) = elide_dead_frames(dead, (0..7).collect());
+        let txt = render(&out);
+        assert_eq!(txt.matches("push rbx").count(), 0, "dead frame push elided:\n{txt}");
+        assert_eq!(txt.matches("pop rbx").count(), 1, "only the enclosing epilogue pop remains:\n{txt}");
+
+        // but kept when the restored value is read afterwards (live)
+        let live = parse("  ; \u{2500}\u{2500} inline Foo\n  push rbx\n  mov rbx, 7\n  pop rbx\n  ; \u{2500}\u{2500} end Foo\n  mov rax, rbx\n  ret\n");
+        let (out2, _) = elide_dead_frames(live, (0..7).collect());
+        let txt2 = render(&out2);
+        assert_eq!(txt2.matches("push rbx").count(), 1, "live frame kept:\n{txt2}");
     }
 
     #[test]
