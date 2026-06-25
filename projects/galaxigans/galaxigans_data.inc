@@ -264,7 +264,10 @@ levelTable DWORD 0, 0, 0   ; L1  nebula       / classic
            DWORD 6, 2, 0   ; L7  wormhole     / new-heavy
            DWORD 7, 3, 0   ; L8  gas giant    / full mix
            DWORD 8, 0, 1   ; L9  aurora       / classic       · BOSS
-NUM_LEVELS equ 9
+           DWORD 9, 1, 0   ; L10 pulsar       / +ray,beetle
+           DWORD 10, 2, 0  ; L11 plasma       / new-heavy
+           DWORD 11, 3, 1  ; L12 binary stars / full mix      · BOSS
+NUM_LEVELS equ 12
 
 ; per-type frame tables, indexed by EN_TYPE (0..7): upright + left/right bank (for divers)
 ; fUp2 = the optional 2nd "flap" frame (0 = none); alternated in formation by EN_ANIM.
