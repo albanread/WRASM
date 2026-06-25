@@ -2131,6 +2131,47 @@ main:
             self.invalidate();
         }
 
+        /// `F3` / `Shift+F3` with the find bar closed: jump to the next (or
+        /// previous, when `back`) match of the active needle without opening the
+        /// bar. Seeds the needle from the selection or word at the caret the first
+        /// time, and re-scans the current document on every press.
+        fn find_next(&mut self, back: bool) {
+            if self.fbar_needle.is_empty() {
+                match self.doc.selected_text() {
+                    Some(sel) if !sel.is_empty() && !sel.contains('\n') => self.fbar_needle = sel,
+                    _ => {
+                        if let Some(w) = self.doc.occurrence_needle() {
+                            self.fbar_needle = w;
+                        }
+                    }
+                }
+            }
+            if self.fbar_needle.is_empty() {
+                return;
+            }
+            // Re-scan and point fbar_idx at the match on/after the caret.
+            self.fbar_recompute(true);
+            if self.fbar_matches.is_empty() {
+                self.notice = format!("no match: {}", self.fbar_needle);
+                self.invalidate();
+                return;
+            }
+            // recompute(seek) lands on the nearest match at/after the caret. Going
+            // forward, advance only if we're already sitting on it; going back,
+            // step to the match before the caret.
+            let cur = self.fbar_matches[self.fbar_idx];
+            let on_it = self.doc.selection().is_some_and(|(a, b)| {
+                a.row == cur.0 && a.col == cur.1 && b.row == cur.0 && b.col == cur.2
+            });
+            if back {
+                self.fbar_step(true);
+            } else if on_it {
+                self.fbar_step(false);
+            } else {
+                self.fbar_select_current();
+            }
+        }
+
         /// A printable / editing character from WM_CHAR — routed to the search box
         /// when it has focus, otherwise to the editor.
         fn on_char(&mut self, ch: u32) {
@@ -2342,6 +2383,22 @@ main:
                         self.invalidate();
                         return true;
                     }
+                    // Document top / bottom (Shift extends the selection).
+                    VK_HOME | VK_END => {
+                        if shift {
+                            self.doc.start_selection();
+                        } else {
+                            self.doc.clear_selection();
+                        }
+                        if vk == VK_HOME {
+                            self.doc.doc_home();
+                        } else {
+                            self.doc.doc_end();
+                        }
+                        self.after_caret();
+                        self.invalidate();
+                        return true;
+                    }
                     VK_BACK => return self.edit(|d| d.delete_word_left()),
                     VK_DELETE => return self.edit(|d| d.delete_word_right()),
                     VK_D => return self.edit(|d| d.duplicate_line()),
@@ -2393,6 +2450,10 @@ main:
                     return true;
                 }
                 VK_DELETE => return self.edit(|d| d.delete_forward()),
+                VK_F3 => {
+                    self.find_next(shift); // Shift+F3 = previous
+                    return true;
+                }
                 VK_F5 => {
                     self.build_exe();
                     return true;

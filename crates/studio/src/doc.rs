@@ -416,6 +416,21 @@ impl Doc {
         self.caret.col = self.lines[self.caret.row].len();
     }
 
+    /// Caret to the very start of the document (`Ctrl+Home`).
+    pub fn doc_home(&mut self) {
+        self.coalescing = false;
+        self.goal_col = None;
+        self.caret = Caret { row: 0, col: 0 };
+    }
+
+    /// Caret to the very end of the document (`Ctrl+End`).
+    pub fn doc_end(&mut self) {
+        self.coalescing = false;
+        self.goal_col = None;
+        let row = self.lines.len() - 1;
+        self.caret = Caret { row, col: self.lines[row].len() };
+    }
+
     // ── word-wise movement & deletion ────────────────────────────────────────
 
     /// Move left to the previous word boundary (`Ctrl+Left`).
@@ -1147,6 +1162,16 @@ mod tests {
         assert_eq!(d.caret.col, 0); // toggle to start
         d.smart_home();
         assert_eq!(d.caret.col, 4);
+    }
+
+    #[test]
+    fn doc_home_and_end_jump_to_the_extremes() {
+        let mut d = Doc::from_str("first\n  middle\nlast line");
+        d.set_caret(1, 3);
+        d.doc_home();
+        assert_eq!((d.caret.row, d.caret.col), (0, 0));
+        d.doc_end();
+        assert_eq!((d.caret.row, d.caret.col), (2, 9)); // end of "last line"
     }
 
     #[test]
