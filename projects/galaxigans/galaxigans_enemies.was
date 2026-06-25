@@ -442,6 +442,9 @@ tb_e:
     add     ecx, 3
     mov     edx, [rdi + EN_Y]
     add     edx, 8
+    mov     eax, [rdi + EN_TYPE]             ; this species' signature bomb
+    lea     r9, [rip + bombByType]
+    mov     r8d, [r9 + rax*4]
     call    DropBomb
     jmp     tb_done                          ; one drop per tick
 tb_next:
@@ -451,8 +454,8 @@ tb_next:
 tb_done:
 endproc
 
-; ---- DropBomb(ecx=x, edx=y): spawn a bomb in the first free slot ----
-proc DropBomb uses rbx rdi r12 frame in rcx rdx
+; ---- DropBomb(ecx=x, edx=y, r8d=bombType): spawn a typed bomb in the first free slot ----
+proc DropBomb uses rbx rdi frame in rcx rdx r8
     lea     rdi, [rip + bombs]
     mov     ebx, BOMB_MAX
 db_find:
@@ -466,10 +469,7 @@ db_spawn:
     mov     [rdi + 0], ecx
     mov     [rdi + 4], edx
     mov     dword ptr [rdi + 8], 1
-    mov     r12, rdi                          ; pick one of the 8 bomb sprites at random
-    call    Rng
-    and     eax, 7
-    mov     [r12 + BOM_TYPE], eax
+    mov     [rdi + BOM_TYPE], r8d             ; the dropper's signature bomb sprite
 db_done:
 endproc
 

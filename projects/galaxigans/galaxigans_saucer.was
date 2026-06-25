@@ -60,6 +60,7 @@ ss_bombs:
     call    DropMine
     jmp     ss_exitchk
 ss_dropbomb:
+    mov     r8d, 1                            ; the bonus saucer lobs fireballs
     call    DropBomb
 ss_exitchk:
     mov     eax, [rip + saucerX]              ; off the far side -> despawn

@@ -324,6 +324,10 @@ bossCapPal DWORD 0x00200828, 0x00481858, 0x00683078, 0x00884898, 0x00B06CC0
 ; pilot palette (slot 11): outline, suit shadow/white/highlight, (5 unused), visor, chest light
 pilotPal   DWORD 0x00202830, 0x00A0A8B8, 0x00E8ECF4, 0x00FFFFFF, 0x00000000
 bombPal    DWORD 0x00802818, 0x00C03820, 0x00FF6020, 0x00FF9828, 0x00FFD850, 0x00FFF0A0, 0x00FFFFE0  ; hot ramp 1..7
+; each species throws its signature bomb (indexed by EN_TYPE) — sprites: 0 orb 1 fireball
+; 2 shuriken 3 dart 4 lightning 5 spike 6 acid 7 crystal
+bombByType DWORD 0, 1, 2, 3, 5, 6, 7, 4         ; Bee=orb Bfly=fireball Boss=shuriken Wasp=dart
+                                                ;   Drone=spike Jelly=acid Beetle=crystal Sting=lightning
            DWORD 0x0040C0FF, 0x00FF8020
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).
