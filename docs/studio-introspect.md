@@ -107,7 +107,48 @@ Some panel features need small in-game support beyond what `library/tcl` has tod
 
 ---
 
-## 9. Implementation phasing (studio side)
+## 9. What the first live session taught us
+
+These priorities are not hypothetical — they come from an actual session: debugging the
+capture-boss rescue, which turned out to be **dead code** (`CheckBossHit` had been dropped from
+GameStep by a stray `git checkout`). Done over the raw `nanotcl` CLI, the friction was concrete,
+and each point maps to a panel feature:
+
+- **The bug was a missing call, and the watch table only showed the symptom.** The bullet sat
+  inside the boss box yet `abducting` never changed — I had to *infer* "the proc isn't running",
+  then confirm by reading the source. → **Proc breakpoints with a hit count, set in the editor
+  gutter.** Click the proc/line, run, and a `0 hits` counter says "never entered" outright. This
+  is the single highest-value feature the session revealed — `CheckBossHit · 0 hits` would have
+  named the bug in one run instead of three rounds of inference.
+
+- **Every new thing to watch meant a rebuild.** Seeing the bullet's x/y took new `TclReg` slots +
+  a ~10 s rebuild + re-run — twice. → **Ad-hoc watches by name** (`bullets[0].y`) read live via a
+  Tier-1 `Peek`, no rebuild. The rebuild loop was the biggest time sink of the session.
+
+- **I was scripting exploration.** Write `.tcl` → run all → read → edit → re-run, several cycles,
+  for a handful of values at a handful of frames. → **The watch table + command bar ARE the REPL**:
+  poke `bossarm`, watch the table move, poke `hitboss`, watch it move. The `.tcl` is the *export*
+  of a good session (a regression test), not the medium of exploration.
+
+- **Frame-sync timing was guesswork.** "Does my poke land before or after this frame's logic? How
+  many `regs` to settle?" — found by trial. → **Explicit single-step + an ordered, frame-stamped
+  log** make "ran @ N, visible @ N+1" legible. (Implementation note: publish the state ping at
+  END of frame so "step, then read" shows the frame you just ran.)
+
+- **Connecting was a five-step dance** — build, background-launch, sleep-hack, `nanotcl`,
+  `taskkill`. → **One-click Build & launch** is the primary connect affordance, with a Stop.
+
+- **The payoff justifies the test machinery.** The harness caught a regression the BMP filmstrip
+  *structurally cannot* — dead code renders identically on screen. → the case for **save-as-test +
+  an in-panel green/red runner**, so the assertion outlives the session.
+
+**The synthesis** ties back to §1: the session *validates the layout choice*. The most valuable
+control — a breakpoint with a hit count — belongs in the **editor gutter**, which is only on
+screen because the panel replaced the help view rather than the code. Debugging wants the code and
+the dashboard together; the watch table tells you *what* is wrong, the gutter breakpoint tells you
+*where* it isn't running.
+
+## 10. Implementation phasing (studio side)
 
 1. **Connect + watch** — `connect`/`spawn`, the frame-sync poll, the named watch table (manifest).
 2. **Control** — transport + run-to-frame/step + local conditional breakpoints + the source-line
