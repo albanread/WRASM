@@ -14,6 +14,8 @@ use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use winkb::Kb;
 
+mod inline; // small-proc inliner (deferred-assembly reducer over the lowered text)
+
 /// First four integer/pointer argument registers (Win64).
 const ARG_REGS: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
 
@@ -181,7 +183,7 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
         }
         let col = raw.len() - raw.trim_start().len() + 1;
         if let Some((rest, fp)) = strip_proc_kw(t) {
-            let h = parse_proc(rest, fp);
+            let h = parse_proc(rest);
             cur = Some(Acc {
                 name: h.name,
                 line,
@@ -1592,6 +1594,11 @@ pub fn remap_assemble_error(e: anyhow::Error, map: &[usize]) -> anyhow::Error {
     }
 }
 
+/// Procs of at most this many lowered instructions are inlining candidates at
+/// their call sites (phase 1 also requires: leaf, unframed, single-region,
+/// address never taken). Tunable; the inliner is conservative regardless.
+const INLINE_THRESHOLD: usize = 8;
+
 /// Lower `src`, also returning a map from each *lowered* line (0-based) back to
 /// the 1-based source line it came from. One source line can expand to many
 /// lowered lines (an `invoke`, a `.while`, or a user macro), so this is what lets
@@ -1608,6 +1615,12 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     // per emitted line) so a downstream error still points at the real source.
     let (preprocessed, pmap) = preprocess_equates(&expanded, kb)?;
     let (lowered, lmap) = lower_expanded(&preprocessed, kb)?;
+    // Deferred-assembly reducer: inline small leaf procs over the lowered text.
+    // `origin[i]` is the lowered line output line `i` derives from, so the error
+    // line-map stays intact across the rewrite. (Phase 1: an identity round-trip —
+    // it changes nothing until a pass is added.)
+    let (lowered, origin) = inline::optimize(&lowered, INLINE_THRESHOLD);
+    let lmap: Vec<usize> = origin.iter().map(|&o| lmap.get(o).copied().unwrap_or(0)).collect();
     // Compose all three maps: lowered → preprocessed → expanded → source.
     let map = lmap
         .into_iter()
@@ -2380,8 +2393,8 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
         let mut max_args = 0;
         for (i, raw) in src.lines().enumerate() {
             let t = strip_comment(raw).trim();
-            if let Some((rest, fp)) = strip_proc_kw(t) {
-                let h = parse_proc(rest, fp);
+            if let Some((rest, _)) = strip_proc_kw(t) {
+                let h = parse_proc(rest);
                 start = Some(i + 1);
                 framed = h.frame;
                 max_args = 0;
@@ -2601,7 +2614,7 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             if block_stack.iter().any(|b| matches!(b, Block::Proc { .. })) {
                 bail!("line {src_line}: `proc` inside a `proc` — close the first with `endproc`");
             }
-            let h = parse_proc(rest, fp);
+            let h = parse_proc(rest);
             if h.name.is_empty() {
                 bail!("line {src_line}: `proc` needs a name");
             }
@@ -2711,9 +2724,6 @@ struct ProcHdr {
     /// `frame` was given: reserve the shadow space + outgoing-arg area once so the
     /// calls inside skip their per-call alignment.
     frame: bool,
-    /// `fproc` (not `proc`): the float variant, whose `uses` may also list
-    /// xmm6..xmm15 — the prologue saves/restores those vector registers for you.
-    fp: bool,
 }
 
 /// Detect a `proc`/`fproc` opener, returning its header text and whether it's the
@@ -2727,14 +2737,13 @@ fn strip_proc_kw(t: &str) -> Option<(&str, bool)> {
 
 /// `proc NAME [uses R…] [in R…] [out R…] [frame]` — the keywords delimit
 /// space/comma-separated register lists; `frame` is a bare flag.
-fn parse_proc(rest: &str, fp: bool) -> ProcHdr {
+fn parse_proc(rest: &str) -> ProcHdr {
     let mut h = ProcHdr {
         name: String::new(),
         uses: Vec::new(),
         ins: Vec::new(),
         outs: Vec::new(),
         frame: false,
-        fp,
     };
     let mut bucket = 0u8; // 0 = name, 1 = uses, 2 = in, 3 = out
     for tok in rest.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()) {
@@ -3651,13 +3660,13 @@ mod tests {
 
     #[test]
     fn proc_parses_and_contract_checks() {
-        let h = parse_proc("add3 uses rbx rsi in rcx rdx out rax", false);
+        let h = parse_proc("add3 uses rbx rsi in rcx rdx out rax");
         assert_eq!(h.name, "add3");
         assert_eq!(h.uses, ["rbx", "rsi"]);
         assert_eq!(h.ins, ["rcx", "rdx"]);
         assert_eq!(h.outs, ["rax"]);
         assert!(!h.frame);
-        assert!(parse_proc("f uses rbx frame", false).frame);
+        assert!(parse_proc("f uses rbx frame").frame);
 
         // `uses` check: modifies a callee-saved register it didn't declare
         let bad = ".code\nproc f uses rbx in rcx\n  mov rsi, rcx\nendproc\n";
