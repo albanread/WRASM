@@ -354,7 +354,7 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
 }
 
 /// Any general register, canonicalized to its 64-bit name (eax→rax, r8d→r8).
-fn gp_reg(s: &str) -> Option<&'static str> {
+pub(crate) fn gp_reg(s: &str) -> Option<&'static str> {
     Some(match s.trim().to_ascii_lowercase().as_str() {
         "rax" | "eax" | "ax" | "al" | "ah" => "rax",
         "rbx" | "ebx" | "bx" | "bl" | "bh" => "rbx",
@@ -427,7 +427,7 @@ fn is_call_site(t: &str) -> bool {
 /// The registers (that `canon` tracks) an instruction reads and writes —
 /// conservative: unknown mnemonics treat operand 0 as written so a clobber is
 /// cleared, never invented.
-fn reg_effects<F: Fn(&str) -> Option<&'static str>>(
+pub(crate) fn reg_effects<F: Fn(&str) -> Option<&'static str>>(
     t: &str,
     canon: &F,
 ) -> (Vec<&'static str>, Vec<&'static str>) {

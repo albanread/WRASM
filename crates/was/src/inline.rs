@@ -318,6 +318,108 @@ fn drop_jmp_to_next(lines: Vec<Line>, origin: Vec<usize>) -> (Vec<Line>, Vec<usi
     (out, oorigin)
 }
 
+/// A `__wfi_cont_N:` label that nothing jumps to is dead (a single-exit proc's
+/// continuation, after its tail `ret`→jmp was peepholed). Strip those — they're
+/// the bulk of an inlined region's residue. (Only our own labels, only when no
+/// jump targets them, so it's always sound.)
+fn remove_dead_cont_labels(lines: Vec<Line>, origin: Vec<usize>) -> (Vec<Line>, Vec<usize>) {
+    let targets: HashSet<&str> = lines
+        .iter()
+        .filter_map(|l| match &l.kind {
+            Kind::Jump(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut oorigin = Vec::with_capacity(origin.len());
+    for (l, o) in lines.iter().zip(origin) {
+        if let Kind::Label(n) = &l.kind {
+            if n.starts_with("__wfi_cont_") && !targets.contains(n.as_str()) {
+                continue; // dead continuation label — drop it
+            }
+        }
+        out.push(l.clone());
+        oorigin.push(o);
+    }
+    (out, oorigin)
+}
+
+/// `pop R` and `push R` operand, if the line is exactly that (a single bare reg).
+fn pop_reg(l: &Line) -> Option<&str> {
+    bare_unary(&l.text, "pop")
+}
+fn push_reg(l: &Line) -> Option<&str> {
+    bare_unary(&l.text, "push")
+}
+fn bare_unary<'a>(text: &'a str, mn: &str) -> Option<&'a str> {
+    let t = text.trim();
+    let rest = t.strip_prefix(mn)?.strip_prefix(char::is_whitespace)?.trim();
+    (gp_or_xmm_reg(rest).is_some()).then_some(rest)
+}
+
+/// A no-op line between a `pop` and a `push` we can see through (comment/blank).
+fn is_transparent(l: &Line) -> bool {
+    matches!(l.kind, Kind::Other) && {
+        let t = l.text.trim();
+        t.is_empty() || t.starts_with(';')
+    }
+}
+
+/// After a `push R` (the value just re-saved), is R overwritten before it's read?
+/// Forward scan, conservative: a read keeps it live, a write kills it, any barrier
+/// (label/call/jump/ret) stops the scan as live. Sound regardless of contracts.
+fn written_before_read(lines: &[Line], push_idx: usize, r: &str) -> bool {
+    let Some(rc) = crate::gp_reg(r) else { return false };
+    for l in &lines[push_idx + 1..] {
+        match &l.kind {
+            Kind::Label(_) | Kind::Call(_) | Kind::Jump(_) | Kind::Ret => return false,
+            _ => {
+                let (reads, writes) = crate::reg_effects(l.text.trim(), &crate::gp_reg);
+                if reads.contains(&rc) {
+                    return false;
+                }
+                if writes.contains(&rc) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Redundant-framing cleanup: a `pop R` immediately followed (comments aside) by a
+/// `push R` is stack-neutral, so the pair can go — provided R is dead between them
+/// (overwritten before read after the push). This collapses the save/restore two
+/// adjacent inlined bodies do around a shared `uses` register.
+fn cancel_pop_push(lines: Vec<Line>, origin: Vec<usize>) -> (Vec<Line>, Vec<usize>) {
+    let mut drop = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(r) = pop_reg(&lines[i]) {
+            let mut j = i + 1;
+            while j < lines.len() && is_transparent(&lines[j]) {
+                j += 1;
+            }
+            if j < lines.len() && push_reg(&lines[j]) == Some(r) && written_before_read(&lines, j, r) {
+                drop[i] = true;
+                drop[j] = true;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    let mut oorigin = Vec::with_capacity(origin.len());
+    for (k, (l, o)) in lines.iter().zip(origin).enumerate() {
+        if !drop[k] {
+            out.push(l.clone());
+            oorigin.push(o);
+        }
+    }
+    (out, oorigin)
+}
+
 /// Run the inliner over lowered asm. Returns the rewritten text plus an `origin`
 /// map (`origin[i]` = the 0-based input line output line `i` derives from), so the
 /// caller can keep error line-mapping intact. Markers are always stripped; a call
@@ -385,6 +487,8 @@ pub fn optimize(asm: &str, threshold: usize) -> (String, Vec<usize>) {
         i += 1;
     }
     let (out, origin) = drop_jmp_to_next(out, origin);
+    let (out, origin) = remove_dead_cont_labels(out, origin);
+    let (out, origin) = cancel_pop_push(out, origin);
     (render(&out), origin)
 }
 
@@ -419,13 +523,42 @@ mod tests {
         assert!(!out.contains("call Foo"), "both calls inlined:\n{out}");
         assert!(!out.lines().any(|l| l.trim() == "Foo:"), "dead Foo def DCE'd:\n{out}");
         assert!(out.lines().any(|l| l.trim() == "Bar:"), "framed Bar kept:\n{out}");
-        assert_eq!(out.matches("push rbx").count(), 2, "body spliced at both sites:\n{out}");
         // internal label uniquified per site; its backward jump renamed to match
         assert!(out.contains("floop__wfi1:") && out.contains("floop__wfi2:"), "per-site labels:\n{out}");
         assert!(out.contains("jnz floop__wfi1") && out.contains("jnz floop__wfi2"), "renamed jumps:\n{out}");
-        // the tail `ret` became a continuation the peephole collapsed (no stray jmp)
-        assert!(!out.contains("jmp __wfi_cont_1\n__wfi_cont_1:"), "trailing jmp peepholed:\n{out}");
+        // cleanup: dead continuation labels stripped; the save/restore the two
+        // adjacent inlinings do around their shared `uses rbx` cancels to one pair.
+        assert!(!out.contains("__wfi_cont"), "dead continuation labels removed:\n{out}");
+        assert_eq!(out.matches("push rbx").count(), 1, "framing reduced to one push:\n{out}");
+        assert_eq!(out.matches("pop rbx").count(), 1, "framing reduced to one pop:\n{out}");
         assert!(out.contains("inline Foo") && out.contains("end Foo"), "visible inline markers:\n{out}");
+    }
+
+    #[test]
+    fn cleanup_cancels_redundant_framing() {
+        // a `pop R` then `push R` (comments between) cancels iff R is dead — i.e.
+        // the next body writes R before reading it.
+        let dead = "  pop rbx\n  ; gap\n  push rbx\n  mov rbx, 7\n  ret\n";
+        let (out, _) = optimize(dead, 8); // no procs → passes run on the buffer directly...
+        // (no @wfi markers → optimize is identity; exercise the pass directly instead)
+        assert_eq!(out, dead, "no markers → identity");
+        let lines = parse(dead);
+        let (c, _) = cancel_pop_push(lines, (0..5).collect());
+        let txt = render(&c);
+        assert!(!txt.contains("pop rbx") && !txt.contains("push rbx"), "cancelled (rbx dead):\n{txt}");
+
+        // must NOT cancel when R is read before written (the value is live)
+        let live = parse("  pop rbx\n  push rbx\n  mov rax, rbx\n  ret\n");
+        let (c2, _) = cancel_pop_push(live, (0..4).collect());
+        let txt2 = render(&c2);
+        assert!(txt2.contains("pop rbx") && txt2.contains("push rbx"), "kept (rbx live):\n{txt2}");
+
+        // dead __wfi_cont labels go; a jumped-to one stays
+        let labs = parse("  jmp __wfi_cont_5\n__wfi_cont_5:\n__wfi_cont_9:\n");
+        let (c3, _) = remove_dead_cont_labels(labs, (0..3).collect());
+        let txt3 = render(&c3);
+        assert!(txt3.contains("__wfi_cont_5:"), "live cont kept:\n{txt3}");
+        assert!(!txt3.contains("__wfi_cont_9:"), "dead cont removed:\n{txt3}");
     }
 
     #[test]
