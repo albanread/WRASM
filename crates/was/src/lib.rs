@@ -68,6 +68,54 @@ fn nonvol_reg(s: &str) -> Option<&'static str> {
     })
 }
 
+/// The callee-saved vector registers on Win64 — xmm6..xmm15 (and the ymm/zmm that
+/// alias them: writing ymm6 destroys the preserved low 128 bits of xmm6, so we
+/// canonicalize any width to its xmm name). A subroutine must preserve these for
+/// its caller; plain `proc`/`uses` can't (it only `push`es GP registers), which is
+/// what `fproc` exists to handle.
+fn nonvol_xmm(s: &str) -> Option<&'static str> {
+    let s = s.trim().to_ascii_lowercase();
+    let n = s
+        .strip_prefix("xmm")
+        .or_else(|| s.strip_prefix("ymm"))
+        .or_else(|| s.strip_prefix("zmm"))?;
+    Some(match n {
+        "6" => "xmm6",
+        "7" => "xmm7",
+        "8" => "xmm8",
+        "9" => "xmm9",
+        "10" => "xmm10",
+        "11" => "xmm11",
+        "12" => "xmm12",
+        "13" => "xmm13",
+        "14" => "xmm14",
+        "15" => "xmm15",
+        _ => return None,
+    })
+}
+
+/// A store of a non-volatile xmm to memory (`movups [rsp+16], xmm6` and friends) —
+/// a hand-rolled save. Lets the contract check tell a preserved clobber from a lost
+/// one in a plain `proc` (an `fproc` saves them for you via `uses`).
+fn xmm_save_target(t: &str) -> Option<&'static str> {
+    let (mn, rest) = match t.find(char::is_whitespace) {
+        Some(p) => (t[..p].to_ascii_lowercase(), t[p..].trim()),
+        None => return None,
+    };
+    let is_move = matches!(
+        mn.as_str(),
+        "movups" | "movaps" | "movupd" | "movapd" | "movdqu" | "movdqa" | "movsd" | "movss" | "movq" | "movd"
+    ) || mn.starts_with("vmov");
+    if !is_move {
+        return None;
+    }
+    let ops = split_top_commas(rest);
+    if ops.len() < 2 || !ops[0].contains('[') {
+        return None; // not a store to memory
+    }
+    nonvol_xmm(&ops[1])
+}
+
 /// A bare integer immediate (`42` / `0x10`), for tracking `sub rsp, N`.
 fn simple_imm(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -102,11 +150,15 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
     struct Acc {
         name: String,
         line: usize,
+        fp: bool, // an `fproc`: its `uses` may save xmm6..xmm15
         saved: Vec<&'static str>,
+        saved_xmm: Vec<&'static str>, // non-volatile xmm an fproc preserves via `uses`
         ins: Vec<&'static str>,
         outs: Vec<&'static str>,
         reads: HashMap<&'static str, usize>, // reg → first-read line
         writes: HashSet<&'static str>,
+        xmm_writes: HashMap<&'static str, usize>, // non-vol xmm → first-write line
+        xmm_saved: HashSet<&'static str>,         // non-vol xmm hand-saved to memory
         framed: bool,
         rsp: Option<i64>, // offset from the post-prologue level; None = untrackable
     }
@@ -128,16 +180,20 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
             continue;
         }
         let col = raw.len() - raw.trim_start().len() + 1;
-        if let Some(rest) = strip_keyword(t, "proc") {
-            let h = parse_proc(rest);
+        if let Some((rest, fp)) = strip_proc_kw(t) {
+            let h = parse_proc(rest, fp);
             cur = Some(Acc {
                 name: h.name,
                 line,
+                fp,
                 saved: h.uses.iter().filter_map(|u| nonvol_reg(u)).collect(),
+                saved_xmm: h.uses.iter().filter_map(|u| nonvol_xmm(u)).collect(),
                 ins: h.ins.iter().filter_map(|u| gp_reg(u)).collect(),
                 outs: h.outs.iter().filter_map(|u| gp_reg(u)).collect(),
                 reads: HashMap::new(),
                 writes: HashSet::new(),
+                xmm_writes: HashMap::new(),
+                xmm_saved: HashSet::new(),
                 framed: h.frame,
                 rsp: Some(0),
             });
@@ -180,6 +236,31 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
                             severity: Severity::Error,
                         });
                     }
+                }
+                // float: a non-volatile xmm clobbered but not preserved. An `fproc`
+                // saves the xmm listed in its `uses`; a hand-rolled movups save also
+                // counts. Otherwise it's a lost caller value — an error in an fproc
+                // (just add it to `uses`), a caution in a plain proc (switch to fproc).
+                let mut xmm_lost: Vec<(&'static str, usize)> = p
+                    .xmm_writes
+                    .iter()
+                    .filter(|(r, _)| !p.saved_xmm.contains(*r) && !p.xmm_saved.contains(*r))
+                    .map(|(r, l)| (*r, *l))
+                    .collect();
+                xmm_lost.sort();
+                for (r, l) in xmm_lost {
+                    let (message, severity) = if p.fp {
+                        (
+                            format!("fproc `{}` modifies `{r}` (callee-saved) without saving it — add `{r}` to its `uses` so the prologue preserves it", p.name),
+                            Severity::Error,
+                        )
+                    } else {
+                        (
+                            format!("proc `{}` modifies `{r}` (callee-saved on Win64) — a plain `proc` can't preserve xmm; make it an `fproc` and add `{r}` to `uses`, or save/reload it by hand", p.name),
+                            Severity::Warn,
+                        )
+                    };
+                    diags.push(Diag { line: l, col: 1, message, severity });
                 }
             }
             continue;
@@ -232,6 +313,15 @@ pub fn proc_contract_diags(src: &str) -> Vec<Diag> {
         }
         for w in &writes {
             p.writes.insert(w);
+        }
+
+        // Non-volatile xmm: track clobbers vs hand-rolled saves (a movups to memory),
+        // checked against the fproc `uses` at endproc.
+        if let Some(saved) = xmm_save_target(t) {
+            p.xmm_saved.insert(saved);
+        }
+        for w in reg_effects(t, &nonvol_xmm).1 {
+            p.xmm_writes.entry(w).or_insert(line);
         }
 
         // frame balance: track rsp across the body's own stack moves.
@@ -2290,8 +2380,8 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
         let mut max_args = 0;
         for (i, raw) in src.lines().enumerate() {
             let t = strip_comment(raw).trim();
-            if let Some(rest) = strip_keyword(t, "proc") {
-                let h = parse_proc(rest);
+            if let Some((rest, fp)) = strip_proc_kw(t) {
+                let h = parse_proc(rest, fp);
                 start = Some(i + 1);
                 framed = h.frame;
                 max_args = 0;
@@ -2502,21 +2592,35 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             out.push_str(&loop_jump(rest, true, &block_stack, kb, &labels, src_line, raw)?);
         } else if let Some(rest) = strip_keyword(t, ".continue") {
             out.push_str(&loop_jump(rest, false, &block_stack, kb, &labels, src_line, raw)?);
-        } else if let Some(rest) = strip_keyword(t, "proc") {
+        } else if let Some((rest, fp)) = strip_proc_kw(t) {
             // `proc NAME uses R…` → the label + a visible prologue (push each saved
-            // register, in order); `endproc`/`ret` pop them in reverse. No frame —
-            // each `invoke` inside aligns and shadow-spaces itself.
+            // GP register, in order); `endproc`/`ret` pop them in reverse. `fproc`
+            // additionally saves its non-volatile xmm `uses` (xmm6..xmm15) to a
+            // movups'd stack area, restored in the epilogue. No frame → each
+            // `invoke` inside aligns and shadow-spaces itself.
             if block_stack.iter().any(|b| matches!(b, Block::Proc { .. })) {
                 bail!("line {src_line}: `proc` inside a `proc` — close the first with `endproc`");
             }
-            let h = parse_proc(rest);
+            let h = parse_proc(rest, fp);
             if h.name.is_empty() {
                 bail!("line {src_line}: `proc` needs a name");
             }
+            let (gpr_uses, xmm_uses) = split_uses(&h.uses);
+            if !xmm_uses.is_empty() && !fp {
+                bail!("line {src_line}: `proc {}` lists xmm in `uses`, but `uses` can only push GP registers — use `fproc` to save xmm6..xmm15", h.name);
+            }
             let frame_size = proc_frame.get(&src_line).copied().unwrap_or(0);
             out.push_str(&format!("{}:\n", h.name));
-            for r in &h.uses {
+            for r in &gpr_uses {
                 out.push_str(&format!("  push {r}\n"));
+            }
+            // Reserve + movups-save the non-volatile xmm registers (alignment-free,
+            // so it's correct whether or not this proc also sets up a frame).
+            if !xmm_uses.is_empty() {
+                out.push_str(&format!("  sub rsp, {}\n", xmm_uses.len() * 16));
+                for (i, r) in xmm_uses.iter().enumerate() {
+                    out.push_str(&format!("  movups [rsp + {}], {r}\n", i * 16));
+                }
             }
             if frame_size > 0 {
                 // Align the stack once with an rbp anchor, so the lean calls
@@ -2524,11 +2628,11 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
                 out.push_str("  push rbp\n  mov rbp, rsp\n  and rsp, -16\n");
                 out.push_str(&format!("  sub rsp, {frame_size}\n"));
             }
-            block_stack.push(Block::Proc { uses: h.uses, frame_size });
+            block_stack.push(Block::Proc { uses: gpr_uses, xmm: xmm_uses, frame_size });
         } else if t == "endproc" {
             match block_stack.pop() {
-                Some(Block::Proc { uses, frame_size }) => {
-                    out.push_str(&proc_epilogue(&uses, frame_size))
+                Some(Block::Proc { uses, xmm, frame_size }) => {
+                    out.push_str(&proc_epilogue(&uses, &xmm, frame_size))
                 }
                 _ => bail!("line {src_line}: `endproc` without an open `proc`"),
             }
@@ -2537,8 +2641,8 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             // registers first. `.ret` is the explicit early-exit form; a bare
             // `ret` is intercepted too so it can't skip the epilogue.
             match block_stack.iter().rev().find(|b| matches!(b, Block::Proc { .. })) {
-                Some(Block::Proc { uses, frame_size }) => {
-                    out.push_str(&proc_epilogue(uses, *frame_size))
+                Some(Block::Proc { uses, xmm, frame_size }) => {
+                    out.push_str(&proc_epilogue(uses, xmm, *frame_size))
                 }
                 _ if t == ".ret" => bail!("line {src_line}: `.ret` outside a `proc`"),
                 _ => out.push_str("  ret\n"),
@@ -2590,11 +2694,12 @@ enum Block {
     Repeat { id: usize },
     For { id: usize, reg: String },
     Forever { id: usize },
-    /// `proc … endproc` — `uses` are the saved registers (popped in reverse).
+    /// `proc … endproc` — `uses` are the saved GP registers (popped in reverse);
+    /// `xmm` are the non-volatile vector registers an `fproc` saves with movups.
     /// `frame_size` > 0 for a `frame` proc: the bytes reserved once in the
     /// prologue (shadow space + outgoing args) so the calls inside skip their
     /// per-call alignment; the epilogue releases it. 0 for an unframed proc.
-    Proc { uses: Vec<String>, frame_size: usize },
+    Proc { uses: Vec<String>, xmm: Vec<&'static str>, frame_size: usize },
 }
 
 /// A parsed `proc` header.
@@ -2606,17 +2711,30 @@ struct ProcHdr {
     /// `frame` was given: reserve the shadow space + outgoing-arg area once so the
     /// calls inside skip their per-call alignment.
     frame: bool,
+    /// `fproc` (not `proc`): the float variant, whose `uses` may also list
+    /// xmm6..xmm15 — the prologue saves/restores those vector registers for you.
+    fp: bool,
+}
+
+/// Detect a `proc`/`fproc` opener, returning its header text and whether it's the
+/// float variant. `strip_keyword` is prefix-based, so `fproc` never matches `proc`.
+fn strip_proc_kw(t: &str) -> Option<(&str, bool)> {
+    if let Some(r) = strip_keyword(t, "fproc") {
+        return Some((r, true));
+    }
+    strip_keyword(t, "proc").map(|r| (r, false))
 }
 
 /// `proc NAME [uses R…] [in R…] [out R…] [frame]` — the keywords delimit
 /// space/comma-separated register lists; `frame` is a bare flag.
-fn parse_proc(rest: &str) -> ProcHdr {
+fn parse_proc(rest: &str, fp: bool) -> ProcHdr {
     let mut h = ProcHdr {
         name: String::new(),
         uses: Vec::new(),
         ins: Vec::new(),
         outs: Vec::new(),
         frame: false,
+        fp,
     };
     let mut bucket = 0u8; // 0 = name, 1 = uses, 2 = in, 3 = out
     for tok in rest.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()) {
@@ -2634,6 +2752,24 @@ fn parse_proc(rest: &str) -> ProcHdr {
         }
     }
     h
+}
+
+/// Split a proc's `uses` list into the GP registers (saved with push/pop) and the
+/// non-volatile xmm registers (saved with movups — `fproc` only), de-duplicating
+/// the latter and canonicalizing ymm/zmm to their xmm name.
+fn split_uses(uses: &[String]) -> (Vec<String>, Vec<&'static str>) {
+    let mut gprs = Vec::new();
+    let mut xmms: Vec<&'static str> = Vec::new();
+    for u in uses {
+        if let Some(x) = nonvol_xmm(u) {
+            if !xmms.contains(&x) {
+                xmms.push(x);
+            }
+        } else {
+            gprs.push(u.clone());
+        }
+    }
+    (gprs, xmms)
 }
 
 /// The number of Win64 arguments a call line marshals (including the COM `this`),
@@ -2667,10 +2803,17 @@ fn proc_frame_size(max_args: usize) -> usize {
 
 /// The proc epilogue: release the frame (restore rsp from the rbp anchor),
 /// restore the saved registers in reverse, then `ret`.
-fn proc_epilogue(uses: &[String], frame_size: usize) -> String {
+fn proc_epilogue(uses: &[String], xmm: &[&'static str], frame_size: usize) -> String {
     let mut s = String::new();
     if frame_size > 0 {
         s.push_str("  mov rsp, rbp\n  pop rbp\n");
+    }
+    // fproc: reload the saved vector registers, then release their stack area.
+    for (i, r) in xmm.iter().enumerate() {
+        s.push_str(&format!("  movups {r}, [rsp + {}]\n", i * 16));
+    }
+    if !xmm.is_empty() {
+        s.push_str(&format!("  add rsp, {}\n", xmm.len() * 16));
     }
     for r in uses.iter().rev() {
         s.push_str(&format!("  pop {r}\n"));
@@ -3508,13 +3651,13 @@ mod tests {
 
     #[test]
     fn proc_parses_and_contract_checks() {
-        let h = parse_proc("add3 uses rbx rsi in rcx rdx out rax");
+        let h = parse_proc("add3 uses rbx rsi in rcx rdx out rax", false);
         assert_eq!(h.name, "add3");
         assert_eq!(h.uses, ["rbx", "rsi"]);
         assert_eq!(h.ins, ["rcx", "rdx"]);
         assert_eq!(h.outs, ["rax"]);
         assert!(!h.frame);
-        assert!(parse_proc("f uses rbx frame").frame);
+        assert!(parse_proc("f uses rbx frame", false).frame);
 
         // `uses` check: modifies a callee-saved register it didn't declare
         let bad = ".code\nproc f uses rbx in rcx\n  mov rsi, rcx\nendproc\n";
@@ -3571,6 +3714,65 @@ mod tests {
         let body = low.split("sub rsp, 32").nth(1).unwrap();
         assert!(!body.contains("and rsp, -16"), "the lean call must not re-align:\n{body}");
         assert!(body.contains("call Sleep"));
+    }
+
+    #[test]
+    fn fproc_saves_xmm_and_checks_clobbers() {
+        let Some(kb) = kb() else { return };
+        // codegen: an fproc reserves a movups-saved area for its xmm `uses` and
+        // reloads it in the epilogue, wrapping any frame setup.
+        let low = lower(
+            ".code\nfproc m uses xmm6 xmm7 frame\n  mulps xmm6, xmm7\n  invoke Sleep, 0\nendproc\n",
+            &kb,
+        )
+        .unwrap();
+        assert!(low.contains("sub rsp, 32"), "reserve 2*16 xmm area:\n{low}");
+        assert!(
+            low.contains("movups [rsp + 0], xmm6") && low.contains("movups [rsp + 16], xmm7"),
+            "save both xmm:\n{low}"
+        );
+        assert!(
+            low.contains("movups xmm6, [rsp + 0]") && low.contains("add rsp, 32"),
+            "restore + release:\n{low}"
+        );
+
+        // an unframed fproc still saves (movups is alignment-free)
+        let low2 = lower(".code\nfproc f uses xmm8\n  addps xmm8, xmm8\nendproc\n", &kb).unwrap();
+        assert!(low2.contains("sub rsp, 16") && low2.contains("movups [rsp + 0], xmm8"), "leaf save:\n{low2}");
+
+        // ymm/zmm in `uses` canonicalize to the 128-bit xmm save
+        let low3 = lower(".code\nfproc g uses ymm6\n  vmovaps ymm6, ymm0\nendproc\n", &kb).unwrap();
+        assert!(low3.contains("movups [rsp + 0], xmm6"), "ymm6 -> xmm6 save:\n{low3}");
+
+        // a plain proc may not list xmm in `uses` (it can only push GP registers)
+        assert!(
+            lower(".code\nproc p uses xmm6\n  ret\nendproc\n", &kb).is_err(),
+            "plain proc + xmm in uses must error"
+        );
+
+        // checker: an fproc's xmm `uses` are preserved → clobbering them is clean
+        assert!(proc_contract_diags(".code\nfproc m uses xmm6\n  mulps xmm6, xmm6\nendproc\n").is_empty());
+        // …but clobbering an xmm NOT in `uses` is an error (add it to `uses`)
+        let d = proc_contract_diags(".code\nfproc m uses xmm6\n  movups xmm8, [rcx]\n  addps xmm0, xmm8\nendproc\n");
+        assert!(
+            d.iter().any(|x| x.message.contains("xmm8") && x.severity == Severity::Error),
+            "fproc clobber-not-in-uses: {d:?}"
+        );
+
+        // checker: a plain proc clobbering a non-volatile xmm warns and points at fproc
+        let w = proc_contract_diags(".code\nproc p\n  movups xmm6, [rcx]\n  addps xmm0, xmm6\nendproc\n");
+        assert!(
+            w.iter().any(|x| x.message.contains("xmm6") && x.message.contains("fproc") && x.severity == Severity::Warn),
+            "plain-proc xmm warning: {w:?}"
+        );
+
+        // a hand-rolled movups save clears the warning (no false positive)
+        assert!(
+            proc_contract_diags(".code\nproc p\n  movups [rsp - 16], xmm6\n  mulps xmm6, xmm6\n  movups xmm6, [rsp - 16]\nendproc\n")
+                .iter()
+                .all(|x| !x.message.contains("xmm6")),
+            "hand-saved xmm6 must not warn"
+        );
     }
 
     #[test]
