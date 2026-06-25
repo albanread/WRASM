@@ -75,6 +75,7 @@ bs_descXs:
 bs_descAt:
     mov     dword ptr [rip + bossState], BS_CHARGE
     mov     dword ptr [rip + bossBeamT], 0
+    call    PlayBossHum                       ; the tractor hum starts as it charges
     jmp     bs_done
 bs_charge:
     inc     dword ptr [rip + bossAnim]
@@ -95,6 +96,7 @@ bs_chcap:
     jl      bs_done
     mov     dword ptr [rip + bossState], BS_BEAM
     mov     dword ptr [rip + bossBeamT], 0
+    call    PlayBossHum                       ; re-trigger the hum for the beam phase
     jmp     bs_done
 bs_beam:
     inc     dword ptr [rip + bossAnim]
@@ -125,6 +127,7 @@ bs_rising:
     cmp     [rip + abducteeY], eax
     jg      bs_done                            ; still rising
     dec     dword ptr [rip + lives]            ; reached the boss -> a pilot is lost
+    call    PlayCapture                        ; the abduction sound
     mov     dword ptr [rip + abducting], 0
     call    BeamOff
     mov     dword ptr [rip + bossState], BS_RETURN
@@ -194,6 +197,7 @@ cbh_nodrop:
     add     edx, 16
     call    BurstAt
     call    PlayBoom
+    call    PlayBonus                          ; the pilot is saved + bonus chime
     add     dword ptr [rip + score], BOSS_SCORE
     call    BeamOff
     mov     dword ptr [rip + bossState], BS_IDLE

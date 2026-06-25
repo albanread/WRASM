@@ -22,6 +22,15 @@ deathFrames DWORD ?
 .balign 16
 wahBuf      real8 88200 dup(0.0)              ; saucer UFO warble (looped while it crosses)
 wahFrames   DWORD ?
+.balign 16
+bossHumBuf  real8 88200 dup(0.0)              ; capture boss: low menacing tractor hum
+bossHumFrames DWORD ?
+.balign 16
+captureBuf  real8 88200 dup(0.0)              ; a pilot abducted: descending loss zap
+captureFrames DWORD ?
+.balign 16
+bonusBuf    real8 88200 dup(0.0)              ; boss shot free: bonus chime
+bonusFrames DWORD ?
 
 ; looping A-minor chiptune (square lead + synth bass) — brickout's proven soundtrack.
 soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=170", 10, "%%MIDI program 1 81", 10, "%%MIDI program 2 38", 10, "K:Em", 10, "V:1", 10, "e g b e' b g e g | d f a d' a f d f | c e g c' g e c e | B d f b a g f e | e g b e' b g e g | d f a d' a f d f | c e a c' a e c B | e2 B2 e4 |", 10, "V:2", 10, "E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | B,,4 E,4 | E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | E,4 E,4 |", 10, 0
@@ -53,6 +62,23 @@ proc AudioBoot frame
     call    Wah
     lea     rcx, [rip + wahBuf]
     lea     rdx, [rip + wahFrames]
+    call    CopySfx
+    mov     ecx, 110                          ; boss hum: low 110 Hz + 4 Hz detune, ominous throb
+    mov     edx, 1100
+    mov     r8d, 4
+    call    Wah
+    lea     rcx, [rip + bossHumBuf]
+    lea     rdx, [rip + bossHumFrames]
+    call    CopySfx
+    mov     edx, 360                          ; pilot captured: a long descending zap
+    call    Zap
+    lea     rcx, [rip + captureBuf]
+    lea     rdx, [rip + captureFrames]
+    call    CopySfx
+    mov     edx, 220                          ; boss freed: a bright bonus chime
+    call    Coin
+    lea     rcx, [rip + bonusBuf]
+    lea     rdx, [rip + bonusFrames]
     call    CopySfx
     mov     dword ptr [rip + gMusicLoop], 1   ; loop the active tune
     lea     rcx, [rip + tuneTitle]            ; boot into STATE_INTRO -> title music
@@ -123,6 +149,24 @@ endproc
 proc PlaySaucerWah frame
     lea     rcx, [rip + wahBuf]
     mov     edx, [rip + wahFrames]
+    call    Play
+endproc
+
+proc PlayBossHum frame
+    lea     rcx, [rip + bossHumBuf]
+    mov     edx, [rip + bossHumFrames]
+    call    Play
+endproc
+
+proc PlayCapture frame
+    lea     rcx, [rip + captureBuf]
+    mov     edx, [rip + captureFrames]
+    call    Play
+endproc
+
+proc PlayBonus frame
+    lea     rcx, [rip + bonusBuf]
+    mov     edx, [rip + bonusFrames]
     call    Play
 endproc
 
