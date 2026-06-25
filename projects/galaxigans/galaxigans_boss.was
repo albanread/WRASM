@@ -134,7 +134,17 @@ bs_rising:
     call    PlayCapture                        ; the abduction sound
     mov     dword ptr [rip + abducting], 0
     call    BeamOff
-    mov     dword ptr [rip + bossState], BS_RETURN
+    cmp     dword ptr [rip + lives], 0         ; that was the last pilot -> game over
+    jg      bs_rising_leave
+    mov     dword ptr [rip + gameState], STATE_GAMEOVER
+    mov     dword ptr [rip + danceFrame], 0
+    mov     dword ptr [rip + danceTimer], DANCE_LEN
+    mov     dword ptr [rip + pAlive], 0        ; nobody left to fly the ship
+    mov     dword ptr [rip + bossState], BS_IDLE  ; clear the boss so it doesn't freeze on-screen
+    call    MusicGameOver                      ; the aliens' victory fanfare
+    jmp     bs_done
+bs_rising_leave:
+    mov     dword ptr [rip + bossState], BS_RETURN  ; survivors remain -> the boss retreats
     jmp     bs_done
 bs_beamhold:
     cmp     dword ptr [rip + bossBeamT], BEAM_HOLD
@@ -145,16 +155,12 @@ bs_beamhold:
 bs_return:
     inc     dword ptr [rip + bossAnim]
     mov     eax, [rip + bossY]
-    cmp     eax, BOSS_STATION_Y
-    jle     bs_retdone
-    sub     eax, 3
+    sub     eax, 4                             ; retreat straight up and off the top
     mov     [rip + bossY], eax
-    jmp     bs_done
-bs_retdone:
-    mov     dword ptr [rip + bossY], BOSS_STATION_Y
-    mov     dword ptr [rip + bossX], 304
-    mov     dword ptr [rip + bossState], BS_STATION
-    mov     dword ptr [rip + bossTimer], 150
+    cmp     eax, -40
+    jg      bs_done
+    mov     dword ptr [rip + bossState], BS_IDLE  ; gone -> reappears later (bossTimer)
+    mov     dword ptr [rip + bossTimer], BOSS_RESPAWN
 bs_done:
 endproc
 

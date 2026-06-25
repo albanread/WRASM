@@ -9,6 +9,8 @@ module Galaxigans
 vnPlayNow  BYTE "playnow", 0
 vnBossArm  BYTE "bossarm", 0
 vnHitBoss  BYTE "hitboss", 0
+vnCapLast  BYTE "caplast", 0
+vnCapKeep  BYTE "capkeep", 0
 .balign 16
 
 .CODE
@@ -30,6 +32,9 @@ proc ExposeState frame
     mov     ecx, 4
     mov     edx, [rip + gameState]
     call    TclReg
+    mov     ecx, 5
+    mov     edx, [rip + bossY]
+    call    TclReg
 endproc
 
 ; ---- RegisterTclVerbs: add the game's dev/test verbs (called from GameInit) ----
@@ -42,6 +47,12 @@ proc RegisterTclVerbs frame
     call    TclAddVerb
     lea     rcx, [rip + vnHitBoss]
     lea     rdx, [rip + HitBossVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnCapLast]
+    lea     rdx, [rip + CapLastVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnCapKeep]
+    lea     rdx, [rip + CapKeepVerb]
     call    TclAddVerb
 endproc
 
@@ -75,6 +86,31 @@ proc HitBossVerb frame
     mov     [r8 + 4], eax
     mov     dword ptr [r8 + 8], 1
     mov     dword ptr [r8 + 12], 0
+endproc
+
+; ---- bossCapArm — boss in BEAM with a pilot ~2 ticks from being taken (shared test setup) ----
+proc bossCapArm frame
+    mov     dword ptr [rip + bossState], BS_BEAM
+    mov     dword ptr [rip + bossX], 304
+    mov     dword ptr [rip + bossY], BOSS_CAP_Y
+    mov     dword ptr [rip + bossBeamT], 0
+    mov     dword ptr [rip + abducting], 1
+    mov     eax, [rip + bossX]
+    add     eax, 10
+    mov     [rip + abducteeX], eax
+    mov     dword ptr [rip + abducteeY], BOSS_CAP_Y + 32   ; rises to <= bossY+26 within ~2 frames
+endproc
+
+; ---- caplast — lives=1, so the next abduction is the last pilot (must end the game) ----
+proc CapLastVerb frame
+    mov     dword ptr [rip + lives], 1
+    call    bossCapArm
+endproc
+
+; ---- capkeep — lives=3, a non-final abduction (the boss should take one + retreat off-screen) ----
+proc CapKeepVerb frame
+    mov     dword ptr [rip + lives], 3
+    call    bossCapArm
 endproc
 
 endmodule
