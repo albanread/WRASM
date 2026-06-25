@@ -122,7 +122,7 @@ dsc_bonext:
 endproc
 
 ; ---- BurstAt(ecx=x, edx=y): an orange explosion at a 640x360 screen point ----
-proc BurstAt uses rbx frame in rcx rdx
+fproc BurstAt uses rbx xmm6 frame in rcx rdx
     cvtsi2ss xmm0, ecx
     cvtsi2ss xmm1, edx
     mov     ecx, 16                           ; particle count
