@@ -129,6 +129,18 @@ proc BuildSprAssets uses rbx frame
     mov     [rip + fUp + 12], eax
     mov     eax, [rip + fDrone]
     mov     [rip + fUp + 16], eax
+    lea     rcx, [rip + butterflyArt2]        ; the rest of the fleet flaps too
+    call    DecAdd16
+    mov     [rip + fUp2 + 4], eax
+    lea     rcx, [rip + bossArt2]
+    call    DecAdd16
+    mov     [rip + fUp2 + 8], eax
+    lea     rcx, [rip + waspArt2]
+    call    DecAdd16
+    mov     [rip + fUp2 + 12], eax
+    lea     rcx, [rip + gruntArt2]
+    call    DecAdd16
+    mov     [rip + fUp2 + 16], eax
     lea     rcx, [rip + fBeeBankLArt]
     call    DecAdd16
     mov     [rip + fBankL + 0], eax

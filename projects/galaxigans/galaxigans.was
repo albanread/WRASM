@@ -43,6 +43,7 @@ NTV_introspect equ 1
 .include "galaxigans_aliens2.was"     ; the alien-art library (Grunt + 9 more for later levels)
 .include "galaxigans_alienbanks.was"  ; per-type rotated bank frames (divers bank as they swoop)
 .include "galaxigans_alienbanks2.was" ; bank frames for the new later-wave species
+.include "galaxigans_fleetanim.was"   ; flap (2nd) frames for butterfly/boss/wasp
 .include "galaxigans_ship.was"        ; the hero fighter: level / left-bank / right-bank frames
 .include "galaxigans_saucerart.was"   ; the bonus saucer (UFO) sprite, 2-frame
 .include "galaxigans_mineart.was"     ; the spinning space-mine sprite, 8 rotation frames
