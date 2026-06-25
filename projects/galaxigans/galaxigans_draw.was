@@ -107,10 +107,12 @@ dsc_bnext:
 dsc_bo:
     cmp     dword ptr [rsi + 8], 0
     je      dsc_bonext
-    mov     ecx, [rip + fBomb]
+    mov     eax, [rsi + BOM_TYPE]            ; pick this bomb's sprite by type
+    lea     r9, [rip + fBombFr]
+    mov     ecx, [r9 + rax*4]
     cvtsi2ss xmm1, dword ptr [rsi + 0]
     cvtsi2ss xmm2, dword ptr [rsi + 4]
-    mov     r8d, PAL_SLOT
+    mov     r8d, BOMB_SLOT
     movss   xmm3, [rip + fOne]
     call    SprPush
 dsc_bonext:

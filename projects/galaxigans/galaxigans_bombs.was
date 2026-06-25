@@ -139,7 +139,7 @@ lightningArt2  BYTE ".36..."
 ;              4 #5a6676 light hull  5 #8694a4 highlight    6 #c0c0c0 spike steel
 ;              7 #ffffff spike tip   8 #ff3020 red eye      9 #ffd060 eye flare
 ; ============================================================================
-mineArt        BYTE "7..6..7."
+spikeArt        BYTE "7..6..7."
                BYTE ".23442.."
                BYTE "63445346"
                BYTE ".45824.."
@@ -147,7 +147,7 @@ mineArt        BYTE "7..6..7."
                BYTE "63445346"
                BYTE ".23442.."
                BYTE "7..6..7."
-mineArt2       BYTE "6..7..6."
+spikeArt2       BYTE "6..7..6."
                BYTE ".23442.."
                BYTE "73445347"
                BYTE ".45924.."

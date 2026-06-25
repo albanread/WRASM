@@ -52,7 +52,8 @@ RESPAWN_FRAMES equ 90                        ; death pause before the ship comes
 
 ; ---- enemy bombs (divers drop them straight down) ----
 BOMB_MAX       equ 6
-BOMB_STRIDE    equ 12                        ; { x:i32, y:i32, active:i32 }
+BOMB_STRIDE    equ 16                        ; { x:i32, y:i32, active:i32, type:i32 }
+BOM_TYPE       equ 12                        ; which of the 8 bomb sprites
 BOMB_DY        equ 4                         ; pixels/frame down
 BOMB_PERIOD    equ 22                        ; frames between drops (the lowest diver drops)
 
@@ -101,6 +102,8 @@ PILOT_SLOT      equ 11                        ; the pilot life-token palette
 PILOT_GAP       equ 16                        ; spacing of the pilots row
 PILOT_X0        equ 14                        ; the lives row sits bottom-left, clear of the ship
 PILOT_ROW_Y     equ 344                       ; the pilots stand on the floor, below the ship
+BOMB_SLOT       equ 12                        ; the 8 enemy-bomb sprites share one fiery ramp
+NUM_BOMBS       equ 8
 
 ; ---- game lifecycle states + the triumphal spiral dance ----
 STATE_PLAYING  equ 0
@@ -215,7 +218,7 @@ saucerSndT   DWORD 0                            ; countdown to re-trigger the lo
 ; pools (zero-initialised; ResetGame fills them). dup() needs a literal count.
 enemies    BYTE  1760 dup(0)                  ; ENEMY_MAX * ENEMY_STRIDE (40*44)
 bullets    BYTE  64  dup(0)                   ; BULLET_MAX * BULLET_STRIDE (4*16)
-bombs      BYTE  72  dup(0)                   ; BOMB_MAX * BOMB_STRIDE
+bombs      BYTE  96  dup(0)                   ; BOMB_MAX * BOMB_STRIDE (now incl. type)
 .balign 16
 mines      BYTE  96  dup(0)                   ; MINE_MAX * MINE_STRIDE (6*16)
 
@@ -239,6 +242,7 @@ fCbBeam    DWORD ?
 fPilot     DWORD ?                            ; the white-spacesuit life token
 fBullet    DWORD ?
 fBomb      DWORD ?
+fBombFr    DWORD 8 dup(0)                      ; the 8 enemy-bomb sprite frames (by type)
 
 ; formation row -> alien type (one species per row)
 ; per-stage formation themes — each row of 5 = the species for grid rows 0..4 (top..bottom).
@@ -319,6 +323,7 @@ bossCapPal DWORD 0x00200828, 0x00481858, 0x00683078, 0x00884898, 0x00B06CC0
 .balign 16
 ; pilot palette (slot 11): outline, suit shadow/white/highlight, (5 unused), visor, chest light
 pilotPal   DWORD 0x00202830, 0x00A0A8B8, 0x00E8ECF4, 0x00FFFFFF, 0x00000000
+bombPal    DWORD 0x00802818, 0x00C03820, 0x00FF6020, 0x00FF9828, 0x00FFD850, 0x00FFF0A0, 0x00FFFFE0  ; hot ramp 1..7
            DWORD 0x0040C0FF, 0x00FF8020
 
 ; ---- sprite art: hex-digit bitmaps row-major (digit = palette index, '.'=0=clear).

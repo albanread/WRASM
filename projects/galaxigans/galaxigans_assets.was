@@ -116,6 +116,47 @@ proc BuildSprAssets uses rbx frame
     call    SprAddFrame
     mov     [rip + fBomb], eax
 
+    lea     rcx, [rip + plasmaOrbArt]        ; the 8 enemy-bomb sprites (mixed 6x8 / 8x8)
+    mov     edx, 6
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 0], eax
+    lea     rcx, [rip + fireballArt]
+    mov     edx, 8
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 4], eax
+    lea     rcx, [rip + shurikenArt]
+    mov     edx, 8
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 8], eax
+    lea     rcx, [rip + dartArt]
+    mov     edx, 6
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 12], eax
+    lea     rcx, [rip + lightningArt]
+    mov     edx, 6
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 16], eax
+    lea     rcx, [rip + spikeArt]
+    mov     edx, 8
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 20], eax
+    lea     rcx, [rip + acidGlobArt]
+    mov     edx, 6
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 24], eax
+    lea     rcx, [rip + crystalArt]
+    mov     edx, 6
+    mov     r8d, 8
+    call    DecAddWH
+    mov     [rip + fBombFr + 28], eax
+
     ; --- per-type frame tables: upright (fUp) + the rotated bank frames (fBankL/R) ---
     mov     eax, [rip + fEnemy]
     mov     [rip + fUp + 0], eax
@@ -292,6 +333,17 @@ proc DecAdd16 frame in rcx
     call    SprAddFrame
 endproc
 
+; ---- DecAddWH(rcx=art, edx=w, r8d=h) -> eax = frame id: decode a w*h hex sprite + add it ----
+proc DecAddWH uses rbx r12 frame in rcx rdx r8
+    mov     ebx, edx                         ; save w
+    mov     r12d, r8d                        ; save h
+    call    DecodeSprite                     ; rcx=art, edx=w, r8d=h  (-> sprScratch)
+    lea     rcx, [rip + sprScratch]
+    mov     edx, ebx
+    mov     r8d, r12d
+    call    SprAddFrame
+endproc
+
 ; ---- DecAdd32(rcx=art) -> eax = frame id: decode a 32x32 hex sprite + add an atlas frame ----
 proc DecAdd32 frame in rcx
     mov     edx, 32
@@ -382,6 +434,10 @@ proc SetupSprPalettes
     call    SetSlotPal
     mov     ecx, PILOT_SLOT
     lea     rdx, [rip + pilotPal]
+    mov     r8d, 7
+    call    SetSlotPal
+    mov     ecx, BOMB_SLOT                    ; the 8 bombs share one hot 1..7 ramp
+    lea     rdx, [rip + bombPal]
     mov     r8d, 7
     call    SetSlotPal
 endproc

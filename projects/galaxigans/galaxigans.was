@@ -49,6 +49,7 @@ NTV_introspect equ 1
 .include "galaxigans_mineart.was"     ; the spinning space-mine sprite, 8 rotation frames
 .include "galaxigans_bossart.was"     ; the 32x32 capture boss sprite, 4 frames
 .include "galaxigans_pilotart.was"    ; the white-spacesuit pilot (life token), 12x16
+.include "galaxigans_bombs.was"       ; the 8 enemy-bomb sprites (orb/fireball/shuriken/...)
 .include "galaxigans_starfield.was"   ; the animated layer-0 nebula+starfield shader
 .include "galaxigans_beamfx.was"      ; the capture beam in indexed layer 1 (palette-cascaded)
 .include "galaxigans_enemies.was"     ; ResetGame + formation sway + dive AI + bombs
