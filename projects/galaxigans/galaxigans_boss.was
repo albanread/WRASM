@@ -36,6 +36,8 @@ bs_dispatch:
     mov     dword ptr [rip + bossState], BS_ENTER
     mov     dword ptr [rip + bossX], 304
     mov     dword ptr [rip + bossY], -36
+    mov     dword ptr [rip + warnTimer], 130  ; sound + flash the arrival warning
+    call    PlayWarn
     jmp     bs_done
 bs_enter:
     inc     dword ptr [rip + bossAnim]

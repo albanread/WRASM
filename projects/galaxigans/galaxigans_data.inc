@@ -164,6 +164,8 @@ gameOverStr BYTE "GAME OVER", 0
 titleStr   BYTE  "G A L A X I G A N S", 0
 startStr   BYTE  "PRESS ANY KEY TO START", 0
 attractTick DWORD 0                            ; attract-mode clock (blink + demo loop)
+warnStr    BYTE  "!  W A R N I N G  !", 0       ; capture-boss arrival klaxon banner
+warnTimer  DWORD 0
 clearStr   BYTE  "STAGE CLEAR", 0
 stageStr   BYTE  "STAGE 1", 0
 

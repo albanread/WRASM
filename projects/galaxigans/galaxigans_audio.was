@@ -31,6 +31,9 @@ captureFrames DWORD ?
 .balign 16
 bonusBuf    real8 88200 dup(0.0)              ; boss shot free: bonus chime
 bonusFrames DWORD ?
+.balign 16
+warnBuf     real8 88200 dup(0.0)              ; boss-arrival klaxon (fast warble)
+warnFrames  DWORD ?
 
 ; looping A-minor chiptune (square lead + synth bass) — brickout's proven soundtrack.
 soundtrack BYTE "X:1", 10, "M:4/4", 10, "L:1/8", 10, "Q:1/4=170", 10, "%%MIDI program 1 81", 10, "%%MIDI program 2 38", 10, "K:Em", 10, "V:1", 10, "e g b e' b g e g | d f a d' a f d f | c e g c' g e c e | B d f b a g f e | e g b e' b g e g | d f a d' a f d f | c e a c' a e c B | e2 B2 e4 |", 10, "V:2", 10, "E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | B,,4 E,4 | E,4 B,,4 | D,4 A,,4 | C,4 G,,4 | E,4 E,4 |", 10, 0
@@ -79,6 +82,13 @@ proc AudioBoot frame
     call    Coin
     lea     rcx, [rip + bonusBuf]
     lea     rdx, [rip + bonusFrames]
+    call    CopySfx
+    mov     ecx, 330                          ; boss klaxon: 330 Hz + 14 Hz detune -> alarm warble
+    mov     edx, 800
+    mov     r8d, 14
+    call    Wah
+    lea     rcx, [rip + warnBuf]
+    lea     rdx, [rip + warnFrames]
     call    CopySfx
     mov     dword ptr [rip + gMusicLoop], 1   ; loop the active tune
     lea     rcx, [rip + tuneTitle]            ; boot into STATE_INTRO -> title music
@@ -167,6 +177,12 @@ endproc
 proc PlayBonus frame
     lea     rcx, [rip + bonusBuf]
     mov     edx, [rip + bonusFrames]
+    call    Play
+endproc
+
+proc PlayWarn frame
+    lea     rcx, [rip + warnBuf]
+    mov     edx, [rip + warnFrames]
     call    Play
 endproc
 

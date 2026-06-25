@@ -95,6 +95,19 @@ gs_play_hud:
     mov     edx, 8
     lea     r8, [rip + livesStr]
     call    DrawText
+    cmp     dword ptr [rip + warnTimer], 0    ; boss arriving -> flash "WARNING"
+    jle     gs_play_end
+    dec     dword ptr [rip + warnTimer]
+    mov     eax, [rip + warnTimer]
+    and     eax, 8
+    jz      gs_play_end
+    mov     ecx, 0x00FF3030
+    call    TxtSetColour
+    mov     ecx, 250
+    mov     edx, 52
+    lea     r8, [rip + warnStr]
+    call    DrawText
+gs_play_end:
     add     rsp, 40
     ret
 
