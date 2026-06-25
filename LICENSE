@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 Alban Read
+Copyright (c) 2024-2026 Alban Read
+Co-authored with Claude (Anthropic).
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +20,105 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+================================================================================
+THIRD-PARTY SOFTWARE
+================================================================================
+
+WRASM's own crates — `rasm`, `was`, `ide`, `winkb`, `studio`, and the supporting
+`docpane` and `rust-tcl` — are Copyright (c) 2024-2026 Alban Read under the MIT
+License above; they are first-party, not third-party. `rust-tcl` is an original,
+Tcl-inspired command-language core (not derived from Tcl/Tk source). The
+components listed below are external open-source dependencies.
+
+WRASM links (and, for SQLite, embeds) open-source software. The complete and
+authoritative dependency set is pinned in `Cargo.lock`; the principal components
+and their licenses are listed below. Except where noted, each is used under the
+MIT License (the same terms reproduced above). Components offered as
+"MIT OR Apache-2.0" are used under the MIT option; the Apache-2.0 alternative is
+available at https://www.apache.org/licenses/LICENSE-2.0.
+
+  Component                          License                       Used in
+  ---------                          -------                       -------
+  anyhow                             MIT OR Apache-2.0             was, studio
+  rusqlite                           MIT                          was, studio
+  libsqlite3-sys                     MIT                          was, studio
+  SQLite (embedded C library)        Public Domain                was, studio
+  windows, windows-core, windows-*   MIT OR Apache-2.0            studio
+    (Microsoft)
+  chrono                             MIT OR Apache-2.0            studio
+  pest, pest_derive                  MIT OR Apache-2.0            studio
+  fontdue                            MIT OR Apache-2.0 OR Zlib    studio
+  ttf-parser                         MIT OR Apache-2.0            studio
+  pulldown-cmark                     MIT                          studio
+  roxmltree                          MIT OR Apache-2.0            studio
+  selkie-rs                          MIT                          studio
+  regex, regex-automata,             MIT OR Apache-2.0            studio
+    regex-syntax
+  serde, serde_json, serde_derive    MIT OR Apache-2.0            studio
+  toml                               MIT OR Apache-2.0            studio
+  uuid                               Apache-2.0 OR MIT            studio
+  zmij                               MIT                          studio
+  getrandom                          MIT OR Apache-2.0            studio
+  unicase, unicode-width             MIT OR Apache-2.0            studio
+  iced-x86                           MIT                          tests only
+
+...together with the further transitive crates pinned in `Cargo.lock`, each used
+under its own open-source license (predominantly MIT and/or Apache-2.0); see each
+crate's own repository for its exact terms and copyright notices.
+
+--------------------------------------------------------------------------------
+The MIT License (applies to the MIT-licensed components above)
+--------------------------------------------------------------------------------
+
+Each MIT-licensed component is the copyright of its respective authors and is
+used under the following terms:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+--------------------------------------------------------------------------------
+selkie-rs
+--------------------------------------------------------------------------------
+
+studio renders Mermaid diagrams via `selkie-rs`, a fork of selkie by btucker
+(https://github.com/btucker/selkie), used under the MIT License (above).
+
+--------------------------------------------------------------------------------
+SQLite
+--------------------------------------------------------------------------------
+
+The Windows-API knowledge database (`windows_api.db`) is read through SQLite,
+embedded via the `libsqlite3-sys` "bundled" feature. SQLite is in the public
+domain; the authors disclaim copyright. See https://www.sqlite.org/copyright.html.
+
+--------------------------------------------------------------------------------
+Apache License 2.0
+--------------------------------------------------------------------------------
+
+Components above offered under "... OR Apache-2.0" may alternatively be used
+under the Apache License, Version 2.0. The full text is available at:
+https://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+Zlib License
+--------------------------------------------------------------------------------
+
+`fontdue` is additionally available under the Zlib License:
+https://opensource.org/license/zlib
