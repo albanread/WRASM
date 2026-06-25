@@ -1619,7 +1619,8 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     // `origin[i]` is the lowered line output line `i` derives from, so the error
     // line-map stays intact across the rewrite. (Phase 1: an identity round-trip —
     // it changes nothing until a pass is added.)
-    let (lowered, origin) = inline::optimize(&lowered, INLINE_THRESHOLD);
+    let threshold = if std::env::var_os("WAS_NOINLINE").is_some() { 0 } else { INLINE_THRESHOLD };
+    let (lowered, origin) = inline::optimize(&lowered, threshold);
     let lmap: Vec<usize> = origin.iter().map(|&o| lmap.get(o).copied().unwrap_or(0)).collect();
     // Compose all three maps: lowered → preprocessed → expanded → source.
     let map = lmap
@@ -2624,6 +2625,11 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             }
             let frame_size = proc_frame.get(&src_line).copied().unwrap_or(0);
             out.push_str(&format!("{}:\n", h.name));
+            // Inliner span marker (a comment, stripped by inline::optimize). The
+            // flag is 1 = "don't inline" — a framed proc or an fproc with an xmm
+            // save area is too complex to splice; 0 = a plain unframed candidate.
+            let complex = (frame_size > 0 || !xmm_uses.is_empty()) as u8;
+            out.push_str(&format!("; @wfi {} {complex}\n", h.name));
             for r in &gpr_uses {
                 out.push_str(&format!("  push {r}\n"));
             }
@@ -2641,11 +2647,12 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
                 out.push_str("  push rbp\n  mov rbp, rsp\n  and rsp, -16\n");
                 out.push_str(&format!("  sub rsp, {frame_size}\n"));
             }
-            block_stack.push(Block::Proc { uses: gpr_uses, xmm: xmm_uses, frame_size });
+            block_stack.push(Block::Proc { name: h.name, uses: gpr_uses, xmm: xmm_uses, frame_size });
         } else if t == "endproc" {
             match block_stack.pop() {
-                Some(Block::Proc { uses, xmm, frame_size }) => {
-                    out.push_str(&proc_epilogue(&uses, &xmm, frame_size))
+                Some(Block::Proc { name, uses, xmm, frame_size }) => {
+                    out.push_str(&proc_epilogue(&uses, &xmm, frame_size));
+                    out.push_str(&format!("; @wfi-end {name}\n")); // close the inliner span
                 }
                 _ => bail!("line {src_line}: `endproc` without an open `proc`"),
             }
@@ -2654,7 +2661,7 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
             // registers first. `.ret` is the explicit early-exit form; a bare
             // `ret` is intercepted too so it can't skip the epilogue.
             match block_stack.iter().rev().find(|b| matches!(b, Block::Proc { .. })) {
-                Some(Block::Proc { uses, xmm, frame_size }) => {
+                Some(Block::Proc { uses, xmm, frame_size, .. }) => {
                     out.push_str(&proc_epilogue(uses, xmm, *frame_size))
                 }
                 _ if t == ".ret" => bail!("line {src_line}: `.ret` outside a `proc`"),
@@ -2712,7 +2719,8 @@ enum Block {
     /// `frame_size` > 0 for a `frame` proc: the bytes reserved once in the
     /// prologue (shadow space + outgoing args) so the calls inside skip their
     /// per-call alignment; the epilogue releases it. 0 for an unframed proc.
-    Proc { uses: Vec<String>, xmm: Vec<&'static str>, frame_size: usize },
+    /// `name` is carried so `endproc` can close the inliner's `; @wfi` span marker.
+    Proc { name: String, uses: Vec<String>, xmm: Vec<&'static str>, frame_size: usize },
 }
 
 /// A parsed `proc` header.
