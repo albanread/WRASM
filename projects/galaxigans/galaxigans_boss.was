@@ -28,7 +28,9 @@ bs_dispatch:
     je      bs_beam
     cmp     eax, BS_RETURN
     je      bs_return
-    ; BS_IDLE: count down to the next appearance
+    ; BS_IDLE: count down to the next appearance (only on boss levels)
+    cmp     dword ptr [rip + bossEnabled], 0
+    je      bs_done
     dec     dword ptr [rip + bossTimer]
     jg      bs_done
     mov     dword ptr [rip + bossState], BS_ENTER

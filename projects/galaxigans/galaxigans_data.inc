@@ -201,6 +201,7 @@ bossY      DWORD -36
 bossAnim   DWORD 0
 bossTimer  DWORD 40
 bossBeamT  DWORD 0
+bossEnabled DWORD 0                            ; does this level field a capture boss?
 abducting   DWORD 0                            ; 0 none / 1 a pilot rising / 2 falling back (saved)
 abducteeX   DWORD 0                            ; the abducted pilot's position in the beam
 abducteeY   DWORD 0
@@ -247,16 +248,17 @@ rowTypePtr QWORD 0                            ; -> the selected theme's 5 entrie
 ; ---- LEVEL TABLE: one row per level = {cosmos scene 0..8, formation theme 0..3}. To add a
 ;      level, append a row; difficulty (dive cadence / bombs / speed) scales with stage on top.
 ;      Levels past the last row wrap the table but keep getting more aggressive. ----
+; each row: {cosmos scene, formation theme, capture-boss?}  — the boss is a periodic event.
 .balign 16
-levelTable DWORD 0, 0      ; L1  nebula       / classic
-           DWORD 1, 1      ; L2  galaxy       / +ray,beetle
-           DWORD 2, 2      ; L3  black hole   / new-heavy
-           DWORD 3, 3      ; L4  alien world  / full mix
-           DWORD 4, 0      ; L5  moon         / classic
-           DWORD 5, 1      ; L6  supernova    / +ray,beetle
-           DWORD 6, 2      ; L7  wormhole     / new-heavy
-           DWORD 7, 3      ; L8  gas giant    / full mix
-           DWORD 8, 0      ; L9  aurora       / classic
+levelTable DWORD 0, 0, 0   ; L1  nebula       / classic
+           DWORD 1, 1, 0   ; L2  galaxy       / +ray,beetle
+           DWORD 2, 2, 1   ; L3  black hole   / new-heavy     · BOSS
+           DWORD 3, 3, 0   ; L4  alien world  / full mix
+           DWORD 4, 0, 0   ; L5  moon         / classic
+           DWORD 5, 1, 1   ; L6  supernova    / +ray,beetle   · BOSS
+           DWORD 6, 2, 0   ; L7  wormhole     / new-heavy
+           DWORD 7, 3, 0   ; L8  gas giant    / full mix
+           DWORD 8, 0, 1   ; L9  aurora       / classic       · BOSS
 NUM_LEVELS equ 9
 
 ; per-type frame tables, indexed by EN_TYPE (0..7): upright + left/right bank (for divers)

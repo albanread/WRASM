@@ -83,11 +83,13 @@ rg_sg:
     xor     edx, edx
     mov     ecx, NUM_LEVELS
     div     ecx                              ; edx = level index
-    imul    edx, edx, 8                       ; 2 dwords per level row
+    imul    edx, edx, 12                      ; 3 dwords per level row
     lea     rcx, [rip + levelTable]
     add     rcx, rdx
     mov     r8d, [rcx]                        ; cosmos scene
     mov     r9d, [rcx + 4]                    ; formation theme
+    mov     eax, [rcx + 8]                    ; capture-boss this level?
+    mov     [rip + bossEnabled], eax
     imul    r9d, r9d, 20                      ; -> rowTypes offset (5 species * 4 bytes)
     lea     rax, [rip + rowTypes]
     add     rax, r9
