@@ -107,6 +107,8 @@ STATE_PLAYING  equ 0
 STATE_GAMEOVER equ 1
 STATE_INTRO    equ 2                         ; title screen, waiting for fire
 STATE_WIN      equ 3                         ; stage clear
+STATE_HISCORE  equ 4                         ; the high-score table
+HISCORE_LEN    equ 360                       ; frames the table is shown
 WIN_LEN        equ 180                       ; stage-clear pause before the next stage
 DANCE_CX       equ 320                       ; orbit centre (640x360 middle)
 DANCE_CY       equ 180

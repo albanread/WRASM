@@ -53,6 +53,8 @@ GameStep:
     je      gs_intro
     cmp     eax, STATE_GAMEOVER
     je      gs_dance
+    cmp     eax, STATE_HISCORE
+    je      gs_hiscore
     cmp     eax, STATE_WIN
     je      gs_win
     call    PlayerStep
@@ -103,9 +105,10 @@ gs_dance:
     call    PtUpdate                         ; let lingering debris fade
     dec     dword ptr [rip + danceTimer]
     jg      gs_dance_hud
-    call    ResetGame
-    mov     dword ptr [rip + gameState], STATE_INTRO   ; dance done -> back to the title
-    call    MusicTitle
+    call    InsertHiScore                    ; dance done -> place the score, show the table
+    call    ClearField
+    mov     dword ptr [rip + gameState], STATE_HISCORE
+    mov     dword ptr [rip + hiTimer], HISCORE_LEN
 gs_dance_hud:
     mov     ecx, 0x00FF4040                  ; "GAME OVER" (red)
     call    TxtSetColour
@@ -113,6 +116,18 @@ gs_dance_hud:
     mov     edx, 30
     lea     r8, [rip + gameOverStr]
     call    DrawText
+    add     rsp, 40
+    ret
+
+; ---- HIGH SCORES: show the table for a few seconds, then back to the attract ----
+gs_hiscore:
+    dec     dword ptr [rip + hiTimer]
+    jg      gs_hiscore_draw
+    call    AttractReset
+    mov     dword ptr [rip + gameState], STATE_INTRO
+    call    MusicTitle
+gs_hiscore_draw:
+    call    DrawHiScores
     add     rsp, 40
     ret
 

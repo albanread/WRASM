@@ -1,0 +1,134 @@
+; galaxigans_hiscore.was — the high-score table + its scene. After the game-over dance,
+; InsertHiScore slots the final score into the table (named "YOU"), then STATE_HISCORE shows
+; it for a few seconds before the attract resumes. (.CODE + .DATA)
+
+module Galaxigans
+.balign 16
+.DATA
+.balign 16
+hiVals     DWORD 30000, 22000, 16000, 11000, 7000, 4000
+.balign 16
+hiNames    BYTE "ACE", 0
+           BYTE "ZAP", 0
+           BYTE "BUG", 0
+           BYTE "FOE", 0
+           BYTE "POW", 0
+           BYTE "WOW", 0
+youName    BYTE "YOU", 0
+hiTitle    BYTE "H I G H   S C O R E S", 0
+hiRowScore BYTE "000000", 0                    ; scratch: a formatted row score
+hiRankBuf  BYTE "0", 0                          ; scratch: a rank digit
+hiNewRow   DWORD -1                             ; the row the player just took (-1 = none)
+hiTimer    DWORD 0
+
+.balign 16
+.CODE
+
+; ---- HiFmt(rcx=value, rdx=buf): write `value` as 6 zero-padded decimals into buf[0..5] ----
+proc HiFmt uses rbx rsi frame in rcx rdx
+    mov     eax, ecx
+    lea     rsi, [rdx + 5]
+    mov     ebx, 6
+hf_lp:
+    xor     edx, edx
+    mov     ecx, 10
+    div     ecx
+    add     dl, '0'
+    mov     [rsi], dl
+    dec     rsi
+    dec     ebx
+    jnz     hf_lp
+endproc
+
+; ---- InsertHiScore: slot `score` into the table (sorted desc), as "YOU"; record the row ----
+proc InsertHiScore uses rbx rsi rdi frame
+    mov     r8d, [rip + score]
+    xor     ebx, ebx                          ; i
+ihs_find:
+    cmp     ebx, 6
+    jge     ihs_none
+    lea     rsi, [rip + hiVals]
+    cmp     r8d, [rsi + rbx*4]
+    jg      ihs_insert
+    inc     ebx
+    jmp     ihs_find
+ihs_none:
+    mov     dword ptr [rip + hiNewRow], -1
+    jmp     ihs_done
+ihs_insert:
+    mov     [rip + hiNewRow], ebx
+    mov     ecx, 5                            ; shift j = 5 .. i+1 down by one
+ihs_shift:
+    cmp     ecx, ebx
+    jle     ihs_put
+    lea     rsi, [rip + hiVals]
+    mov     eax, [rsi + rcx*4 - 4]
+    mov     [rsi + rcx*4], eax
+    lea     rsi, [rip + hiNames]
+    mov     eax, ecx
+    shl     eax, 2
+    mov     edi, [rsi + rax - 4]
+    mov     [rsi + rax], edi
+    dec     ecx
+    jmp     ihs_shift
+ihs_put:
+    lea     rsi, [rip + hiVals]
+    mov     [rsi + rbx*4], r8d                ; vals[i] = score
+    lea     rsi, [rip + hiNames]
+    mov     eax, ebx
+    shl     eax, 2
+    mov     edi, dword ptr [rip + youName]
+    mov     [rsi + rax], edi                  ; names[i] = "YOU"
+ihs_done:
+endproc
+
+; ---- DrawHiScores: the table — title + six {rank, name, score} rows, player's row highlighted ----
+proc DrawHiScores uses rbx rsi frame
+    mov     ecx, 0x0050D0FF
+    call    TxtSetColour
+    mov     ecx, 240
+    mov     edx, 78
+    lea     r8, [rip + hiTitle]
+    call    DrawText
+    xor     ebx, ebx                          ; i
+dhs_row:
+    cmp     ebx, 6
+    jge     dhs_done
+    mov     esi, ebx                          ; y = 120 + i*24
+    imul    esi, esi, 24
+    add     esi, 120
+    mov     ecx, 0x00FFFFFF
+    cmp     ebx, [rip + hiNewRow]
+    jne     dhs_col
+    mov     ecx, 0x00FFE040                   ; the player's freshly-placed row
+dhs_col:
+    call    TxtSetColour
+    mov     eax, ebx                          ; rank '1'..'6'
+    add     al, '1'
+    mov     byte ptr [rip + hiRankBuf], al
+    mov     ecx, 252
+    mov     edx, esi
+    lea     r8, [rip + hiRankBuf]
+    call    DrawText
+    mov     ecx, 280                          ; name
+    mov     edx, esi
+    lea     r8, [rip + hiNames]
+    mov     eax, ebx
+    shl     eax, 2
+    add     r8, rax
+    call    DrawText
+    mov     eax, ebx                          ; score
+    lea     rcx, [rip + hiVals]
+    mov     ecx, [rcx + rax*4]
+    lea     rdx, [rip + hiRowScore]
+    call    HiFmt
+    mov     ecx, 348
+    mov     edx, esi
+    lea     r8, [rip + hiRowScore]
+    call    DrawText
+    inc     ebx
+    jmp     dhs_row
+dhs_done:
+endproc
+
+endmodule

@@ -187,6 +187,42 @@ proc AttractReset frame
     mov     dword ptr [rip + attractTick], 0
 endproc
 
+; ---- ClearField: empty the playfield (no fleet/shots/saucer/boss) — a clean backdrop ----
+proc ClearField uses rbx rdi frame
+    lea     rdi, [rip + enemies]
+    mov     ebx, ENEMY_MAX
+cf_e:
+    mov     dword ptr [rdi + EN_ALIVE], 0
+    add     rdi, ENEMY_STRIDE
+    dec     ebx
+    jnz     cf_e
+    lea     rdi, [rip + bullets]
+    mov     ebx, BULLET_MAX
+cf_b:
+    mov     dword ptr [rdi + 8], 0
+    add     rdi, BULLET_STRIDE
+    dec     ebx
+    jnz     cf_b
+    lea     rdi, [rip + bombs]
+    mov     ebx, BOMB_MAX
+cf_bo:
+    mov     dword ptr [rdi + 8], 0
+    add     rdi, BOMB_STRIDE
+    dec     ebx
+    jnz     cf_bo
+    lea     rdi, [rip + mines]
+    mov     ebx, MINE_MAX
+cf_m:
+    mov     dword ptr [rdi + MIN_ACTIVE], 0
+    add     rdi, MINE_STRIDE
+    dec     ebx
+    jnz     cf_m
+    mov     dword ptr [rip + saucerActive], 0
+    mov     dword ptr [rip + bossState], BS_IDLE
+    mov     dword ptr [rip + abducting], 0
+    call    BeamOff
+endproc
+
 ; ---- FormationStep: sway the grid, maybe launch a diver, then advance every enemy:
 ;      formation enemies track home+sway, divers run the swoop inline. ----
 proc FormationStep uses rbx rdi frame

@@ -53,6 +53,7 @@ NTV_introspect equ 1
 .include "galaxigans_beamfx.was"      ; the capture beam in indexed layer 1 (palette-cascaded)
 .include "galaxigans_enemies.was"     ; ResetGame + formation sway + dive AI + bombs
 .include "galaxigans_dance.was"       ; the triumphal spiral dance (game-over celebration)
+.include "galaxigans_hiscore.was"     ; the high-score table + scene
 .include "galaxigans_player.was"      ; input -> move/fire + player bullets
 .include "galaxigans_collision.was"   ; bullet x enemy + diver/bomb x player + scoring
 .include "galaxigans_saucer.was"      ; the bonus saucer: appear/move/drop-bombs/exit + hit
