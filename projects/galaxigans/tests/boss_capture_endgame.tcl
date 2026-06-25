@@ -41,4 +41,15 @@ puts "after retreat: bossState=$bs2 bossY=$by2"
 assert [expr {$by2 < $by1}] "boss must move UP off-screen (bossY $by2 < $by1)"
 assert [expr {$bs2 == 0}]   "boss gone -> BS_IDLE 0 (got $bs2)"
 
-puts "BOSS CAPTURE ENDGAME + RETREAT: VERIFIED"
+# ---- Bug 3: with only ONE pilot left, the boss must NOT start a steal ----
+send "playnow"
+set R [regs]
+send "capnone"                              ; # lives=1, beam on but no grab begun
+for {set i 0} {$i < 20} {incr i} { set R [regs] }
+set ab3 [lindex $R 2]
+set lv3 [lindex $R 3]
+puts "last-pilot beam: abducting=$ab3 lives=$lv3"
+assert [expr {$ab3 == 0}] "boss must not grab the last pilot (abducting stayed 0, got $ab3)"
+assert [expr {$lv3 == 1}] "the last pilot is spared (lives still 1, got $lv3)"
+
+puts "BOSS CAPTURE ENDGAME + RETREAT + LAST-PILOT SPARE: VERIFIED"

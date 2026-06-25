@@ -31,6 +31,8 @@ bs_dispatch:
     ; BS_IDLE: count down to the next appearance (only on boss levels)
     cmp     dword ptr [rip + bossEnabled], 0
     je      bs_done
+    cmp     dword ptr [rip + lives], 1         ; never bully the player's LAST pilot -> don't appear
+    jle     bs_done
     dec     dword ptr [rip + bossTimer]
     jg      bs_done
     mov     dword ptr [rip + bossState], BS_ENTER
@@ -55,9 +57,12 @@ bs_station:
     inc     dword ptr [rip + bossAnim]
     dec     dword ptr [rip + bossTimer]
     jg      bs_done
-    cmp     dword ptr [rip + lives], 0        ; no pilots left -> nothing to abduct, hover
-    jle     bs_done
+    cmp     dword ptr [rip + lives], 1        ; only steal when a SPARE pilot remains
+    jle     bs_station_leave                  ; down to the last one -> give up + retreat
     mov     dword ptr [rip + bossState], BS_DESCEND
+    jmp     bs_done
+bs_station_leave:
+    mov     dword ptr [rip + bossState], BS_RETURN
     jmp     bs_done
 bs_descend:
     inc     dword ptr [rip + bossAnim]
@@ -116,7 +121,7 @@ bs_beam:
     je      bs_rising
     test    eax, eax
     jne     bs_beamhold                       ; abducting==2 (falling) handled at the top
-    cmp     dword ptr [rip + lives], 0        ; grab a pilot if any remain
+    cmp     dword ptr [rip + lives], 1        ; never grab the player's last pilot
     jle     bs_beamhold
     mov     dword ptr [rip + abducting], 1
     mov     eax, [rip + bossX]                ; pilot rises at the beam centre (12 wide)

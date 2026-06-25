@@ -11,6 +11,7 @@ vnBossArm  BYTE "bossarm", 0
 vnHitBoss  BYTE "hitboss", 0
 vnCapLast  BYTE "caplast", 0
 vnCapKeep  BYTE "capkeep", 0
+vnCapNone  BYTE "capnone", 0
 .balign 16
 
 .CODE
@@ -53,6 +54,9 @@ proc RegisterTclVerbs frame
     call    TclAddVerb
     lea     rcx, [rip + vnCapKeep]
     lea     rdx, [rip + CapKeepVerb]
+    call    TclAddVerb
+    lea     rcx, [rip + vnCapNone]
+    lea     rdx, [rip + CapNoneVerb]
     call    TclAddVerb
 endproc
 
@@ -111,6 +115,16 @@ endproc
 proc CapKeepVerb frame
     mov     dword ptr [rip + lives], 3
     call    bossCapArm
+endproc
+
+; ---- capnone — lives=1, beam on but NO grab started: the boss must not take the last pilot ----
+proc CapNoneVerb frame
+    mov     dword ptr [rip + lives], 1
+    mov     dword ptr [rip + bossState], BS_BEAM
+    mov     dword ptr [rip + bossX], 304
+    mov     dword ptr [rip + bossY], BOSS_CAP_Y
+    mov     dword ptr [rip + bossBeamT], 0
+    mov     dword ptr [rip + abducting], 0
 endproc
 
 endmodule
