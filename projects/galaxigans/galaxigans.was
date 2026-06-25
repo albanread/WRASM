@@ -56,6 +56,7 @@ NTV_introspect equ 1
 .include "galaxigans_hiscore.was"     ; the high-score table + scene
 .include "galaxigans_player.was"      ; input -> move/fire + player bullets
 .include "galaxigans_collision.was"   ; bullet x enemy + diver/bomb x player + scoring
+.include "galaxigans_popup.was"       ; floating "+N" score popups on kills
 .include "galaxigans_saucer.was"      ; the bonus saucer: appear/move/drop-bombs/exit + hit
 .include "galaxigans_mine.was"        ; the saucer's rare spinning mine (drift + threat + bonus)
 .include "galaxigans_boss.was"        ; the capture boss FSM + draw (Phase 1: enter/descend/beam)

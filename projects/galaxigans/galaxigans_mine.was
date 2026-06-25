@@ -150,6 +150,10 @@ cms_m:
     call    BurstAt
     call    PlayBoom
     add     dword ptr [rip + score], MINE_SCORE
+    mov     ecx, [rdi + MIN_X]                ; "+150" popup
+    mov     edx, [rdi + MIN_Y]
+    lea     r8, [rip + popPlus150]
+    call    SpawnPopup
     jmp     cms_bnext                         ; one mine per bullet
 cms_mnext:
     add     rdi, MINE_STRIDE

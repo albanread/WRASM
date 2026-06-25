@@ -122,6 +122,11 @@ cs_b:
     call    BurstAt
     call    PlayBoom
     add     dword ptr [rip + score], SAUCER_SCORE
+    mov     ecx, [rip + saucerX]              ; "+200" popup
+    add     ecx, 8
+    mov     edx, SAUCER_Y
+    lea     r8, [rip + popPlus200]
+    call    SpawnPopup
     jmp     cs_done
 cs_next:
     add     rdi, BULLET_STRIDE

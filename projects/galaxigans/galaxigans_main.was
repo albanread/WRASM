@@ -71,6 +71,7 @@ GameStep:
     call    CheckMineShot
     call    BossStep                         ; the capture boss + pilot abduction
     call    CheckBossHit                     ; shoot the boss to free an abducted pilot
+    call    PopupStep                        ; age the floating score popups
     call    PtUpdate                         ; advance explosion debris
     call    CountAlive                       ; stage cleared when none remain
     test    eax, eax
@@ -95,6 +96,7 @@ gs_play_hud:
     mov     edx, 8
     lea     r8, [rip + livesStr]
     call    DrawText
+    call    DrawPopups                        ; floating "+N" score popups
     cmp     dword ptr [rip + warnTimer], 0    ; boss arriving -> flash "WARNING"
     jle     gs_play_end
     dec     dword ptr [rip + warnTimer]
@@ -155,6 +157,7 @@ gs_intro:
     call    Collide                          ; the demo's shots blow aliens up
     call    SaucerStep
     call    MineStep
+    call    PopupStep
     call    PtUpdate
     call    CountAlive                       ; cleared, or 15 s elapsed -> a new random level
     test    eax, eax
@@ -183,6 +186,7 @@ gs_intro_start:
     add     rsp, 40
     ret
 gs_intro_hud:
+    call    DrawPopups                        ; demo score popups
     mov     ecx, 0x0050D0FF                  ; "GALAXIGANS" (cyan)
     call    TxtSetColour
     mov     ecx, 263

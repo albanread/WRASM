@@ -1,0 +1,78 @@
+; galaxigans_popup.was — floating score popups ("+10" etc.) that rise and fade on a kill.
+; A tiny pool; spawned by the hit handlers, stepped + drawn in the game/attract loops. (.CODE+.DATA)
+
+POPUP_MAX    equ 8
+POPUP_STRIDE equ 24                            ; {x i32, y i32, timer i32, pad, strptr i64}
+POP_X        equ 0
+POP_Y        equ 4
+POP_T        equ 8
+POP_STR      equ 16
+POPUP_LEN    equ 42                            ; frames a popup lives (rises 1 px/frame)
+
+module Galaxigans
+.balign 16
+.DATA
+.balign 16
+popups     BYTE 192 dup(0)                     ; POPUP_MAX * POPUP_STRIDE
+popPlus10  BYTE "+10", 0
+popPlus150 BYTE "+150", 0
+popPlus200 BYTE "+200", 0
+popPlus500 BYTE "+500", 0
+
+.balign 16
+.CODE
+
+; ---- SpawnPopup(rcx=x, rdx=y, r8=strptr): start a rising score popup at (x,y) ----
+proc SpawnPopup uses rbx rdi frame in rcx rdx r8
+    lea     rdi, [rip + popups]
+    mov     ebx, POPUP_MAX
+sp_find:
+    cmp     dword ptr [rdi + POP_T], 0
+    je      sp_free
+    add     rdi, POPUP_STRIDE
+    dec     ebx
+    jnz     sp_find
+    jmp     sp_done                            ; pool full -> skip
+sp_free:
+    mov     [rdi + POP_X], ecx
+    mov     [rdi + POP_Y], edx
+    mov     dword ptr [rdi + POP_T], POPUP_LEN
+    mov     [rdi + POP_STR], r8
+sp_done:
+endproc
+
+; ---- PopupStep: age each popup + drift it up ----
+proc PopupStep uses rbx rdi frame
+    lea     rdi, [rip + popups]
+    mov     ebx, POPUP_MAX
+ps_e:
+    cmp     dword ptr [rdi + POP_T], 0
+    je      ps_next
+    dec     dword ptr [rdi + POP_T]
+    sub     dword ptr [rdi + POP_Y], 1
+ps_next:
+    add     rdi, POPUP_STRIDE
+    dec     ebx
+    jnz     ps_e
+endproc
+
+; ---- DrawPopups: queue each live popup's "+N" text (yellow) ----
+proc DrawPopups uses rbx rsi frame
+    mov     ecx, 0x00FFE850
+    call    TxtSetColour
+    lea     rsi, [rip + popups]
+    mov     ebx, POPUP_MAX
+dp_e:
+    cmp     dword ptr [rsi + POP_T], 0
+    je      dp_next
+    mov     ecx, [rsi + POP_X]
+    mov     edx, [rsi + POP_Y]
+    mov     r8, [rsi + POP_STR]
+    call    DrawText
+dp_next:
+    add     rsi, POPUP_STRIDE
+    dec     ebx
+    jnz     dp_e
+endproc
+
+endmodule

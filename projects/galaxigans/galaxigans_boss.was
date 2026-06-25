@@ -203,6 +203,11 @@ cbh_nodrop:
     call    PlayBoom
     call    PlayBonus                          ; the pilot is saved + bonus chime
     add     dword ptr [rip + score], BOSS_SCORE
+    mov     ecx, [rip + bossX]                 ; "+500" popup
+    add     ecx, 8
+    mov     edx, [rip + bossY]
+    lea     r8, [rip + popPlus500]
+    call    SpawnPopup
     call    BeamOff
     mov     dword ptr [rip + bossState], BS_IDLE
     mov     dword ptr [rip + bossTimer], BOSS_RESPAWN

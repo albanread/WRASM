@@ -47,6 +47,10 @@ col_e:
     mov     dword ptr [rdi + EN_ALIVE], 0    ; enemy dead
     mov     dword ptr [rsi + 8], 0           ; bullet spent
     add     dword ptr [rip + score], 10
+    mov     ecx, [rdi + EN_X]                ; "+10" popup
+    mov     edx, [rdi + EN_Y]
+    lea     r8, [rip + popPlus10]
+    call    SpawnPopup
     jmp     col_bnext                        ; one kill per bullet
 col_enext:
     add     rdi, ENEMY_STRIDE
