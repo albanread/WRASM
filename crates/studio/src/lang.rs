@@ -752,11 +752,13 @@ fn signature_markdown(kb: &Kb, func: &str, active: usize) -> Option<String> {
 /// Lower + assemble a source buffer to the requested artifact, returning the
 /// bytes and a one-line status string for the GUI.
 fn assemble_bytes(kb: &Kb, src: &str, emit: Emit) -> Result<(Vec<u8>, String)> {
-    let lowered = was::lower(src, kb)?;
+    // Keep the lowered→source map so a downstream encode error reports the source
+    // line, not the post-lowering line — matching the `was` CLI.
+    let (lowered, map) = was::lower_mapped(src, kb)?;
     if emit == Emit::Asm {
         return Ok((lowered.into_bytes(), "asm".to_string()));
     }
-    let module = rasm::assemble(&lowered)?;
+    let module = rasm::assemble(&lowered).map_err(|e| was::remap_assemble_error(e, &map))?;
     match emit {
         Emit::Asm => unreachable!("handled above"),
         Emit::Obj => {

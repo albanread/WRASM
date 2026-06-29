@@ -152,7 +152,7 @@ fn run() -> anyhow::Result<()> {
 
     // The module overlay (opt-in) needs the per-line file attribution, so it runs
     // here on the expanded text; otherwise we take the expanded text as-is.
-    let src = if modules { was::scope_modules_by_file(&exp) } else { exp.text };
+    let src = if modules { was::scope_modules_by_file(&exp) } else { exp.text.clone() };
 
     if check {
         let diags = was::check(&src, &kb);
@@ -173,14 +173,18 @@ fn run() -> anyhow::Result<()> {
     // Keep the source→lowered map so a downstream encode error is reported at the
     // real source line, not the post-preprocessing/lowering line (the equate/IF
     // pass removes lines, so the two diverge).
-    let (lowered, map) = was::lower_mapped(&src, &kb)?;
+    let (lowered, map) = was::lower_mapped(&src, &kb)
+        .map_err(|e| anyhow::anyhow!("{}", was::locate_error(&format!("{e:#}"), &exp)))?;
 
     if emit_asm {
         print!("{lowered}");
         return Ok(());
     }
 
-    let module = assemble(&lowered).map_err(|e| was::remap_assemble_error(e, &map))?;
+    let module = assemble(&lowered).map_err(|e| {
+        let mapped = was::remap_assemble_error(e, &map);
+        anyhow::anyhow!("{}", was::locate_error(&format!("{mapped:#}"), &exp))
+    })?;
     let output = output
         .unwrap_or_else(|| Path::new(&input).with_extension("obj").to_string_lossy().into_owned());
 

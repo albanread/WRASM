@@ -1100,15 +1100,18 @@ main:
         /// builds/runs in the IDE exactly as it does from the `was` CLI (where module
         /// scoping is on by default). An unsaved buffer has no base directory, so its
         /// includes can't resolve — save first. A missing include is surfaced.
-        fn build_source(&self) -> Result<String, String> {
+        /// Returns the source to assemble plus the `Expansion` (when the buffer is
+        /// saved), so a build error's expanded-source line can be reported as the
+        /// original `file:line` rather than a line in the flattened include blob.
+        fn build_source(&self) -> Result<(String, Option<was::Expansion>), String> {
             let text = self.doc.text();
             match &self.path {
                 // expand includes (recording per-line file attribution), then privatise
                 // each module's lowercase labels — matching the CLI default.
                 Some(p) => was::expand_includes_graph(&text, p)
-                    .map(|exp| was::scope_modules_by_file(&exp))
+                    .map(|exp| (was::scope_modules_by_file(&exp), Some(exp)))
                     .map_err(|e| e.to_string()),
-                None => Ok(text),
+                None => Ok((text, None)),
             }
         }
 
@@ -1177,8 +1180,8 @@ main:
         fn build_exe(&mut self) {
             let Some(lang) = self.lang.as_ref() else { return };
             let out = self.output_exe_path();
-            let src = match self.build_source() {
-                Ok(s) => s,
+            let (src, exp) = match self.build_source() {
+                Ok(v) => v,
                 Err(e) => {
                     self.notice = format!("include error: {e}");
                     self.invalidate();
@@ -1190,7 +1193,10 @@ main:
                     Ok(()) => format!("built {} — {info}", out.display()),
                     Err(e) => format!("build ok ({info}) but write failed: {e}"),
                 },
-                Some(Response::Error { message, .. }) => format!("build error: {message}"),
+                Some(Response::Error { message, .. }) => {
+                    let m = exp.as_ref().map_or(message.clone(), |e| was::locate_error(&message, e));
+                    format!("build error: {m}")
+                }
                 _ => "build failed: no reply from the assembler (timed out)".to_string(),
             };
             self.invalidate();
@@ -2677,8 +2683,8 @@ main:
         fn run_exe(&mut self) {
             let Some(lang) = self.lang.as_ref() else { return };
             let out = self.output_exe_path();
-            let src = match self.build_source() {
-                Ok(s) => s,
+            let (src, exp) = match self.build_source() {
+                Ok(v) => v,
                 Err(e) => {
                     self.notice = format!("include error: {e}");
                     self.invalidate();
@@ -2699,7 +2705,10 @@ main:
                     }
                     Err(e) => format!("write failed: {e}"),
                 },
-                Some(Response::Error { message, .. }) => format!("build error: {message}"),
+                Some(Response::Error { message, .. }) => {
+                    let m = exp.as_ref().map_or(message.clone(), |e| was::locate_error(&message, e));
+                    format!("build error: {m}")
+                }
                 _ => "build failed: no reply from the assembler (timed out)".to_string(),
             };
             self.invalidate();

@@ -1594,6 +1594,24 @@ pub fn remap_assemble_error(e: anyhow::Error, map: &[usize]) -> anyhow::Error {
     }
 }
 
+/// Rewrite a leading `line N:` error tag into `path:line:`, where `path`/`line`
+/// are the original file and line that expanded-source line `N` came from. Points
+/// a diagnostic at the editable file, not a line in the flattened include blob —
+/// far more useful for a shell-of-includes program. `N` is 1-based in `exp.text`
+/// (the coordinate `remap_assemble_error`/lowering errors report after remapping);
+/// no tag, or `N` out of range, returns the message unchanged.
+pub fn locate_error(msg: &str, exp: &Expansion) -> String {
+    let (line, rest) = split_line_tag(msg);
+    match line.and_then(|n| {
+        let i = n.checked_sub(1)?;
+        let fid = *exp.line_file.get(i)? as usize;
+        Some((exp.files.get(fid)?, *exp.line_no.get(i)?))
+    }) {
+        Some((file, ln)) => format!("{}:{}: {}", file.display(), ln, rest),
+        None => msg.to_string(),
+    }
+}
+
 /// Procs of at most this many lowered instructions are inlining candidates at
 /// their call sites (phase 1 also requires: leaf, unframed, single-region,
 /// address never taken). Tunable; the inliner is conservative regardless.
@@ -1614,7 +1632,16 @@ pub fn lower_mapped(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     // anything structural is lowered. Returns its own 1-based map (expanded line
     // per emitted line) so a downstream error still points at the real source.
     let (preprocessed, pmap) = preprocess_equates(&expanded, kb)?;
-    let (lowered, lmap) = lower_expanded(&preprocessed, kb)?;
+    let (lowered, lmap) = lower_expanded(&preprocessed, kb).map_err(|e| {
+        // A lowering bail's `line N` is a *preprocessed* line; map it back through
+        // preprocessed → expanded → source so the error points at the real line
+        // (not the post-macro-expansion line, which can be off by hundreds).
+        let prep_to_src: Vec<usize> = pmap
+            .iter()
+            .map(|&pl| emap.get(pl.wrapping_sub(1)).copied().unwrap_or(0))
+            .collect();
+        remap_assemble_error(e, &prep_to_src)
+    })?;
     // Deferred-assembly reducer: inline small leaf procs over the lowered text.
     // `origin[i]` is the lowered line output line `i` derives from, so the error
     // line-map stays intact across the rewrite. (Phase 1: an identity round-trip —
@@ -2700,6 +2727,18 @@ fn lower_expanded(src: &str, kb: &Kb) -> Result<(String, Vec<usize>)> {
     }
     if let Some(acc) = pending_string {
         bail!("string block is missing its `{}`", acc.end_kw);
+    }
+    // A block left open at end of input — most commonly a `proc` whose `endproc`
+    // was forgotten (silently produced a body with no epilogue before this check).
+    if let Some(b) = block_stack.last() {
+        match b {
+            Block::Proc { name, .. } => bail!("proc `{name}` is missing its `endproc`"),
+            Block::If { .. } => bail!("`.if` is missing its `.endif`"),
+            Block::While { .. } => bail!("`.while` is missing its `.endw`"),
+            Block::Repeat { .. } => bail!("`.repeat` is missing its `.until`"),
+            Block::For { .. } => bail!("`.for` is missing its `.endfor`"),
+            Block::Forever { .. } => bail!("`.forever` is missing its `.endfor`"),
+        }
     }
     Ok((out, map))
 }
@@ -3790,6 +3829,21 @@ mod tests {
                 .all(|x| !x.message.contains("xmm6")),
             "hand-saved xmm6 must not warn"
         );
+    }
+
+    #[test]
+    fn unclosed_block_at_eof_errors() {
+        let Some(kb) = kb() else { return };
+        // a `proc` whose `endproc` was forgotten (nothing follows) must error, not
+        // silently emit a body with no epilogue.
+        let e = lower(".code\nmain:\n  ret\nproc Foo\n  mov rax, 1\n", &kb).unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("Foo") && m.contains("endproc"), "named-proc error: {m}");
+        // an unclosed `.if` is caught the same way
+        let e2 = lower(".code\nmain:\n  .if al == 1\n  mov rax, 1\n", &kb).unwrap_err();
+        assert!(e2.to_string().contains(".endif"), "{e2}");
+        // a balanced proc still lowers fine
+        assert!(lower(".code\nproc Foo\n  mov rax, 1\nendproc\n", &kb).is_ok());
     }
 
     #[test]
