@@ -63,6 +63,8 @@ beamRamp   DWORD 0xFF103040, 0xFF1C6078, 0xFF3098B8, 0xFF58C8E8
 .globl BeamInit
 BeamInit:
     push    rbx
+    push    r12
+    push    r13
     sub     rsp, 40
     lea     rax, [rip + beamEnd]
     lea     rcx, [rip + beamSrc]
@@ -75,17 +77,17 @@ BeamInit:
     test    eax, eax
     js      beam_fc
     pBeamVSBlob.GetBufferPointer()
-    mov     [rip + beamTmpPtr], rax
+    mov     r12, rax                          ; r12 = VS bytecode ptr (callee-saved, no conflict)
     pBeamVSBlob.GetBufferSize()
-    mov     [rip + beamTmpSz], rax
-    pDevice.CreateVertexShader([rip + beamTmpPtr], [rip + beamTmpSz], 0, pBeamVS)
+    mov     r13, rax                          ; r13 = VS bytecode size
+    pDevice.CreateVertexShader(r12, r13, 0, pBeamVS)
     test    eax, eax
     js      beam_fd
     pBeamPSBlob.GetBufferPointer()
-    mov     [rip + beamTmpPtr], rax
+    mov     r12, rax
     pBeamPSBlob.GetBufferSize()
-    mov     [rip + beamTmpSz], rax
-    pDevice.CreatePixelShader([rip + beamTmpPtr], [rip + beamTmpSz], 0, pBeamPS)
+    mov     r13, rax
+    pDevice.CreatePixelShader(r12, r13, 0, pBeamPS)
     test    eax, eax
     js      beam_fd
     xor     ecx, ecx                          ; draw the beam in PHYSICAL 640x360 (the game's
@@ -93,6 +95,8 @@ BeamInit:
     call    CanvasSetOrigin
     xor     eax, eax
     add     rsp, 40
+    pop     r13
+    pop     r12
     pop     rbx
     ret
 beam_fc:
