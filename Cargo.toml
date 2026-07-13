@@ -1,10 +1,18 @@
 [workspace]
-members = [".", "crates/winkb", "crates/was", "crates/ide", "crates/studio"]
-# The self-contained core (no external repos): a fresh clone builds these with a
-# bare `cargo build`. `studio` is excluded from the default set because it
-# path-deps WF66's docpane (the Direct2D render core); build it explicitly with
-# `cargo build -p studio` when WF66 is checked out alongside, or `--workspace`.
-default-members = [".", "crates/winkb", "crates/was", "crates/ide"]
+members = [
+    ".",
+    # Vendored dependencies (formerly external path deps)
+    "crates/docpane",
+    "crates/selkie",
+    "crates/rust-tcl",
+    # RASM crates
+    "crates/winkb",
+    "crates/was",
+    "crates/ide",
+    "crates/studio",
+]
+# All members self-contained: a fresh clone builds everything with `cargo build`.
+default-members = [".", "crates/winkb", "crates/was", "crates/ide", "crates/studio"]
 resolver = "2"
 
 [package]

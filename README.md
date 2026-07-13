@@ -66,18 +66,14 @@ Everything below lowers to plain, visible x86-64 — inspect it with `was … --
 
 ## Build & test
 
-```sh
-cargo build            # rasm + winkb + was + ide
-cargo test -p rasm     # encoder unit tests + the 5,109-golden corpus gate
-cargo test -p was      # the front-end: macros, proc contracts, the checks
-```
-
-`studio` additionally needs **WF66**'s `docpane` (the shared Direct2D /
-DirectWrite render core) checked out at `../WF66` relative to this repo:
+All Rust crates (assembler, IDE, knowledge layer, and the Direct2D render core)
+are vendored under `crates/`. A fresh `git clone` + `cargo build` is all you need:
 
 ```sh
-cargo build --workspace      # everything, including studio (needs ../WF66)
-cargo test  --workspace
+cargo build                  # everything: rasm + winkb + was + ide + studio
+cargo test -p rasm           # encoder unit tests + the 5,109-golden corpus gate
+cargo test -p was            # front-end: macros, proc contracts, clobber checks
+cargo test --workspace       # full suite across all crates
 ```
 
 ### The knowledge database

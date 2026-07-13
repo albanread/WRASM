@@ -13,7 +13,7 @@ name = "nanotcl"
 path = "src/main.rs"
 
 [dependencies]
-rust-tcl = { path = "../../../doccrate/crates/rust-tcl" }
+rust-tcl = { path = "../../crates/rust-tcl" }
 
 [profile.release]
 opt-level = 2
