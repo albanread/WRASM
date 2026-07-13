@@ -66,10 +66,16 @@ Everything below lowers to plain, visible x86-64 — inspect it with `was … --
 
 ## Build & test
 
+**Prerequisites:** Rust stable 1.80+ (`rustup` — https://rustup.rs) · Windows 10/11
+64-bit (the IDE uses Direct2D / DirectWrite; the assembler and tests are
+cross-platform but the GUI is Windows-only).
+
 All Rust crates (assembler, IDE, knowledge layer, and the Direct2D render core)
 are vendored under `crates/`. A fresh `git clone` + `cargo build` is all you need:
 
 ```sh
+git clone https://github.com/albanread/WRASM.git
+cd WRASM
 cargo build                  # everything: rasm + winkb + was + ide + studio
 cargo test -p rasm           # encoder unit tests + the 5,109-golden corpus gate
 cargo test -p was            # front-end: macros, proc contracts, clobber checks
@@ -78,9 +84,23 @@ cargo test --workspace       # full suite across all crates
 
 ### The knowledge database
 
-`winkb` reads `windows_api.db` — a SQLite database derived from the Win32
-metadata (not committed here; it's large). Point `winkb`/`was`/`studio` at it
-with `$WINKB_DB`, defaulting to `E:\windows_api\windows_api.db`.
+`winkb`, `was`, and `studio` read `windows_api.db` — a SQLite database of
+~165,000 Win32 symbols derived from the official Microsoft Win32 metadata
+(`microsoft/win32metadata`). It is not committed to this repo (too large).
+
+Set the `WINKB_DB` environment variable to point at your copy:
+
+```sh
+# PowerShell
+$env:WINKB_DB = "C:\path\to\windows_api.db"
+
+# cmd
+set WINKB_DB=C:\path\to\windows_api.db
+```
+
+The assembler core (`rasm`), the front-end (`was --check` excluded), and all
+encoder tests work without the database. Only lookups, `invoke`, `comcall`,
+struct cards, and `ide`/`studio` require it.
 
 ## Try it
 
