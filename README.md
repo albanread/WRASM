@@ -90,8 +90,9 @@ interfaces) derived from the official Microsoft Win32 metadata. It is not
 committed to this repo (86 MB uncompressed, 20 MB zipped).
 
 **Option A — download the pre-built copy** (quickest):
-Download `windows_api.zip` from the [Releases page](https://github.com/albanread/WRASM/releases)
-and extract `windows_api.db` anywhere convenient.
+Download `windows_api.zip` from the [Releases page](https://github.com/albanread/WRASM/releases),
+extract `windows_api.db` anywhere convenient, and set `WINKB_DB` to point at it.
+A pre-built copy derived from Win32Metadata 70.0.11-preview is available there now.
 
 **Option B — build it yourself** (see [Building the knowledge database](#building-the-knowledge-database) below).
 
