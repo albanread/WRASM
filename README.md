@@ -85,16 +85,28 @@ cargo test --workspace       # full suite across all crates
 ### The knowledge database
 
 `winkb`, `was`, and `studio` read `windows_api.db` — a SQLite database of
-~165,000 Win32 symbols derived from the official Microsoft Win32 metadata
-(`microsoft/win32metadata`). It is not committed to this repo (too large).
+~165,000 Win32 symbols (functions, types, struct layouts, constants, COM
+interfaces) derived from the official Microsoft Win32 metadata. It is not
+committed to this repo (86 MB uncompressed, 20 MB zipped).
 
-Set the `WINKB_DB` environment variable to point at your copy:
+**Option A — download the pre-built copy** (quickest):
+Download `windows_api.zip` from the [Releases page](https://github.com/albanread/WRASM/releases)
+and extract `windows_api.db` anywhere convenient.
 
-```sh
-# PowerShell
+**Option B — build it yourself** (see [Building the knowledge database](#building-the-knowledge-database) below).
+
+Point `winkb`/`was`/`studio` at your copy with the `WINKB_DB` environment variable:
+
+```powershell
+# PowerShell — current session
 $env:WINKB_DB = "C:\path\to\windows_api.db"
 
-# cmd
+# PowerShell — permanent (new shells)
+[System.Environment]::SetEnvironmentVariable("WINKB_DB","C:\path\to\windows_api.db","User")
+```
+
+```cmd
+rem cmd
 set WINKB_DB=C:\path\to\windows_api.db
 ```
 
@@ -128,6 +140,89 @@ The `examples/` corpus is the assembler's proving ground — each a hand-written
 | `mandel_gpu` / `mandel_gpu_proc` | a D3D11 **shader** Mandelbrot (HLSL via `.ASCIISTRING` + `D3DCompile`) with rubber-band zoom; the `_proc` version is 512 bytes smaller via a `frame` proc |
 | `d2d_balls` | a **Direct2D** fountain of spinning, translucent, outlined marbles (SSE physics, the COM macros, float→`xmm`) |
 | `gamescanvas` | the start of a retro **indexed-colour game canvas** (320×200 palette framebuffer, 5×7 font via `.include`, palette cycling) |
+
+## Building the knowledge database
+
+The database is the brain behind every smart feature in WRASM — `invoke`,
+`comcall`, `sizeof`, struct field offsets, COM vtable lookup, and the IDE cards.
+It is derived entirely from Microsoft's official Win32 metadata and is fully
+reproducible from public sources.
+
+### What it contains
+
+A single SQLite file (`windows_api.db`, ~86 MB) with nine core tables:
+
+| table | what it holds |
+|---|---|
+| `functions` | ~5,000 Win32 API entry points with DLL, calling convention, charset |
+| `function_params` | parameter name, type, direction, register hint |
+| `types` | all types — structs, unions, enums, COM interfaces, typedefs |
+| `struct_fields` | field name, byte offset, bit width (computed layout) |
+| `enum_members` | member name + value (signed and unsigned) |
+| `constants` | standalone constants (int, float, string, GUID, …) |
+| `interface_methods` | COM method name, vtable slot + resolved `vtable_index` |
+| `interface_method_params` | COM method parameter name and type |
+| `namespaces` | `Windows.Win32.*` namespace catalog |
+
+### Prerequisites
+
+- **Python 3.10+**
+- **.NET 8.0 SDK** — `dotnet` on PATH
+  (https://dotnet.microsoft.com/download)
+
+### Pipeline
+
+The generation tooling lives in a separate repo/directory (`E:\windows_api` here;
+not included in WRASM). The five steps are:
+
+```powershell
+# 1. Download Microsoft.Windows.SDK.Win32Metadata from NuGet
+#    Extracts Windows.Win32.winmd (~24 MB ECMA-335 binary) into artifacts/
+python bootstrap.py fetch-win32metadata
+
+# 2. Create an empty SQLite database from schema.sql (schema version 6)
+python bootstrap.py init-db
+
+# 3. Parse the .winmd and insert all symbols
+#    Spawns WinmdInspect.csproj (.NET 8, System.Reflection.Metadata)
+#    Supports --limit N and --start-after NAMESPACE for resumable ingestion
+python bootstrap.py ingest-batch --path artifacts/.../Windows.Win32.winmd --prefix Windows.Win32
+
+# 4. Compute struct/union size, alignment, and field byte offsets
+python bootstrap.py compute-layout
+
+# 5. Resolve COM vtable indices across the full inheritance chain
+python bootstrap.py compute-vtables
+```
+
+Total runtime: ~5–10 minutes. Output: `windows_api.db` (~86 MB).
+
+### How the parser works
+
+`ingest-batch` compiles and runs `winmd_inspect/WinmdInspect.csproj`, a .NET 8
+CLI tool that opens the winmd PE binary with `System.Reflection.Metadata` and
+writes rows directly into SQLite via `Microsoft.Data.Sqlite`. For each
+`Windows.Win32.*` namespace it extracts:
+
+- The `Apis` static class → function rows + parameter rows
+- Custom attributes on each method → DLL name, calling convention, charset
+- Type definitions → struct fields, enum members, COM interfaces and GUIDs
+- `Guid` attributes → IIDs for `interface` types
+
+`compute-layout` then fills `size_bits`, `align_bits`, and `byte_offset` for
+every struct field. `compute-vtables` walks the base-interface chain to assign
+the correct absolute `vtable_index` to every COM method.
+
+### Distributing a new build
+
+Compress with PowerShell (built-in, no extra tools):
+
+```powershell
+Compress-Archive -Path windows_api.db -DestinationPath windows_api.zip
+# Result: ~20 MB (76 % reduction) — natively extractable on Windows
+```
+
+Upload `windows_api.zip` as a GitHub Release asset on this repo.
 
 ## License
 
